@@ -1,0 +1,397 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Headless.XUnit;
+using Avalonia.Styling;
+using Avalonia.Threading;
+using Avalonia.VisualTree;
+using Undertone.Controls;
+using Undertone.Mobile.Services;
+using Undertone.Mobile.ViewModels;
+using Undertone.Mobile.Views;
+using Undertone.Models;
+using Undertone.Services;
+using Xunit;
+
+namespace Undertone.Tests;
+
+/// <summary>Phone navigation: tabs, the page stack, the Back order, safe-area padding and
+/// the scroll offset a pushed page keeps across Back.</summary>
+public class MobileNavigationTests : IDisposable
+{
+    private readonly string _root = Path.Combine(Path.GetTempPath(), "UndertoneTests", Guid.NewGuid().ToString("N"));
+    public void Dispose() { try { Directory.Delete(_root, recursive: true); } catch { } }
+
+    private sealed class NoPicker : IFolderPicker
+    {
+        public Task<string?> PickFolderAsync() => Task.FromResult<string?>(null);
+    }
+
+    private sealed class NavTestPage : MobilePage
+    {
+        private readonly string _title;
+        public NavTestPage(string title) => _title = title;
+        public override string Title => _title;
+        public int Closed { get; private set; }
+        public override void OnClosed() => Closed++;
+    }
+
+    private ShellViewModel MakeShell(params Track[] tracks)
+    {
+        var library = new FakeLibraryService();
+        library.TrackList.AddRange(tracks);
+        var persistence = new PersistenceService(_root);
+        var player = new FakeAudioPlayer();
+        var nowPlaying = new NowPlayingViewModel(player, library, persistence, marshal: a => a());
+        return new ShellViewModel(
+            new LibraryViewModel(library, persistence, new NoPicker(), marshal: a => a()),
+            nowPlaying,
+            new LyricsPageViewModel(player, nowPlaying, new FakeTrackFiles(), persistence, work => Task.FromResult(work())));
+    }
+
+    private static (ShellView View, Window Window) Mount(ShellViewModel shell)
+    {
+        var view = new ShellView { DataContext = shell };
+        var window = new Window { Width = 412, Height = 915, Content = view };
+        window.Show();
+        window.UpdateLayout();
+        return (view, window);
+    }
+
+    private static Track Song(string title) => new()
+    {
+        Id = Guid.NewGuid(), Title = title, Artist = "Tester", FilePath = "content://x/" + title,
+        Duration = TimeSpan.FromSeconds(90), AlbumArtworkPath = "/art/" + title + ".jpg",
+    };
+
+    [Fact]
+    public void Navigate_PushesOverTheTab_AndBackPopsInOrder()
+    {
+        var shell = MakeShell();
+        var first = new NavTestPage("First");
+        var second = new NavTestPage("Second");
+
+        shell.Navigate(first);
+        shell.Navigate(second);
+        Assert.Same(second, shell.CurrentPage);
+        Assert.False(shell.IsHomeRootVisible);
+
+        Assert.True(shell.GoBack());
+        Assert.Same(first, shell.CurrentPage);
+        Assert.Equal(1, second.Closed);
+
+        Assert.True(shell.GoBack());
+        Assert.Null(shell.CurrentPage);
+        Assert.True(shell.IsHomeRootVisible);
+        Assert.False(shell.GoBack());
+    }
+
+    [Fact]
+    public void TryHandleBack_ClosesOverlays_ThenPopsPages_ThenReturnsToHome_ThenLetsTheSystemHaveIt()
+    {
+        var shell = MakeShell();
+        shell.SelectTabCommand.Execute(MobileTab.Search);
+        shell.Navigate(new NavTestPage("Pushed"));
+        shell.OpenNowPlayingCommand.Execute(null);
+        shell.ToggleQueueCommand.Execute(null);
+
+        Assert.True(shell.TryHandleBack());
+        Assert.False(shell.IsQueueOpen);
+        Assert.True(shell.IsNowPlayingOpen);
+
+        Assert.True(shell.TryHandleBack());
+        Assert.False(shell.IsNowPlayingOpen);
+        Assert.NotNull(shell.CurrentPage);
+
+        Assert.True(shell.TryHandleBack());
+        Assert.Null(shell.CurrentPage);
+        Assert.Equal(MobileTab.Search, shell.SelectedTab);
+
+        Assert.True(shell.TryHandleBack());                // a non-start tab goes back to Home
+        Assert.Equal(MobileTab.Home, shell.SelectedTab);
+
+        Assert.False(shell.TryHandleBack());               // Home root: the system finishes the activity
+    }
+
+    /// <summary>S23 2026-10-05: a 3-button-nav Back is an Escape key AND the activity's
+    /// BackRequested; one press closed Lyrics and Now Playing together.</summary>
+    [Fact]
+    public void BackKey_ThenItsSystemEcho_ClosesOnlyOneLayer()
+    {
+        var shell = MakeShell();
+        long now = 10_000;
+        shell.TickSource = () => now;
+        shell.OpenNowPlayingCommand.Execute(null);
+        shell.ToggleLyricsCommand.Execute(null);
+
+        Assert.True(shell.TryHandleBackKey());
+        Assert.True(shell.TryHandleSystemBack());          // the same press: consumed, nothing more closes
+        Assert.False(shell.IsLyricsOpen);
+        Assert.True(shell.IsNowPlayingOpen);
+
+        now += 50;
+        Assert.True(shell.TryHandleBackKey());             // the next press
+        Assert.True(shell.TryHandleSystemBack());
+        Assert.False(shell.IsNowPlayingOpen);
+    }
+
+    [Fact]
+    public void SystemBack_WithoutABackKey_OrLongAfterOne_ActsNormally()
+    {
+        var shell = MakeShell();
+        long now = 10_000;
+        shell.TickSource = () => now;
+        shell.OpenNowPlayingCommand.Execute(null);
+        shell.ToggleLyricsCommand.Execute(null);
+
+        Assert.True(shell.TryHandleSystemBack());          // gesture navigation: no key first
+        Assert.False(shell.IsLyricsOpen);
+
+        Assert.True(shell.TryHandleBackKey());             // a key with no echo (e.g. a keyboard Escape)...
+        Assert.False(shell.IsNowPlayingOpen);
+        shell.Navigate(new NavTestPage("Pushed"));
+        now += ShellViewModel.BackKeyEchoMs;
+        Assert.True(shell.TryHandleSystemBack());          // ...does not swallow a later gesture
+        Assert.Null(shell.CurrentPage);
+
+        Assert.False(shell.TryHandleBackKey());            // Library root: the key is left to the system,
+        Assert.False(shell.TryHandleSystemBack());         // and so is its echo, which finishes the activity
+    }
+
+    [Fact]
+    public void TryHandleBack_InLibraryEditMode_FinishesEditing_BeforeLeavingTheApp()
+    {
+        var shell = MakeShell();
+        shell.LibraryRows.EditCommand.Execute(null);
+        Assert.True(shell.LibraryRows.IsEditing);
+
+        Assert.True(shell.TryHandleBack());                // Back is Done
+        Assert.False(shell.LibraryRows.IsEditing);
+
+        Assert.False(shell.TryHandleBack());               // Library root: the system finishes the activity
+    }
+
+    [Fact]
+    public void SelectTab_ClearsTheStack_AndClosesEveryPage()
+    {
+        var shell = MakeShell();
+        var a = new NavTestPage("A");
+        var b = new NavTestPage("B");
+        shell.Navigate(a);
+        shell.Navigate(b);
+
+        shell.SelectTabCommand.Execute(MobileTab.Library);   // re-tapping the current tab pops to its root
+        Assert.Empty(shell.Pages);
+        Assert.Null(shell.CurrentPage);
+        Assert.Equal(1, a.Closed);
+        Assert.Equal(1, b.Closed);
+
+        shell.Navigate(new NavTestPage("C"));
+        shell.SelectTabCommand.Execute(MobileTab.Favorites);
+        Assert.Empty(shell.Pages);
+        Assert.True(shell.IsFavoritesSelected);
+        Assert.True(shell.IsFavoritesRootVisible);
+        Assert.False(shell.IsLibraryRootVisible);
+    }
+
+    /// <summary>The tab bar stays up under the Queue: a tab tapped there lands on that tab's
+    /// page, not back on the player.</summary>
+    [Fact]
+    public void SelectTab_FromUnderTheQueue_ClosesTheQueueAndNowPlaying()
+    {
+        var shell = MakeShell();
+        shell.OpenNowPlayingCommand.Execute(null);
+        shell.ToggleQueueCommand.Execute(null);
+
+        shell.SelectTabCommand.Execute(MobileTab.Playlists);
+
+        Assert.False(shell.IsQueueOpen);
+        Assert.False(shell.IsNowPlayingOpen);
+        Assert.False(shell.IsLyricsOpen);
+        Assert.True(shell.IsPlaylistsRootVisible);
+    }
+
+    [Fact]
+    public void Navigate_FromNowPlaying_ClosesThePlayerAndItsOverlays()
+    {
+        var shell = MakeShell();
+        shell.OpenNowPlayingCommand.Execute(null);
+        shell.ToggleLyricsCommand.Execute(null);
+
+        shell.Navigate(new NavTestPage("Artist"));
+
+        Assert.False(shell.IsNowPlayingOpen);
+        Assert.False(shell.IsLyricsOpen);
+        Assert.NotNull(shell.CurrentPage);
+    }
+
+    [AvaloniaFact]
+    public void PageHost_ShowsTheTopPage_AndHidesTheHomeRoot()
+    {
+        var shell = MakeShell();
+        var (view, window) = Mount(shell);
+        var library = view.GetVisualDescendants().OfType<HomePage>().Single();   // the start tab
+        var host = view.FindControl<PageStack>("PageHost")!;
+        Assert.True(library.IsEffectivelyVisible);
+        Assert.Null(host.Top);
+
+        shell.Navigate(new NavTestPage("Pushed Page"));
+        window.UpdateLayout();
+        Assert.True(library.IsEffectivelyVisible);   // under the page while it slides in
+        MobileFixtures.Land(window);
+
+        Assert.False(library.IsEffectivelyVisible);
+        Assert.Same(shell.CurrentPage, host.Top);
+        // No DataTemplate matches the test page, so Avalonia's default template shows ToString().
+        Assert.Contains(host.GetVisualDescendants().OfType<TextBlock>(), t => t.Text == "Pushed Page");
+
+        shell.NavigateBackCommand.Execute(null);
+        window.UpdateLayout();
+        Assert.True(library.IsEffectivelyVisible);   // back at once, under the page sliding away
+        MobileFixtures.Land(window);
+        Assert.DoesNotContain(host.GetVisualDescendants().OfType<TextBlock>(), t => t.Text == "Pushed Page");
+        window.Close();
+    }
+
+    [AvaloniaFact]
+    public void SafeArea_PadsTheTabContentAndTheBottomChrome()
+    {
+        var shell = MakeShell();
+        var (view, window) = Mount(shell);
+
+        view.ApplySafeArea(new Thickness(0, 24, 0, 48));
+        window.UpdateLayout();
+
+        Assert.Equal(24, shell.TopSafePadding.Top);
+        Assert.Equal(24, view.FindControl<Panel>("TabContent")!.Margin.Top);
+        Assert.Equal(48, view.FindControl<Panel>("BottomChrome")!.Margin.Bottom);
+        window.Close();
+    }
+
+    /// <summary>Landscape with 3-button navigation or a side cutout: the bar sits on the left
+    /// or right, and without the side insets the tab content drew under it.</summary>
+    [AvaloniaFact]
+    public void SafeArea_SideInsets_ReachTheTabContentAndTheBottomChrome()
+    {
+        var shell = MakeShell();
+        var (view, window) = Mount(shell);
+
+        view.ApplySafeArea(new Thickness(30, 24, 48, 16));
+        window.UpdateLayout();
+
+        Assert.Equal(new Thickness(30, 24, 48, 0), shell.TopSafePadding);
+        Assert.Equal(new Thickness(30, 0, 48, 16), shell.BottomSafePadding);
+        var content = view.FindControl<Panel>("TabContent")!.Margin;
+        Assert.Equal((30.0, 48.0), (content.Left, content.Right));
+        var chrome = view.FindControl<Panel>("BottomChrome")!.Margin;
+        Assert.Equal((30.0, 48.0), (chrome.Left, chrome.Right));
+        window.Close();
+    }
+
+    /// <summary>
+    /// Undertone.UI's Styles.axaml pins every ScrollViewer and ScrollBar to AllowAutoHide=False
+    /// (persistent desktop bars), and a non-auto-hide bar reserves its width, so every phone
+    /// page stopped ~16 dp short of the right edge. The phone styles turn auto-hide back on,
+    /// where Fluent's bar overlays the content. The headless app has no Undertone.UI styles, so
+    /// the desktop rule is recreated on the window, below the shell as it is on the device.
+    /// </summary>
+    [AvaloniaFact]
+    public void PhonePages_AutoHideTheirScrollBars_OverTheDesktopsPersistentBars()
+    {
+        var shell = MakeShell(Song("Tone"));
+        var view = new ShellView { DataContext = shell };
+        var window = new Window { Width = 412, Height = 915, Content = view };
+        window.Styles.Add(new Style(x => x.OfType<ScrollViewer>())
+        {
+            Setters = { new Setter(ScrollViewer.AllowAutoHideProperty, false) },
+        });
+        window.Styles.Add(new Style(x => x.OfType<Avalonia.Controls.Primitives.ScrollBar>())
+        {
+            Setters = { new Setter(Avalonia.Controls.Primitives.ScrollBar.AllowAutoHideProperty, false) },
+        });
+        window.Show();
+        window.UpdateLayout();
+
+        var scroll = MobileFixtures.Named<ScrollViewer>(view, "HomeScroll");
+        Assert.True(scroll.AllowAutoHide);
+        var bars = scroll.GetVisualDescendants().OfType<Avalonia.Controls.Primitives.ScrollBar>().ToList();
+        Assert.NotEmpty(bars);   // Fluent's ScrollViewer template always realizes both bars
+        Assert.All(bars, bar => Assert.True(bar.AllowAutoHide));
+        window.Close();
+    }
+
+    [AvaloniaFact]
+    public void MiniBar_ShowsTheTracksArtwork_AndTheLibraryTabIsShown()
+    {
+        var track = Song("Tone A");
+        var shell = MakeShell(track);
+        shell.Library.InitializeAsync().GetAwaiter().GetResult();
+        var (view, window) = Mount(shell);
+
+        shell.PlaySongCommand.Execute(track);
+        window.UpdateLayout();
+
+        Assert.True(shell.IsMiniBarVisible);
+        Assert.Equal(track.AlbumArtworkPath, view.FindControl<CachedImage>("MiniArtwork")!.SourcePath);
+        Assert.True(view.FindControl<Button>("LibraryTab")!.IsVisible);
+
+        shell.OpenNowPlayingCommand.Execute(null);
+        Assert.False(shell.IsMiniBarVisible);
+        window.Close();
+    }
+
+    [AvaloniaFact]
+    public void ScrollMemory_RestoresThePageOffset_WhenItsViewIsRecreated()
+    {
+        var page = new NavTestPage("Long list");
+        ScrollViewer MakeViewer()
+        {
+            var viewer = new ScrollViewer { DataContext = page, Content = new Border { Height = 3000 } };
+            ScrollMemory.SetIsEnabled(viewer, true);
+            return viewer;
+        }
+
+        var window = new Window { Width = 400, Height = 300, Content = MakeViewer() };
+        window.Show();
+        window.UpdateLayout();
+        ((ScrollViewer)window.Content!).Offset = new Vector(0, 700);
+        window.UpdateLayout();
+        Dispatcher.UIThread.RunJobs();
+        Assert.Equal(700, page.ScrollOffset.Y, 1);
+
+        window.Content = MakeViewer();                    // what Back does: a fresh view over the same page
+        window.UpdateLayout();
+        Dispatcher.UIThread.RunJobs();
+        window.UpdateLayout();
+        Dispatcher.UIThread.RunJobs();
+
+        Assert.Equal(700, ((ScrollViewer)window.Content!).Offset.Y, 1);
+        window.Close();
+    }
+    [AvaloniaFact]
+    public void ScrollMemory_ARestoreSupersededWhileDetached_DoesNotBlockSaving()
+    {
+        var first = new NavTestPage("First") { ScrollOffset = new Vector(0, 500) };
+        var second = new NavTestPage("Second");
+        var viewer = new ScrollViewer { DataContext = first, Content = new Border { Height = 3000 } };
+        ScrollMemory.SetIsEnabled(viewer, true);
+        var window = new Window { Width = 400, Height = 300, Content = viewer };
+        window.Show();                        // attached: first's restore is queued
+        window.Content = null;                // detached before it lands...
+        viewer.DataContext = second;          // ...and reused for a page with nothing to restore
+        Dispatcher.UIThread.RunJobs();        // the superseded restore gives up
+
+        window.Content = viewer;
+        window.UpdateLayout();
+        Dispatcher.UIThread.RunJobs();
+        viewer.Offset = new Vector(0, 400);
+        window.UpdateLayout();
+        Dispatcher.UIThread.RunJobs();
+
+        Assert.Equal(400, second.ScrollOffset.Y, 1);
+        window.Close();
+    }
+}

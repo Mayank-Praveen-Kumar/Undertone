@@ -1,0 +1,915 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:loc="using:Undertone.Localization"
+             xmlns:vm="using:Undertone.ViewModels"
+             xmlns:m="using:Undertone.Models"
+             xmlns:conv="using:Undertone.Converters"
+             xmlns:ctrl="using:Undertone.Controls"
+             xmlns:helpers="using:Undertone.Helpers"
+             x:Class="Undertone.Views.SidebarView"
+             x:Name="SidebarRoot"
+             x:DataType="vm:SidebarViewModel"
+             Background="Transparent"
+             Foreground="{DynamicResource IslandForeground}">
+
+    <UserControl.Resources>
+        <conv:IconKeyToGeometryConverter x:Key="IconKeyToGeometry" />
+        <conv:HexColorToBrushConverter x:Key="HexColorToBrush" />
+        <conv:BoolToHorizontalAlignmentConverter x:Key="BoolToAlignment" />
+        <conv:BoolToThicknessConverter x:Key="BoolToThickness" />
+        <conv:CountLabelConverter x:Key="CountLabel" />
+    </UserControl.Resources>
+
+    <UserControl.Styles>
+        <!-- Folder chevron turns with the row fold, on its exact timing (FoldingListBoxItem.FoldDuration / FoldEase). -->
+        <Style Selector="Path.folder-chevron">
+            <Setter Property="RenderTransform" Value="rotate(0deg)" />
+            <Setter Property="Transitions">
+                <Transitions>
+                    <TransformOperationsTransition Property="RenderTransform" Duration="{x:Static ctrl:FoldingListBoxItem.FoldDuration}" Easing="{x:Static ctrl:FoldingListBoxItem.FoldEase}" />
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Path.folder-chevron.open">
+            <Setter Property="RenderTransform" Value="rotate(90deg)" />
+        </Style>
+        <!-- Row content colours are class-driven (not local values) so the selected accent pill
+             (Styles.axaml, GitHub #87) can flip them to the accent-contrast colour, like the
+             Settings rail's rail-bitmap. Accent-filled marks invert on the pill so they stay visible. -->
+        <Style Selector="ListBox.sidebar ctrl|MaskIcon.nav-bitmap">
+            <Setter Property="Foreground" Value="{DynamicResource IslandForeground}" />
+        </Style>
+        <Style Selector="ListBox.sidebar PathIcon.nav-icon">
+            <Setter Property="Foreground" Value="{DynamicResource IslandForeground}" />
+        </Style>
+        <Style Selector="ListBox.sidebar Ellipse.nav-badge">
+            <Setter Property="Fill" Value="{DynamicResource AccentColorBrush}" />
+        </Style>
+        <Style Selector="ListBox.sidebar Border.fav-heart">
+            <Setter Property="Background" Value="{DynamicResource AccentColorBrush}" />
+        </Style>
+        <Style Selector="ListBox.sidebar Path.fav-heart-glyph">
+            <Setter Property="Fill" Value="{DynamicResource AccentForegroundBrush}" />
+        </Style>
+        <Style Selector="ListBox.sidebar ListBoxItem:selected ctrl|MaskIcon.nav-bitmap">
+            <Setter Property="Foreground" Value="{DynamicResource AccentForegroundBrush}" />
+        </Style>
+        <Style Selector="ListBox.sidebar ListBoxItem:selected PathIcon.nav-icon">
+            <Setter Property="Foreground" Value="{DynamicResource AccentForegroundBrush}" />
+        </Style>
+        <Style Selector="ListBox.sidebar ListBoxItem:selected Ellipse.nav-badge">
+            <Setter Property="Fill" Value="{DynamicResource AccentForegroundBrush}" />
+        </Style>
+        <Style Selector="ListBox.sidebar ListBoxItem:selected Border.fav-heart">
+            <Setter Property="Background" Value="{DynamicResource AccentForegroundBrush}" />
+        </Style>
+        <Style Selector="ListBox.sidebar ListBoxItem:selected Path.fav-heart-glyph">
+            <Setter Property="Fill" Value="{DynamicResource AccentColorBrush}" />
+        </Style>
+
+        <!-- Drop target highlight while a track drag (or a playlist drag onto a folder)
+             hovers a sidebar row. The 1.5px rim is ALWAYS there, transparent, with the
+             padding trimmed to match (10 - 1.5): toggling BorderThickness on the hovered
+             row re-laid its content out, so every row the drag crossed jumped 1.5px
+             (the "playlists dancing around" report, Discord Luwi 09-22). -->
+        <Style Selector="ListBox#PlaylistList ListBoxItem">
+            <Setter Property="Padding" Value="8.5" />
+            <!-- ListBoxItem clips by default, which cut off the 2px the group tray reaches
+                 into the row gaps and left dark seams across it. A fold still clips the row
+                 while it runs (FoldingListBoxItem sets it locally). -->
+            <Setter Property="ClipToBounds" Value="False" />
+        </Style>
+        <Style Selector="ListBox#PlaylistList ListBoxItem /template/ ContentPresenter">
+            <Setter Property="BorderBrush" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="1.5" />
+        </Style>
+        <Style Selector="ListBox#PlaylistList ListBoxItem.drop-target /template/ ContentPresenter">
+            <Setter Property="Background" Value="{DynamicResource SidebarSelectedHoverBrush}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource AccentColorBrush}" />
+        </Style>
+
+        <!-- Open folder tray (Discord Luwi 10-04: in the collapsed rail a folder's playlists
+             looked like loose ones). ONE faint rounded backdrop behind an open folder's header
+             and its playlists, drawn by the header row and stretched by code-behind
+             (UpdateGroupTrays) to the bottom of the group's last realized row, so it follows
+             the fold and drag-reorder. Per-row slices met at independently rounded edges and
+             showed seams. The -10 is the row inset (Padding 8.5 + rim 1.5); radius 24 = the
+             48px row pill's. Scoped to the list, so the drag card (same template) shows none. -->
+        <Style Selector="Border.group-tray">
+            <Setter Property="IsHitTestVisible" Value="False" />
+            <Setter Property="Opacity" Value="0" />
+            <Setter Property="Background" Value="{DynamicResource IslandForeground}" />
+            <Setter Property="CornerRadius" Value="24" />
+            <Setter Property="Transitions">
+                <Transitions>
+                    <DoubleTransition Property="Opacity" Duration="{x:Static ctrl:FoldingListBoxItem.FoldDuration}" Easing="{x:Static ctrl:FoldingListBoxItem.FoldEase}" />
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="ListBox#PlaylistList Border.group-tray.header.open">
+            <Setter Property="Opacity" Value="0.06" />
+        </Style>
+
+        <!-- Right-click menu for playlist rows and folder headers. One shared menu; the
+             items switch on IsFolder. Opened from code-behind on right-press so the
+             ListBox doesn't also select (and navigate to) the row.
+             v2 look (10-09 redesign): line icons, grouped rows, the destructive row last in red.
+             Playlist rows: [Edit, Star / Unstar] · [Move to Folder, Remove from Folder] · [Delete].
+             Folder headers: [New Playlist in Folder, Rename] · [Remove Folder]. -->
+        <Style Selector="ListBox#PlaylistList ListBoxItem">
+            <Setter Property="ContextMenu">
+                <ContextMenu x:DataType="m:PlaylistNavItem" Classes="v2">
+                    <!-- Playlist rows -->
+                    <MenuItem Header="{loc:T Sidebar.EditPlaylist}"
+                              IsVisible="{Binding !IsFolder}"
+                              Command="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).EditPlaylistItemCommand}"
+                              CommandParameter="{Binding}">
+                        <MenuItem.Icon>
+                            <Viewbox Width="16" Height="16"><Canvas Width="24" Height="24"><Path Classes="mv2-icon" Data="{StaticResource MenuLineEdit}" StrokeThickness="2.25" StrokeLineCap="Round" StrokeJoin="Round" /></Canvas></Viewbox>
+                        </MenuItem.Icon>
+                    </MenuItem>
+                    <MenuItem Header="{loc:T Sidebar.StarSidebar}"
+                              Command="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).TogglePinItemCommand}"
+                              CommandParameter="{Binding}">
+                        <MenuItem.IsVisible>
+                            <MultiBinding Converter="{x:Static BoolConverters.And}">
+                                <Binding Path="!IsFolder" />
+                                <Binding Path="!IsPinned" />
+                            </MultiBinding>
+                        </MenuItem.IsVisible>
+                        <MenuItem.Icon>
+                            <Viewbox Width="16" Height="16"><Canvas Width="24" Height="24"><Path Classes="mv2-icon" Data="{StaticResource MenuLineStar}" StrokeThickness="2.25" StrokeLineCap="Round" StrokeJoin="Round" /></Canvas></Viewbox>
+                        </MenuItem.Icon>
+                    </MenuItem>
+                    <MenuItem Header="{loc:T Sidebar.UnstarFromSidebar}"
+                              Command="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).TogglePinItemCommand}"
+                              CommandParameter="{Binding}">
+                        <MenuItem.IsVisible>
+                            <MultiBinding Converter="{x:Static BoolConverters.And}">
+                                <Binding Path="!IsFolder" />
+                                <Binding Path="IsPinned" />
+                            </MultiBinding>
+                        </MenuItem.IsVisible>
+                        <MenuItem.Icon>
+                            <Viewbox Width="16" Height="16"><Canvas Width="24" Height="24"><Path Classes="mv2-icon mv2-pinned" Data="{StaticResource MenuLineStar}" StrokeThickness="2.25" StrokeLineCap="Round" StrokeJoin="Round" /></Canvas></Viewbox>
+                        </MenuItem.Icon>
+                    </MenuItem>
+                    <Separator IsVisible="{Binding !IsFolder}" />
+                    <MenuItem Header="{loc:T Sidebar.MoveFolder}"
+                              IsVisible="{Binding !IsFolder}"
+                              Command="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).MoveToFolderCommand}"
+                              CommandParameter="{Binding}">
+                        <MenuItem.Icon>
+                            <Viewbox Width="16" Height="16"><Canvas Width="24" Height="24"><Path Classes="mv2-icon" Data="{StaticResource MenuLineSendToFolder}" StrokeThickness="2.25" StrokeLineCap="Round" StrokeJoin="Round" /></Canvas></Viewbox>
+                        </MenuItem.Icon>
+                    </MenuItem>
+                    <MenuItem Header="{loc:T Sidebar.RemoveFromFolder}"
+                              Command="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).RemoveFromFolderCommand}"
+                              CommandParameter="{Binding}">
+                        <MenuItem.IsVisible>
+                            <MultiBinding Converter="{x:Static BoolConverters.And}">
+                                <Binding Path="!IsFolder" />
+                                <Binding Path="HasFolder" />
+                            </MultiBinding>
+                        </MenuItem.IsVisible>
+                        <MenuItem.Icon>
+                            <!-- Dynamic: IconsMenuExtra.axaml may not be merged where a test mounts the sidebar. -->
+                            <Viewbox Width="16" Height="16"><Canvas Width="24" Height="24"><Path Classes="mv2-icon" Data="{DynamicResource MenuLineFolderRemove}" StrokeThickness="2.25" StrokeLineCap="Round" StrokeJoin="Round" /></Canvas></Viewbox>
+                        </MenuItem.Icon>
+                    </MenuItem>
+                    <Separator IsVisible="{Binding !IsFolder}" />
+                    <MenuItem Header="{loc:T Sidebar.DeletePlaylist}" Classes="danger"
+                              IsVisible="{Binding !IsFolder}"
+                              Command="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).DeletePlaylistItemCommand}"
+                              CommandParameter="{Binding}">
+                        <MenuItem.Icon>
+                            <Viewbox Width="16" Height="16"><Canvas Width="24" Height="24"><Path Classes="mv2-icon" Data="{StaticResource MenuLineTrash}" StrokeThickness="2.25" StrokeLineCap="Round" StrokeJoin="Round" /></Canvas></Viewbox>
+                        </MenuItem.Icon>
+                    </MenuItem>
+
+                    <!-- Folder headers -->
+                    <MenuItem Header="{loc:T Sidebar.NewPlaylistFolder}"
+                              IsVisible="{Binding IsFolder}"
+                              Command="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).NewPlaylistInFolderCommand}"
+                              CommandParameter="{Binding}">
+                        <MenuItem.Icon>
+                            <Viewbox Width="16" Height="16"><Canvas Width="24" Height="24"><Path Classes="mv2-icon" Data="{StaticResource MenuLinePlaylistAdd}" StrokeThickness="2.25" StrokeLineCap="Round" StrokeJoin="Round" /></Canvas></Viewbox>
+                        </MenuItem.Icon>
+                    </MenuItem>
+                    <MenuItem Header="{loc:T Sidebar.RenameFolder}"
+                              IsVisible="{Binding IsFolder}"
+                              Command="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).RenameFolderCommand}"
+                              CommandParameter="{Binding}">
+                        <MenuItem.Icon>
+                            <Viewbox Width="16" Height="16"><Canvas Width="24" Height="24"><Path Classes="mv2-icon" Data="{StaticResource MenuLineEdit}" StrokeThickness="2.25" StrokeLineCap="Round" StrokeJoin="Round" /></Canvas></Viewbox>
+                        </MenuItem.Icon>
+                    </MenuItem>
+                    <Separator IsVisible="{Binding IsFolder}" />
+                    <MenuItem Header="{loc:T Sidebar.RemoveFolderKeepPlaylists}" Classes="danger"
+                              IsVisible="{Binding IsFolder}"
+                              Command="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).DissolveFolderCommand}"
+                              CommandParameter="{Binding}">
+                        <MenuItem.Icon>
+                            <Viewbox Width="16" Height="16"><Canvas Width="24" Height="24"><Path Classes="mv2-icon" Data="{StaticResource MenuLineTrash}" StrokeThickness="2.25" StrokeLineCap="Round" StrokeJoin="Round" /></Canvas></Viewbox>
+                        </MenuItem.Icon>
+                    </MenuItem>
+                </ContextMenu>
+            </Setter>
+        </Style>
+
+        <!-- Right-click menu for a plugin screen's row: its plugin page, or off the sidebar.
+             Opened from code-behind on right-press, like the playlist rows' menu. -->
+        <Style Selector="ListBox#PluginList ListBoxItem">
+            <Setter Property="ContextMenu">
+                <ContextMenu x:DataType="vm:PluginNavItem" Classes="v2">
+                    <MenuItem Header="{loc:T Sidebar.PluginSettings}"
+                              Command="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).OpenPluginItemSettingsCommand}"
+                              CommandParameter="{Binding}">
+                        <MenuItem.Icon>
+                            <Viewbox Width="16" Height="16"><Canvas Width="24" Height="24"><Path Classes="mv2-icon" Data="{StaticResource MenuLineTools}" StrokeThickness="2.25" StrokeLineCap="Round" StrokeJoin="Round" /></Canvas></Viewbox>
+                        </MenuItem.Icon>
+                    </MenuItem>
+                    <MenuItem Header="{loc:T Sidebar.HidePlugin}"
+                              Command="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).HidePluginItemCommand}"
+                              CommandParameter="{Binding}">
+                        <MenuItem.Icon>
+                            <Viewbox Width="16" Height="16"><Canvas Width="24" Height="24"><Path Classes="mv2-icon" Data="{StaticResource MenuLineEyeOff}" StrokeThickness="2.25" StrokeLineCap="Round" StrokeJoin="Round" /></Canvas></Viewbox>
+                        </MenuItem.Icon>
+                    </MenuItem>
+                </ContextMenu>
+            </Setter>
+        </Style>
+    </UserControl.Styles>
+
+    <Border CornerRadius="20">
+        <DockPanel LastChildFill="True">
+
+            <!-- Top spacing -->
+            <Border DockPanel.Dock="Top" Height="4" />
+
+            <!-- Back + contextual search, pinned above the scrolling nav.
+                 State (can-go-back, search visibility/watermark/text) comes from TopBarViewModel. -->
+            <StackPanel x:Name="RailActions"
+                        DockPanel.Dock="Top"
+                        Orientation="Vertical"
+                        Spacing="0"
+                        Margin="6,2,6,6">
+                <StackPanel.Styles>
+                    <!-- Same footprint as a nav row (ListBox.sidebar ListBoxItem: Padding 10 around
+                         a 28px icon = 48px, 2px vertical margin, full width when expanded), so Back
+                         and Search read as two more rows rather than two smaller buttons. -->
+                    <Style Selector="Button.rail-action">
+                        <Setter Property="Background" Value="Transparent"/>
+                        <Setter Property="BorderThickness" Value="0"/>
+                        <Setter Property="MinHeight" Value="0"/>
+                        <Setter Property="CornerRadius" Value="999"/>
+                        <Setter Property="Padding" Value="10"/>
+                        <Setter Property="Margin" Value="0,2"/>
+                        <Setter Property="FontSize" Value="15"/>
+                        <Setter Property="Cursor" Value="Hand"/>
+                        <Setter Property="HorizontalAlignment" Value="Stretch"/>
+                        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                        <Setter Property="VerticalContentAlignment" Value="Center"/>
+                    </Style>
+                    <Style Selector="Button.rail-action:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+                        <Setter Property="Background" Value="{DynamicResource SidebarHoverBrush}"/>
+                    </Style>
+                    <Style Selector="Button.rail-action:disabled">
+                        <Setter Property="Opacity" Value="0.3"/>
+                    </Style>
+                    <!-- Rail buttons (Back, Search): no global hover zoom (rail rows don't zoom,
+                         and the search capsule takes over from this exact 48px disc), and the
+                         press keeps the hover fill instead of Fluent's grey pressed box. Back
+                         had both the zoom and the grey disabled disc until 10-08. -->
+                    <Style Selector="Button.rail-action:pointerover">
+                        <Setter Property="RenderTransform" Value="scale(1)"/>
+                    </Style>
+                    <Style Selector="Button.rail-action:pressed">
+                        <Setter Property="RenderTransform" Value="scale(0.96)"/>
+                    </Style>
+                    <Style Selector="Button.rail-action:pressed /template/ ContentPresenter#PART_ContentPresenter">
+                        <Setter Property="Background" Value="{DynamicResource SidebarHoverBrush}"/>
+                    </Style>
+                    <!-- Disabled (Back with nowhere to go; Search on Home/Settings): just dimmed,
+                         not Fluent's grey disabled disc. -->
+                    <Style Selector="Button.rail-action:disabled /template/ ContentPresenter#PART_ContentPresenter">
+                        <Setter Property="Background" Value="Transparent"/>
+                    </Style>
+                </StackPanel.Styles>
+
+                <Button Classes="rail-action"
+                        Margin="0,8,0,0"
+                        Classes.expanded="{Binding IsExpanded}"
+                        Command="{Binding TopBar.BackCommand}"
+                        IsEnabled="{Binding TopBar.IsBackButtonVisible, FallbackValue=False}"
+                        ToolTip.Tip="{loc:T Sidebar.BackTip}">
+                    <StackPanel Orientation="Horizontal" Spacing="14"
+                                HorizontalAlignment="{Binding IsExpanded, Converter={StaticResource BoolToAlignment}}">
+                        <Grid Width="28" Height="28">
+                            <!-- Y nudge centers the chevron glyph in the circular button
+                                 (the geometry sits slightly high in its viewbox). -->
+                            <PathIcon Data="{StaticResource ChevronLeftIcon}" Width="17" Height="17"
+                                      Foreground="{DynamicResource IslandForeground}">
+                                <PathIcon.RenderTransform>
+                                    <TranslateTransform Y="0.5" />
+                                </PathIcon.RenderTransform>
+                            </PathIcon>
+                        </Grid>
+                        <TextBlock x:Name="BackLabel"
+                                   Text="{loc:T Sidebar.BackTip}"
+                                   FontSize="15"
+                                   VerticalAlignment="Center"
+                                   IsVisible="{Binding IsExpanded}"/>
+                    </StackPanel>
+                </Button>
+
+                <Button x:Name="SearchButton"
+                        Classes="rail-action"
+                        Classes.expanded="{Binding IsExpanded}"
+                        IsEnabled="{Binding TopBar.IsSearchActionAvailable, FallbackValue=False}"
+                        Click="OnSearchButtonClick"
+                        ToolTip.Tip="{loc:T Sidebar.SearchCtrlFTip, MacKeys=True}">
+                    <StackPanel Orientation="Horizontal" Spacing="14"
+                                HorizontalAlignment="{Binding IsExpanded, Converter={StaticResource BoolToAlignment}}">
+                        <Grid x:Name="SearchIconHost" Width="28" Height="28">
+                            <PathIcon Data="{StaticResource SearchIcon}" Width="16" Height="16"
+                                      Foreground="{DynamicResource IslandForeground}"/>
+                            <!-- Active-filter dot: search text survives the pill closing,
+                                 so mark the icon while a query is filtering the page. -->
+                            <Ellipse Width="7" Height="7"
+                                     Fill="{DynamicResource AccentColorBrush}"
+                                     HorizontalAlignment="Right"
+                                     VerticalAlignment="Top"
+                                     Margin="0,2,2,0"
+                                     IsVisible="{Binding TopBar.SearchText.Length, FallbackValue=False}"/>
+                        </Grid>
+                        <TextBlock x:Name="SearchLabel"
+                                   Text="{loc:T Sidebar.Search}"
+                                   FontSize="15"
+                                   VerticalAlignment="Center"
+                                   IsVisible="{Binding IsExpanded}"/>
+                    </StackPanel>
+                </Button>
+
+                <!-- Persistent search pill: a non-light-dismiss popup (unlike the old
+                     flyout) so it stays open while the user browses the filtered page.
+                     Closed explicitly via the Search button toggle or Esc; opened via
+                     the button or Ctrl+F. Hosted in the window's overlay layer: a
+                     native popup window is WS_EX_TOPMOST on Win32 and override-redirect
+                     on X11, so it floats over OTHER applications and outlives minimize;
+                     the overlay layer keeps the pill inside the window on every
+                     platform. Anchored on the sidebar ROOT, not the icon's grid: the
+                     hover rail re-aligns and animates its width, and the overlay host
+                     re-resolves its anchor on every frame the capsule's own width
+                     transition resizes it, so a target inside the rail drags the
+                     capsule sideways mid-morph. The root's origin never moves; the
+                     horizontal offset is a CONSTANT (both settled rail states put the
+                     button at the same x; measuring it live caught the collapse
+                     animation mid-slide and pinned the capsule askew), the vertical
+                     offset is measured per open (the vertical stack never animates, so
+                     that read is timing-safe).
+                     IsOpen is driven from code-behind (SyncSearchPopupToViewModel), not
+                     bound: a view model close (navigation, search disabled) must play
+                     the collapse too, and a binding would snap the popup shut first.
+
+                     Look (owner 10-08, the filled-pill language): no outline. The capsule
+                     starts as the rail button's own 48px hover disc, exactly over it,
+                     and grows into a 40px filled pill: the island surface with a soft
+                     shadow (it floats over the page), the rail's hover tint as the field
+                     fill, and a 1.5px ring that is transparent at rest and turns accent
+                     while the field has focus (PillDialog's pill-field). The magnifier
+                     never moves: 24px from the left edge = the disc's centre, which on
+                     the pill is the field's 16px inset. The 48px host keeps the shrinking
+                     height centred on the button; SearchShadowRoom's padding is room for the shadow (the
+                     overlay host clips to its content's bounds; no room on the left, where
+                     the rail ends). Motion lives in code-behind. -->
+                <Popup x:Name="SearchPopup"
+                       PlacementTarget="{Binding #SidebarRoot}"
+                       Placement="AnchorAndGravity"
+                       PlacementAnchor="TopLeft"
+                       PlacementGravity="BottomRight"
+                       IsLightDismissEnabled="False"
+                       ShouldUseOverlayLayer="True"
+                       WindowManagerAddShadowHint="False"
+                       Opened="OnSearchPopupOpened"
+                       Closed="OnSearchPopupClosed">
+                    <Border x:Name="SearchShadowRoom" Padding="6,10,20,24" HorizontalAlignment="Left">
+                    <Panel x:Name="SearchCapsuleHost" Height="48" HorizontalAlignment="Left">
+                        <Border x:Name="SearchPopupContent"
+                                Background="Transparent"
+                                CornerRadius="999"
+                                Width="48" Height="48"
+                                HorizontalAlignment="Left"
+                                VerticalAlignment="Center">
+                            <Border.Styles>
+                                <!-- Focus ring: always the accent, faded in and out (a brush tween
+                                     from Transparent passes through a grey outline). Its parent's
+                                     opacity follows the open/close motion in code-behind. -->
+                                <Style Selector="Border#SearchCapsuleRingStroke">
+                                    <Setter Property="Opacity" Value="0"/>
+                                    <Setter Property="Transitions">
+                                        <Transitions>
+                                            <DoubleTransition Property="Opacity" Duration="0:0:0.16"/>
+                                        </Transitions>
+                                    </Setter>
+                                </Style>
+                                <Style Selector="Border#SearchPopupContent:focus-within Border#SearchCapsuleRingStroke">
+                                    <Setter Property="Opacity" Value="1"/>
+                                </Style>
+                                <!-- The island is dark in every theme: Fluent's Light placeholder
+                                     and text colours were dark-on-dark here. -->
+                                <!-- The cap is a plain round target inside the pill: no global
+                                     hover zoom (it would carry the anchored magnifier with it). -->
+                                <Style Selector="Button#SearchCapButton:pointerover">
+                                    <Setter Property="RenderTransform" Value="scale(1)"/>
+                                </Style>
+                                <Style Selector="Button#SearchCapButton:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+                                    <Setter Property="Background" Value="{DynamicResource SidebarHoverBrush}"/>
+                                </Style>
+                                <Style Selector="Button#SearchCapButton:pressed">
+                                    <Setter Property="RenderTransform" Value="scale(0.92)"/>
+                                </Style>
+                                <Style Selector="Button#SearchCapButton:pressed /template/ ContentPresenter#PART_ContentPresenter">
+                                    <Setter Property="Background" Value="{DynamicResource SidebarHoverBrush}"/>
+                                </Style>
+                            </Border.Styles>
+                            <Panel>
+                                <!-- Surface + shadow on their own layer so the shadow fades in as
+                                     the pill leaves the rail (on the rail it would ring the disc). -->
+                                <Border x:Name="SearchCapsuleSurface"
+                                        Background="{DynamicResource IslandBackground}"
+                                        CornerRadius="999"
+                                        BoxShadow="0 8 24 0 #59000000, 0 1 3 0 #33000000"
+                                        Opacity="0"
+                                        IsHitTestVisible="False"/>
+                                <Border x:Name="SearchCapsuleTint"
+                                        Background="{DynamicResource SidebarHoverBrush}"
+                                        CornerRadius="999"
+                                        Opacity="0"
+                                        IsHitTestVisible="False"/>
+                                <Border CornerRadius="999" ClipToBounds="True">
+                                    <Grid ColumnDefinitions="48,Auto" HorizontalAlignment="Left">
+                                        <!-- Left cap: the same 16px magnifier as the (hidden) rail
+                                             button beneath, doubling as the close toggle. -->
+                                        <Button x:Name="SearchCapButton"
+                                                Grid.Column="0"
+                                                Click="OnSearchButtonClick"
+                                                AutomationProperties.Name="{loc:T Sidebar.Search}"
+                                                Width="32" Height="32"
+                                                Background="Transparent" BorderThickness="0"
+                                                Padding="0" Cursor="Hand" CornerRadius="999"
+                                                HorizontalAlignment="Center"
+                                                VerticalAlignment="Center"
+                                                HorizontalContentAlignment="Center"
+                                                VerticalContentAlignment="Center">
+                                            <PathIcon x:Name="SearchCapsuleGlyph"
+                                                      Data="{StaticResource SearchIcon}" Width="16" Height="16"
+                                                      Foreground="{DynamicResource IslandForeground}"/>
+                                        </Button>
+                                        <Grid x:Name="SearchFieldArea"
+                                              Grid.Column="1"
+                                              ColumnDefinitions="*,Auto" Width="196" Margin="-6,0,12,0">
+                                            <TextBox x:Name="SearchBox"
+                                                     Grid.Column="0"
+                                                     Classes="search-box"
+                                                     AutomationProperties.Name="{loc:T Sidebar.Search}"
+                                                     Text="{Binding TopBar.SearchText, Mode=TwoWay}"
+                                                     Watermark="{Binding TopBar.SearchWatermark}"
+                                                     ToolTip.Tip="{loc:T Sidebar.SearchSyntaxTip}"
+                                                     ToolTip.Placement="Bottom"
+                                                     ToolTip.ShowDelay="700"
+                                                     Background="Transparent" BorderThickness="0"
+                                                     Foreground="{DynamicResource IslandForeground}"
+                                                     CaretBrush="{DynamicResource IslandForeground}"
+                                                     PlaceholderForeground="{DynamicResource IslandForegroundSecondary}"
+                                                     FontSize="13" Padding="0,2,4,2"
+                                                     VerticalAlignment="Center"/>
+                                            <Button x:Name="SearchClearButton"
+                                                    Grid.Column="1"
+                                                    Command="{Binding TopBar.ClearSearchCommand}"
+                                                    Click="OnSearchClearClick"
+                                                    AutomationProperties.Name="{loc:T Main.Clear}"
+                                                    IsVisible="{Binding TopBar.SearchText.Length, FallbackValue=False}"
+                                                    Background="Transparent" BorderThickness="0"
+                                                    Foreground="{DynamicResource IslandForeground}"
+                                                    Padding="6,2" Cursor="Hand" VerticalAlignment="Center">
+                                                <ctrl:LineIcon Data="{StaticResource MenuLineClose}" Width="12" Height="12" Opacity="0.5"/>
+                                            </Button>
+                                        </Grid>
+                                    </Grid>
+                                </Border>
+                                <Panel x:Name="SearchCapsuleRing" IsHitTestVisible="False">
+                                    <Border x:Name="SearchCapsuleRingStroke"
+                                            CornerRadius="999"
+                                            BorderThickness="1.5"
+                                            BorderBrush="{DynamicResource AccentColorBrush}"/>
+                                </Panel>
+                            </Panel>
+                        </Border>
+                    </Panel>
+                    </Border>
+                </Popup>
+            </StackPanel>
+
+            <!-- Divider between rail actions and navigation -->
+            <Border DockPanel.Dock="Top"
+                    Height="1"
+                    Background="{DynamicResource IslandForeground}"
+                    Opacity="0.1"
+                    Margin="8,0,8,6" />
+
+            <!-- Scrollable content fills remaining space. Scrollbar stays hidden
+                 (wheel/touch still scroll) so it never cuts through the 60px
+                 collapsed rail when many playlists overflow the viewport. -->
+            <ScrollViewer VerticalScrollBarVisibility="Hidden"
+                          HorizontalScrollBarVisibility="Disabled">
+                <StackPanel>
+
+                    <!-- Main navigation: Home, Songs, Albums, Artists, Playlists, Settings -->
+                    <ListBox Classes="sidebar"
+                             x:Name="NavList"
+                             ItemsSource="{Binding NavItems}"
+                             SelectedItem="{Binding SelectedNavItem, Mode=OneWay}"
+                             SelectionChanged="OnNavListSelectionChanged"
+                             Margin="6,0,6,4">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate x:DataType="m:NavItem">
+                                <StackPanel Orientation="Horizontal" Spacing="14"
+                                            ToolTip.Tip="{Binding Label}"
+                                            HorizontalAlignment="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).IsExpanded, Converter={StaticResource BoolToAlignment}}">
+                                    <Grid Width="28"
+                                          Height="28"
+                                          VerticalAlignment="Center">
+                                        <!-- PNG mask drawn at its exact pixel size on whole pixels (MaskIcon):
+                                             crisp at every Interface Size, not only 100%. -->
+                                        <ctrl:MaskIcon Width="20"
+                                                       Height="20"
+                                                       HorizontalAlignment="Center"
+                                                       VerticalAlignment="Center"
+                                                       Classes="nav-bitmap"
+                                                       Source="{Binding IconGlyph, Converter={StaticResource IconKeyToGeometry}}"
+                                                       IsVisible="{Binding IconGlyph, Converter={x:Static helpers:IconKeyConverter.IsBitmap}}" />
+                                        <!-- Geometry icons (Visualizer, Lyrics Studio): same 20px box as the PNG masks. -->
+                                        <PathIcon Width="20" Height="20"
+                                                  HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                  Classes="nav-icon"
+                                                  Data="{Binding IconGlyph, Converter={x:Static helpers:IconKeyConverter.Instance}}"
+                                                  IsVisible="{Binding IconGlyph, Converter={x:Static helpers:IconKeyConverter.IsGeometry}}" />
+                                        <!-- Update-available dot (top-right of icon; visible in
+                                             both expanded and icon-only rail) -->
+                                        <Ellipse Width="8" Height="8"
+                                                 Classes="nav-badge"
+                                                 HorizontalAlignment="Right"
+                                                 VerticalAlignment="Top"
+                                                 Margin="0,-1,-1,0"
+                                                 IsVisible="{Binding ShowBadge}" />
+                                    </Grid>
+                                    <TextBlock Text="{Binding Label}"
+                                               VerticalAlignment="Center"
+                                               IsVisible="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).IsExpanded}" />
+                                    <!-- Inbox: songs waiting to be checked. -->
+                                    <TextBlock Text="{Binding Count}"
+                                               FontSize="12"
+                                               Opacity="0.5"
+                                               FontFeatures="+tnum"
+                                               VerticalAlignment="Center">
+                                        <TextBlock.IsVisible>
+                                            <MultiBinding Converter="{x:Static BoolConverters.And}">
+                                                <Binding Path="HasCount"/>
+                                                <Binding Path="$parent[UserControl].((vm:SidebarViewModel)DataContext).IsExpanded"/>
+                                            </MultiBinding>
+                                        </TextBlock.IsVisible>
+                                    </TextBlock>
+                                </StackPanel>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+
+                    <!-- Horizontal divider -->
+                    <Border Height="1"
+                            Background="{DynamicResource IslandForeground}"
+                            Opacity="0.1"
+                            Margin="8,8,8,8" />
+
+                    <!-- Favorites -->
+                    <ListBox Classes="sidebar"
+                             x:Name="FavoritesList"
+                             ItemsSource="{Binding FavoritesItems}"
+                             SelectedItem="{Binding SelectedNavItem, Mode=OneWay}"
+                             SelectionChanged="OnNavListSelectionChanged"
+                             Margin="6,0,6,4">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate x:DataType="m:NavItem">
+                                <StackPanel Orientation="Horizontal" Spacing="10"
+                                            ToolTip.Tip="{Binding Label}"
+                                            HorizontalAlignment="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).IsExpanded, Converter={StaticResource BoolToAlignment}}">
+                                    <!-- Heart cover art thumbnail -->
+                                    <Border Width="28" Height="28"
+                                            CornerRadius="14"
+                                            ClipToBounds="True"
+                                            VerticalAlignment="Center"
+                                            Classes="fav-heart">
+                                        <!-- Heart badge. Width/Height = icon SIZE.
+                                             To nudge position, change X and Y below:
+                                               X  -> sideways  (positive = RIGHT, negative = LEFT)
+                                               Y  -> up/down    (positive = DOWN,  negative = UP)
+                                             1 = 1 pixel. -->
+                                        <Path Data="{StaticResource FavoritesFilledIcon}"
+                                              Width="14" Height="10"
+                                              Stretch="Uniform"
+                                              Classes="fav-heart-glyph"
+                                              HorizontalAlignment="Center"
+                                              VerticalAlignment="Center">
+                                            <Path.RenderTransform>
+                                                <TranslateTransform X="1.3" Y="0" />
+                                            </Path.RenderTransform>
+                                        </Path>
+                                    </Border>
+                                    <StackPanel VerticalAlignment="Center" Spacing="1"
+                                                IsVisible="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).IsExpanded}">
+                                        <TextBlock Text="{Binding Label}"
+                                                   FontSize="13" />
+                                        <TextBlock FontSize="11"
+                                                   Opacity="0.5"
+                                                   Text="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).FavoritesCount, Converter={StaticResource CountLabel}, ConverterParameter=song}" />
+                                    </StackPanel>
+                                </StackPanel>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+
+                    <!-- Horizontal divider below Favorites -->
+                    <Border Height="1"
+                            Background="{DynamicResource IslandForeground}"
+                            Opacity="0.1"
+                            Margin="8,2,8,8" />
+
+                    <!-- Plugins: one row per screen a running plugin added (Album Town, A-B Loop),
+                         above the playlists so it is one click away (Discord feedback 11-03). A row
+                         opens the screen in Settings in place of its plugin's page and never takes
+                         the selection (SidebarViewModel.OpensSheet). Right-click: Plugin Settings,
+                         Hide from Sidebar. The whole block goes when no plugin adds a screen. -->
+                    <StackPanel x:Name="PluginSection" IsVisible="{Binding HasPluginItems}">
+                        <TextBlock Margin="18,4,12,4"
+                                   IsVisible="{Binding IsExpanded}"
+                                   Text="{loc:T Sidebar.PLUGINS}"
+                                   FontSize="12"
+                                   FontWeight="SemiBold"
+                                   Opacity="0.5"
+                                   VerticalAlignment="Center" />
+                        <ListBox Classes="sidebar"
+                                 x:Name="PluginList"
+                                 ItemsSource="{Binding PluginItems}"
+                                 SelectedItem="{Binding SelectedNavItem, Mode=OneWay}"
+                                 SelectionChanged="OnNavListSelectionChanged"
+                                 Margin="6,0,6,4">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate x:DataType="vm:PluginNavItem">
+                                    <StackPanel Orientation="Horizontal" Spacing="10"
+                                                ToolTip.Tip="{Binding Label}"
+                                                HorizontalAlignment="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).IsExpanded, Converter={StaticResource BoolToAlignment}}">
+                                        <!-- The plugin's icon (as on its Settings card), else its letter tile. -->
+                                        <Panel Width="28" Height="28" VerticalAlignment="Center">
+                                            <Border CornerRadius="8" Background="{Binding MonogramBrush}" IsVisible="{Binding ShowMonogram}">
+                                                <TextBlock Text="{Binding Monogram}" FontSize="11" FontWeight="Bold" Foreground="White"
+                                                           HorizontalAlignment="Center" VerticalAlignment="Center" />
+                                            </Border>
+                                            <Image Source="{Binding Icon}" IsVisible="{Binding HasIcon}" Width="28" Height="28"
+                                                   RenderOptions.BitmapInterpolationMode="HighQuality" />
+                                        </Panel>
+                                        <TextBlock Text="{Binding Label}"
+                                                   FontSize="13"
+                                                   VerticalAlignment="Center"
+                                                   TextTrimming="CharacterEllipsis"
+                                                   MaxWidth="130"
+                                                   IsVisible="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).IsExpanded}" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                        <Border Height="1"
+                                Background="{DynamicResource IslandForeground}"
+                                Opacity="0.1"
+                                Margin="8,2,8,8" />
+                    </StackPanel>
+
+                    <!-- Playlists header (only visible when expanded) -->
+                    <TextBlock Margin="18,4,12,4"
+                               IsVisible="{Binding IsExpanded}"
+                               Text="{loc:T Sidebar.PLAYLISTS}"
+                               FontSize="12"
+                               FontWeight="SemiBold"
+                               Opacity="0.5"
+                               VerticalAlignment="Center"
+                               Background="Transparent"
+                               ToolTip.Tip="{loc:T Sidebar.RightClickNewPlaylistTip}">
+                        <TextBlock.ContextMenu>
+                            <ContextMenu Classes="v2">
+                                <MenuItem Header="{loc:T Sidebar.NewPlaylist}" Command="{Binding CreatePlaylistCommand}">
+                                    <MenuItem.Icon>
+                                        <Viewbox Width="16" Height="16"><Canvas Width="24" Height="24"><Path Classes="mv2-icon" Data="{StaticResource MenuLinePlaylistAdd}" StrokeThickness="2.25" StrokeLineCap="Round" StrokeJoin="Round" /></Canvas></Viewbox>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <MenuItem Header="{loc:T Sidebar.NewSmartPlaylist}" Command="{Binding CreateSmartPlaylistFromSidebarCommand}">
+                                    <MenuItem.Icon>
+                                        <Viewbox Width="16" Height="16"><Canvas Width="24" Height="24"><Path Classes="mv2-icon" Data="{StaticResource MenuLineSmartPlaylist}" StrokeThickness="2.25" StrokeLineCap="Round" StrokeJoin="Round" /></Canvas></Viewbox>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                            </ContextMenu>
+                        </TextBlock.ContextMenu>
+                    </TextBlock>
+
+                    <!-- User playlists: pinned first, then folders, then loose playlists.
+                         The Panel hosts the reorder drag card over the list. -->
+                    <Panel x:Name="PlaylistListHost" Margin="6,0,6,4">
+                    <ctrl:FoldingListBox Classes="sidebar"
+                             x:Name="PlaylistList"
+                             ItemsSource="{Binding SidebarRows}"
+                             SelectedItem="{Binding SelectedNavItem, Mode=OneWay}"
+                             SelectionChanged="OnNavListSelectionChanged"
+                             MaxHeight="528"
+                             ScrollViewer.VerticalScrollBarVisibility="Hidden">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate x:DataType="m:PlaylistNavItem">
+                                <Panel>
+
+                                <!-- An open folder's tray, drawn by its header row (styles above). -->
+                                <!-- In a zero-size Canvas so its code-set height never grows
+                                     the header row; -10 = back out to the row pill's edge. -->
+                                <Canvas Width="0" Height="0" HorizontalAlignment="Left" VerticalAlignment="Top">
+                                <Border Classes="group-tray"
+                                        Canvas.Left="-10" Canvas.Top="-10"
+                                        Classes.header="{Binding IsGroupHeader}"
+                                        Classes.open="{Binding IsExpanded}"
+                                        Classes.member="{Binding IsGroupMember}"
+                                        Classes.last="{Binding IsGroupLast}" />
+                                </Canvas>
+
+                                <!-- Folder header row -->
+                                <StackPanel Orientation="Horizontal" Spacing="10"
+                                            ToolTip.Tip="{Binding Label}"
+                                            IsVisible="{Binding IsFolder}"
+                                            HorizontalAlignment="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).IsExpanded, Converter={StaticResource BoolToAlignment}}">
+                                    <Border Width="28" Height="28"
+                                            CornerRadius="8"
+                                            VerticalAlignment="Center"
+                                            Background="#22808080">
+                                        <!-- Drawn in the button's own 28px box, symmetric about its centre
+                                             (x 11.5-16.5, y 9-19), so it sits dead centre and turns in place.
+                                             The bounds-stretched PathIcon landed ~1px up and left. -->
+                                        <Path Classes="folder-chevron"
+                                              Classes.open="{Binding IsExpanded}"
+                                              Width="28" Height="28"
+                                              Data="M 11.5,9 L 16.5,14 L 11.5,19"
+                                              Stroke="{Binding $parent[ListBoxItem].Foreground}"
+                                              StrokeThickness="1.8"
+                                              StrokeLineCap="Round"
+                                              StrokeJoin="Round"
+                                              Opacity="0.8" />
+                                    </Border>
+                                    <StackPanel VerticalAlignment="Center" Spacing="1"
+                                                IsVisible="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).IsExpanded}">
+                                        <TextBlock Text="{Binding Label}"
+                                                   FontSize="13"
+                                                   FontWeight="SemiBold"
+                                                   TextTrimming="CharacterEllipsis"
+                                                   MaxWidth="120" />
+                                        <TextBlock FontSize="11"
+                                                   Opacity="0.5"
+                                                   Text="{Binding TrackCount, Converter={StaticResource CountLabel}, ConverterParameter=playlist}" />
+                                    </StackPanel>
+                                </StackPanel>
+
+                                <!-- Playlist row. Reorder / move-to-folder is an in-app pointer drag
+                                     handled by SidebarView (LiquidReorder). -->
+                                <StackPanel Orientation="Horizontal" Spacing="10"
+                                            ToolTip.Tip="{Binding Label}"
+                                            IsVisible="{Binding !IsFolder}"
+                                            Background="Transparent"
+                                            HorizontalAlignment="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).IsExpanded, Converter={StaticResource BoolToAlignment}}">
+                                    <!-- Indent for playlists inside an expanded folder. Hidden in the
+                                         collapsed rail: with it, the row is 52px (14+10 spacing+28 art)
+                                         in a 28px slot, so the art rendered off-center and clipped. -->
+                                    <Border Width="14">
+                                        <Border.IsVisible>
+                                            <MultiBinding Converter="{x:Static BoolConverters.And}">
+                                                <Binding Path="IsInFolder" />
+                                                <Binding Path="$parent[UserControl].((vm:SidebarViewModel)DataContext).IsExpanded" FallbackValue="False" />
+                                            </MultiBinding>
+                                        </Border.IsVisible>
+                                    </Border>
+                                    <!-- Playlist artwork thumbnail -->
+                                    <Border Width="28" Height="28"
+                                            CornerRadius="14"
+                                            ClipToBounds="True"
+                                            VerticalAlignment="Center">
+                                        <Panel>
+                                            <!-- Layer 1: Colored background (always present) -->
+                                            <Border Background="{Binding Color, Converter={StaticResource HexColorToBrush}}"
+                                                    CornerRadius="14" />
+
+                                            <!-- Layer 2: Fallback playlist icon -->
+                                            <PathIcon Data="{StaticResource PlaylistsIcon}"
+                                                      Width="12" Height="12"
+                                                      Foreground="{DynamicResource SecondaryTextBrush}"
+                                                      HorizontalAlignment="Center"
+                                                      VerticalAlignment="Center"
+                                                      IsVisible="{Binding ShowFallbackIcon}" />
+
+                                            <!-- Layer 3: Single album art (only 1 unique art).
+                                                 DecodeWidth 128 (36px render target) — shared bucket with the
+                                                 Add-to-Playlist dialog thumbs, so the always-visible sidebar
+                                                 keeps that bucket warm and the dialog opens without a decode. -->
+                                            <ctrl:CachedImage SourcePath="{Binding Art1}"
+                                                              DecodeWidth="128"
+                                                              Stretch="UniformToFill"
+                                                              IsVisible="{Binding HasSingleArt}" />
+
+                                            <!-- Layer 4: 2x2 collage (2+ unique arts) -->
+                                            <Grid RowDefinitions="*,*"
+                                                  ColumnDefinitions="*,*"
+                                                  IsVisible="{Binding HasCollageArt}">
+                                                <ctrl:CachedImage Grid.Row="0" Grid.Column="0"
+                                                                  SourcePath="{Binding Art1}"
+                                                                  DecodeWidth="128"
+                                                                  Stretch="UniformToFill" />
+                                                <ctrl:CachedImage Grid.Row="0" Grid.Column="1"
+                                                                  SourcePath="{Binding Art2}"
+                                                                  DecodeWidth="128"
+                                                                  Stretch="UniformToFill" />
+                                                <ctrl:CachedImage Grid.Row="1" Grid.Column="0"
+                                                                  SourcePath="{Binding Art3}"
+                                                                  DecodeWidth="128"
+                                                                  Stretch="UniformToFill" />
+                                                <ctrl:CachedImage Grid.Row="1" Grid.Column="1"
+                                                                  SourcePath="{Binding Art4}"
+                                                                  DecodeWidth="128"
+                                                                  Stretch="UniformToFill" />
+                                            </Grid>
+
+                                            <!-- Layer 5: Custom cover art (highest priority, covers everything) -->
+                                            <ctrl:CachedImage SourcePath="{Binding CoverArtPath}"
+                                                              DecodeWidth="128"
+                                                              Stretch="UniformToFill"
+                                                              IsVisible="{Binding HasCustomArt}" />
+                                        </Panel>
+                                    </Border>
+
+                                    <!-- Playlist name and track count (only when expanded) -->
+                                    <StackPanel VerticalAlignment="Center" Spacing="1"
+                                                IsVisible="{Binding $parent[UserControl].((vm:SidebarViewModel)DataContext).IsExpanded}">
+                                        <StackPanel Orientation="Horizontal" Spacing="4">
+                                            <TextBlock Text="{Binding Label}"
+                                                       FontSize="13"
+                                                       TextTrimming="CharacterEllipsis"
+                                                       MaxWidth="120" />
+                                            <PathIcon Data="{StaticResource StarIcon}"
+                                                      Width="11" Height="11"
+                                                      Foreground="#F1C40F"
+                                                      Opacity="0.9"
+                                                      VerticalAlignment="Center"
+                                                      IsVisible="{Binding IsPinned}" />
+                                        </StackPanel>
+                                        <TextBlock FontSize="11"
+                                                   Opacity="0.5"
+                                                   TextTrimming="CharacterEllipsis"
+                                                   Text="{Binding TrackCount, Converter={StaticResource CountLabel}, ConverterParameter=song}" />
+                                    </StackPanel>
+                                </StackPanel>
+
+                                </Panel>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ctrl:FoldingListBox>
+                    <!-- Floating card for a playlist being reordered: the row's own template
+                         in a lifted pill; LiquidReorder drives its transforms per frame and the
+                         other rows slide apart under it. -->
+                    <Border x:Name="PlaylistDragCard"
+                            IsVisible="False"
+                            IsHitTestVisible="False"
+                            VerticalAlignment="Top"
+                            CornerRadius="999"
+                            Padding="10"
+                            Background="{DynamicResource SidebarSelectedHoverBrush}"
+                            BoxShadow="0 8 22 0 #70000000"
+                            RenderTransformOrigin="50%,50%">
+                        <Border.RenderTransform>
+                            <TransformGroup>
+                                <ScaleTransform />
+                                <TranslateTransform />
+                            </TransformGroup>
+                        </Border.RenderTransform>
+                        <ContentControl x:Name="PlaylistDragCardContent"
+                                        HorizontalContentAlignment="Stretch"
+                                        VerticalContentAlignment="Center" />
+                    </Border>
+                    </Panel>
+
+
+                </StackPanel>
+            </ScrollViewer>
+
+        </DockPanel>
+    </Border>
+
+</UserControl>

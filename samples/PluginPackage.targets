@@ -1,0 +1,94 @@
+<Project>
+  <!--
+    Packs a Undertone plugin after a Release build: the plugin DLL (+ its private dependencies,
+    minus the shared kit), plugin.json and icon.png (if there is one) into bin/<Configuration>/<AssemblyName>-<Version>.zip,
+    ready for Settings → Plugins → "Install from file…".
+    plugin.json is deliberately NOT a CopyToOutputDirectory item: that would flow into every
+    project referencing the plugin (the test project references several).
+  -->
+
+  <!--
+    Reproducible packages: the same source, OS and .NET SDK give a byte-identical zip, so the
+    SHA-256 published in plugins/index.json can be checked by rebuilding. The DLL gets no commit
+    hash in its version and no PDB path (the package never carries the PDB), and the zip lists
+    its files in name order with one fixed date.
+  -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <Deterministic>true</Deterministic>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
+  <UsingTask TaskName="UndertoneReproducibleZip" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <SourceDirectory ParameterType="System.String" Required="true" />
+      <DestinationFile ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System" />
+      <Using Namespace="System.IO" />
+      <Using Namespace="System.IO.Compression" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        var root = Path.GetFullPath(SourceDirectory).TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
+        var files = Directory.GetFiles(root, "*", SearchOption.AllDirectories);
+        var names = new string[files.Length];
+        for (var i = 0; i < files.Length; i++) names[i] = files[i].Substring(root.Length).Replace('\\', '/');
+        Array.Sort(names, StringComparer.Ordinal);
+        if (File.Exists(DestinationFile)) File.Delete(DestinationFile);
+        using (var output = File.Create(DestinationFile))
+        using (var zip = new ZipArchive(output, ZipArchiveMode.Create))
+        {
+            foreach (var name in names)
+            {
+                var entry = zip.CreateEntry(name, CompressionLevel.Optimal);
+                entry.LastWriteTime = new DateTimeOffset(2000, 1, 1, 0, 0, 0, TimeSpan.Zero);
+                using (var source = File.OpenRead(Path.Combine(root, name)))
+                using (var target = entry.Open())
+                    source.CopyTo(target);
+            }
+        }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+  <Target Name="PackUndertonePlugin" AfterTargets="Build" Condition="'$(Configuration)' == 'Release' And Exists('$(MSBuildProjectDirectory)\plugin.json')">
+    <PropertyGroup>
+      <_PluginStage>$(BaseIntermediateOutputPath)plugin-package\$(AssemblyName)\</_PluginStage>
+      <_PluginZip>$(MSBuildProjectDirectory)\bin\$(Configuration)\$(AssemblyName)-$(Version).zip</_PluginZip>
+    </PropertyGroup>
+    <ItemGroup>
+      <_PluginFiles Include="$(OutDir)*.dll" Exclude="$(OutDir)Undertone.Plugins.Abstractions.dll;$(OutDir)Avalonia*.dll;$(OutDir)SkiaSharp*.dll;$(OutDir)HarfBuzzSharp*.dll" />
+      <_PluginFiles Include="$(OutDir)$(AssemblyName).deps.json" Condition="Exists('$(OutDir)$(AssemblyName).deps.json')" />
+      <_PluginFiles Include="$(MSBuildProjectDirectory)\plugin.json" />
+      <!-- The plugin's icon (plugin.json "icon"), when it has one. -->
+      <_PluginFiles Include="$(MSBuildProjectDirectory)\icon.png" Condition="Exists('$(MSBuildProjectDirectory)\icon.png')" />
+      <!-- A plugin under its own license (a community plugin brought into the repo) ships it. -->
+      <_PluginFiles Include="$(MSBuildProjectDirectory)\LICENSE" Condition="Exists('$(MSBuildProjectDirectory)\LICENSE')" />
+    </ItemGroup>
+    <RemoveDir Directories="$(_PluginStage)" />
+    <Copy SourceFiles="@(_PluginFiles)" DestinationFolder="$(_PluginStage)" />
+    <Delete Files="$(_PluginZip)" />
+    <UndertoneReproducibleZip SourceDirectory="$(_PluginStage)" DestinationFile="$(_PluginZip)" />
+    <Message Importance="high" Text="Undertone plugin package: $(_PluginZip)" />
+  </Target>
+
+  <!--
+    Content packs (<UndertoneContentPack>true</UndertoneContentPack>): data only, so nothing from the
+    build output goes in. The pack/ folder (plugin.json at its top) is zipped as is into
+    bin/<Configuration>/<AssemblyName>-<Version>.zip. Keep only .json, text and images in pack/:
+    anything else makes Undertone refuse the pack.
+  -->
+  <Target Name="PackUndertoneContentPack" AfterTargets="Build" Condition="'$(Configuration)' == 'Release' And '$(UndertoneContentPack)' == 'true'">
+    <PropertyGroup>
+      <_ContentPackDir>$(MSBuildProjectDirectory)\pack\</_ContentPackDir>
+      <_ContentPackOut>$(MSBuildProjectDirectory)\bin\$(Configuration)\</_ContentPackOut>
+      <_ContentPackZip>$(_ContentPackOut)$(AssemblyName)-$(Version).zip</_ContentPackZip>
+    </PropertyGroup>
+    <Error Condition="!Exists('$(_ContentPackDir)plugin.json')" Text="Content pack: $(_ContentPackDir)plugin.json is missing." />
+    <MakeDir Directories="$(_ContentPackOut)" />
+    <Delete Files="$(_ContentPackZip)" />
+    <UndertoneReproducibleZip SourceDirectory="$(_ContentPackDir)" DestinationFile="$(_ContentPackZip)" />
+    <Message Importance="high" Text="Undertone content pack: $(_ContentPackZip)" />
+  </Target>
+</Project>

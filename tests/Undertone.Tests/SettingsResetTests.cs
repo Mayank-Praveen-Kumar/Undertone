@@ -1,0 +1,198 @@
+using System.Reflection;
+using System.Text.Json;
+using Avalonia.Headless.XUnit;
+using Undertone.Models;
+using Undertone.Services;
+using Undertone.ViewModels;
+using Xunit;
+
+namespace Undertone.Tests;
+
+/// <summary>
+/// Settings › Reset everything promises every setting returns to its default. The reset
+/// writes a default settings.json, but the next save re-applies the view-model's
+/// properties on top of it (SyncToSettings), so any property the reset did not put back
+/// (upmix, shortcuts, accent-follows-artwork, music videos, per-song lyrics clips, the
+/// Songs columns, Lyrics Studio, ...) was written straight back over the defaults.
+/// </summary>
+public class SettingsResetTests : IDisposable
+{
+    private readonly string _root =
+        Path.Combine(Path.GetTempPath(), "UndertoneTests", Guid.NewGuid().ToString("N"));
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_root, true); } catch { }
+    }
+
+    private sealed class NoOpPlayHistoryService : IPlayHistoryService
+    {
+        public IReadOnlyList<PlayHistoryEvent> Events => Array.Empty<PlayHistoryEvent>();
+        public Task PreloadAsync() => Task.CompletedTask;
+        public void RecordPlay(Track track) { }
+        public void RecordSkip(Track track) { }
+        public Task FlushAsync() => Task.CompletedTask;
+    }
+
+    private static List<string> DifferingProperties(AppSettings actual, AppSettings expected) =>
+        typeof(AppSettings).GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Where(p => p.CanRead && p.GetIndexParameters().Length == 0)
+            .Where(p => JsonSerializer.Serialize(p.GetValue(actual)) != JsonSerializer.Serialize(p.GetValue(expected)))
+            .Select(p => p.Name)
+            .ToList();
+
+    /// <summary>What a fresh install writes on its first save.</summary>
+    private async Task<AppSettings> FreshInstallSaveAsync()
+    {
+        var persistence = new PersistenceService(Path.Combine(_root, "fresh"));
+        var vm = new SettingsViewModel(persistence, new FakeLibraryService(), new NoOpPlayHistoryService());
+        await vm.LoadAsync();
+        await vm.SaveAsync();
+        return await persistence.LoadSettingsAsync();
+    }
+
+    [AvaloniaFact]
+    public async Task Reset_ThenNextSave_WritesTheSameFileAsAFreshInstall()
+    {
+        var dataDir = Path.Combine(_root, "used");
+        Directory.CreateDirectory(dataDir);
+        var clip = Path.Combine(dataDir, "clip.mp4");
+        File.WriteAllText(clip, "x");
+
+        var persistence = new PersistenceService(dataDir);
+        await persistence.SaveSettingsAsync(new AppSettings
+        {
+            CommunityPluginsEnabled = false,
+            AccentFollowsArtwork = true,
+            AccentTrackLinks = false,
+            AppIcon = "ruby",
+            UpmixMode = "Surround",
+            HeadphoneSurround = true,
+            Shortcuts = new Dictionary<string, string> { [nameof(ShortcutAction.PlayPause)] = "P" },
+            LyricsBackgroundMediaOverrides = new Dictionary<string, string> { ["track:1"] = clip },
+            LyricsBackgroundPausesWithPlayback = true,
+            MusicVideosEnabled = false,
+            MusicVideoRoundedCorners = false,
+            MusicVideoUseVideoAudio = true,
+            MusicVideoAsBackground = true,
+            DiscordShowAlbum = false,
+            DiscordStatusDisplay = "Title",
+            UndertoneServerPort = 5050,
+            ShowGenreColumn = false,
+            ShowBpmColumn = true,
+            ShowPlaysColumn = false,
+            SyncEnabled = true,
+            SyncDeviceName = "Desk",
+            YouTubeDownloadFolder = Path.Combine(dataDir, "yt"),
+            YtDlpPath = Path.Combine(dataDir, "yt-dlp.exe"),
+            LyricsStudioModel = "Small",
+            LyricsStudioLanguage = "en",
+            LyricsStudioWordTimings = false,
+            LyricsStudioSkipAlreadyTimed = false,
+            LyricsStudioEmbedTags = true,
+            LyricsStudioOnlineLyrics = false,
+            IgnoreLeadingWordsInArtistSort = false,
+            AlbumPageTintEnabled = false,
+            PlayPauseFadeEnabled = false,
+            ArtistSortIgnoredWords = new List<string> { "The", "Los" },
+            PlayCountThresholdPercent = 75,
+        });
+
+        var audio = new FakeAudioPlayer();
+        var vm = new SettingsViewModel(persistence, new FakeLibraryService(), new NoOpPlayHistoryService());
+        vm.SetAudioPlayer(audio);
+        await vm.LoadAsync();
+        Assert.True(vm.AccentFollowsArtwork);
+        Assert.False(vm.AccentTrackLinks);
+        Assert.Equal("ruby", vm.AppIcon);
+        Assert.False(vm.ShortcutService.IsDefault(ShortcutAction.PlayPause));
+        Assert.True(vm.HasLyricsBackgroundOverride("track:1"));
+        Assert.Equal("Surround", audio.UpmixMode);
+        Assert.True(vm.HeadphoneSurround);
+
+        // ConfirmResetLibrary's settings half, without its OS and data-folder side effects.
+        var defaults = new AppSettings { CommunityPluginsEnabled = false };
+        await vm.WriteDefaultSettingsAsync(defaults);
+        vm.ResetSettingsToDefaults(defaults);
+
+        Assert.True(vm.ShortcutService.IsDefault(ShortcutAction.PlayPause));
+        Assert.False(vm.HasLyricsBackgroundOverride("track:1"));
+        Assert.Equal("Off", audio.UpmixMode);
+        Assert.False(vm.HeadphoneSurround);
+        Assert.Equal("classic", vm.AppIcon);
+
+        // Any toggle, or the unconditional save when the window closes.
+        await vm.SaveAsync();
+        var afterReset = await persistence.LoadSettingsAsync();
+        // The defaults that went on for new installs (2026-10-18) come back on.
+        Assert.True(afterReset.AlbumPageTintEnabled);
+        Assert.True(afterReset.PlayPauseFadeEnabled);
+        Assert.True(afterReset.IgnoreLeadingWordsInArtistSort);
+
+        // Except the sync id: made once per install, at random (a fresh install has its own), and
+        // kept through a reset so phones still see the same computer in the sync ledger.
+        var fresh = await FreshInstallSaveAsync();
+        Assert.Equal(new[] { nameof(AppSettings.SyncDeviceId) }, DifferingProperties(afterReset, fresh));
+        Assert.False(string.IsNullOrWhiteSpace(afterReset.SyncDeviceId));
+        Assert.False(string.IsNullOrWhiteSpace(fresh.SyncDeviceId));
+    }
+
+
+    /// <summary>
+    /// 11-03 audit: every bool flipped and every number nudged before the reset. The page view
+    /// state (Songs/Albums/Artists sort direction, Home/Album/Artist folded sections) survived
+    /// it: ResetSettingsToDefaults never put those view-model properties back, so the next save
+    /// wrote them over the defaults.
+    /// </summary>
+    [AvaloniaFact]
+    public async Task Reset_EveryFieldChanged_ThenNextSave_WritesTheSameFileAsAFreshInstall()
+    {
+        var dataDir = Path.Combine(_root, "every");
+        Directory.CreateDirectory(dataDir);
+        var persistence = new PersistenceService(dataDir);
+        var seeded = new AppSettings();
+        var baseline = new AppSettings();
+        foreach (var p in typeof(AppSettings).GetProperties(BindingFlags.Public | BindingFlags.Instance))
+        {
+            if (!p.CanWrite || p.GetIndexParameters().Length > 0) continue;
+            if (p.PropertyType == typeof(bool)) p.SetValue(seeded, !(bool)p.GetValue(baseline)!);
+            else if (p.PropertyType == typeof(bool?)) p.SetValue(seeded, false);
+            else if (p.PropertyType == typeof(int)) p.SetValue(seeded, (int)p.GetValue(baseline)! + 1);
+            else if (p.PropertyType == typeof(double)) p.SetValue(seeded, (double)p.GetValue(baseline)! * 0.9 + 0.01);
+            else if (p.PropertyType == typeof(string)) p.SetValue(seeded, "zz");
+        }
+        await persistence.SaveSettingsAsync(seeded);
+        var vm = new SettingsViewModel(persistence, new FakeLibraryService(), new NoOpPlayHistoryService());
+        vm.SetAudioPlayer(new FakeAudioPlayer());
+        await vm.LoadAsync();
+        var defaults = new AppSettings { CommunityPluginsEnabled = false };
+        await vm.WriteDefaultSettingsAsync(defaults);
+        vm.ResetSettingsToDefaults(defaults);
+        await vm.SaveAsync();
+        var afterReset = await persistence.LoadSettingsAsync();
+        var fresh = await FreshInstallSaveAsync();
+        Assert.Equal(new[] { nameof(AppSettings.SyncDeviceId) }, DifferingProperties(afterReset, fresh));
+    }
+
+    /// <summary>
+    /// "Add from YouTube" became a plugin (10-29): a settings.json that still carries its folder and
+    /// a custom yt-dlp loads, and a save keeps both as they were (legacy fields nothing writes).
+    /// </summary>
+    [AvaloniaFact]
+    public async Task SavedYouTubeSettings_FromBeforeThePlugin_LoadAndSurviveASave()
+    {
+        var dataDir = Path.Combine(_root, "legacy");
+        Directory.CreateDirectory(dataDir);
+        File.WriteAllText(Path.Combine(dataDir, "settings.json"),
+            """{ "youTubeDownloadFolder": "D:\\Music\\YT", "ytDlpPath": "C:\\tools\\yt-dlp.exe", "musicFolders": ["D:\\Music"] }""");
+        var persistence = new PersistenceService(dataDir);
+        var vm = new SettingsViewModel(persistence, new FakeLibraryService(), new NoOpPlayHistoryService());
+
+        await vm.LoadAsync();
+        await vm.SaveAsync();
+
+        var saved = await persistence.LoadSettingsAsync();
+        Assert.Equal(@"D:\Music\YT", saved.YouTubeDownloadFolder);
+        Assert.Equal(@"C:\tools\yt-dlp.exe", saved.YtDlpPath);
+    }
+}

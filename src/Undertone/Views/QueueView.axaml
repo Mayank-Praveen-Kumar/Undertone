@@ -1,0 +1,341 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:loc="using:Undertone.Localization"
+             xmlns:vm="using:Undertone.ViewModels"
+             xmlns:m="using:Undertone.Models"
+             xmlns:helpers="using:Undertone.Helpers"
+             xmlns:controls="using:Undertone.Controls"
+             x:Class="Undertone.Views.QueueView"
+             x:DataType="vm:QueueViewModel"
+             Background="{DynamicResource AppMainBackground}">
+
+    <UserControl.Styles>
+        <!-- Apple-Music-style press feel for the Up Next shuffle/repeat toggles —
+             mirrors the playback bar's transport-btn class (press dip to 0.85 over
+             0.18s CubicEaseOut, no hover grow). Declared locally so it overrides the
+             global Button hover scale(1.045) / pressed scale(0.96): styles closer to
+             the control apply last and win. The Background transition keeps the
+             stock Fluent hover fade these buttons already had (a local Transitions
+             setter replaces the global one wholesale). Never animate RenderTransform
+             here with a keyframe Animation — that crashes at startup; Transitions
+             only. -->
+        <Style Selector="Button.queue-toggle-btn">
+            <Setter Property="RenderTransformOrigin" Value="0.5,0.5"/>
+            <Setter Property="RenderTransform" Value="scale(1)"/>
+            <Setter Property="Transitions">
+                <Transitions>
+                    <TransformOperationsTransition Property="RenderTransform" Duration="0:0:0.18">
+                        <TransformOperationsTransition.Easing>
+                            <CubicEaseOut/>
+                        </TransformOperationsTransition.Easing>
+                    </TransformOperationsTransition>
+                    <BrushTransition Property="Background" Duration="0:0:0.06">
+                        <BrushTransition.Easing>
+                            <CubicEaseOut/>
+                        </BrushTransition.Easing>
+                    </BrushTransition>
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Button.queue-toggle-btn:pointerover">
+            <Setter Property="RenderTransform" Value="scale(1)"/>
+        </Style>
+        <Style Selector="Button.queue-toggle-btn:pressed">
+            <Setter Property="RenderTransform" Value="scale(0.85)"/>
+        </Style>
+    </UserControl.Styles>
+
+    <!-- Grid, not ScrollViewer+StackPanel: a page-level ScrollViewer measures the
+         Up Next ListBox at infinite height, so its VirtualizingStackPanel realizes
+         a row for every queued track at once. The star row gives the ListBox a
+         finite viewport so virtualization actually works; History (capped at 50)
+         scrolls within its own MaxHeight-bounded region. -->
+    <Grid Margin="16" RowDefinitions="Auto,Auto,Auto,Auto,*,Auto,Auto">
+
+            <!-- Now Playing section -->
+            <TextBlock Text="{loc:T Queue.NowPlaying}"
+                       Grid.Row="0"
+                       FontSize="24"
+                       FontWeight="Bold"
+                       Margin="0,0,0,12" />
+
+            <Border Grid.Row="1"
+                    Padding="12"
+                    CornerRadius="8"
+                    Background="{DynamicResource SystemControlBackgroundListLowBrush}"
+                    Margin="0,0,0,24"
+                    IsVisible="{Binding Player.CurrentTrack, Converter={x:Static ObjectConverters.IsNotNull}}">
+                <Grid ColumnDefinitions="Auto,*" HorizontalAlignment="Stretch">
+                    <!-- Now-playing mark: the island's own filled play glyph as a vector (was
+                         a 512px Play ICON.png mask, soft at 16px). -->
+                    <PathIcon Grid.Column="0"
+                              Data="{StaticResource PlayIcon}"
+                              Width="14" Height="14"
+                              Margin="1,0,13,0"
+                              VerticalAlignment="Center"
+                              Opacity="0.6"
+                              Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" />
+                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                        <Grid ColumnDefinitions="*,Auto">
+                            <TextBlock Text="{Binding Player.CurrentTrack.Title}"
+                                       Grid.Column="0"
+                                       Classes="one-line-explicit-title"
+                                       FontSize="14"
+                                       FontWeight="SemiBold" />
+                            <Border Grid.Column="1"
+                                    Classes="explicit-badge compact"
+                                    Margin="6,0,0,0"
+                                    IsVisible="{Binding Player.CurrentTrack.IsExplicit, FallbackValue=False}"
+                                    ToolTip.Tip="{loc:T Queue.ExplicitTip}">
+                                <TextBlock Text="E"
+                                           Classes="explicit-badge-text compact"
+                                           FontSize="8"
+                                           Opacity="0.9" />
+                            </Border>
+                        </Grid>
+                        <TextBlock Text="{Binding Player.CurrentTrack.ArtistDisplay}"
+                                   FontSize="12"
+                                   Opacity="0.6"
+                                   TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <TextBlock Text="{loc:T Queue.NoTrackPlaying}"
+                       Grid.Row="2"
+                       FontSize="14"
+                       Opacity="0.4"
+                       Margin="0,0,0,24"
+                       IsVisible="{Binding Player.CurrentTrack, Converter={x:Static ObjectConverters.IsNull}}" />
+
+            <!-- Up Next section -->
+            <Grid Grid.Row="3" ColumnDefinitions="*,Auto,Auto" Margin="0,0,0,8">
+                <!-- Title + Shuffle/Repeat toggles. These live here (not in the slim Home
+                     playback bar) so set-once controls stay out of the bar's way. -->
+                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                    <TextBlock Text="{loc:T Queue.UpNext}"
+                               FontSize="18"
+                               FontWeight="SemiBold"
+                               VerticalAlignment="Center" />
+                    <!-- Shuffle/Repeat active state, Apple-Music style: accent-tinted
+                         glyph over a soft rounded accent wash. The wash Border reuses
+                         AccentColorBrush (kept in sync with Settings by App.SetAccent)
+                         and knocks it back via Border.Opacity, so no separate
+                         translucent brush resource is needed. Fixed 27x23 replaces the
+                         old Padding="6,4" — identical footprint, but the Panel now
+                         fills the button so the wash can cover it. -->
+                    <Button Command="{Binding Player.ToggleShuffleCommand}"
+                            Classes="queue-toggle-btn"
+                            Background="Transparent" BorderThickness="0" Padding="0"
+                            Width="27" Height="23"
+                            Cursor="Hand" VerticalAlignment="Center"
+                            ToolTip.Tip="{loc:T Queue.ShuffleTip}">
+                        <Panel Width="27" Height="23">
+                            <Border CornerRadius="6"
+                                    Background="{DynamicResource AccentColorBrush}"
+                                    Opacity="0.18"
+                                    IsVisible="{Binding Player.IsShuffleEnabled}" />
+                            <PathIcon Data="{StaticResource ShuffleIcon}" Width="15" Height="15"
+                                      HorizontalAlignment="Center" VerticalAlignment="Center"
+                                      Opacity="0.55"
+                                      IsVisible="{Binding !Player.IsShuffleEnabled}" />
+                            <PathIcon Data="{StaticResource ShuffleIcon}" Width="15" Height="15"
+                                      HorizontalAlignment="Center" VerticalAlignment="Center"
+                                      Foreground="{DynamicResource AccentColorBrush}"
+                                      IsVisible="{Binding Player.IsShuffleEnabled}" />
+                        </Panel>
+                    </Button>
+                    <Button Command="{Binding Player.CycleRepeatCommand}"
+                            Classes="queue-toggle-btn"
+                            Background="Transparent" BorderThickness="0" Padding="0"
+                            Width="27" Height="23"
+                            Cursor="Hand" VerticalAlignment="Center"
+                            ToolTip.Tip="{Binding Player.RepeatModeTip}">
+                        <Panel Width="27" Height="23">
+                            <Border CornerRadius="6"
+                                    Background="{DynamicResource AccentColorBrush}"
+                                    Opacity="0.18"
+                                    IsVisible="{Binding Player.RepeatMode, Converter={x:Static ObjectConverters.NotEqual}, ConverterParameter={x:Static m:RepeatMode.Off}}" />
+                            <PathIcon Data="{StaticResource RepeatAllIcon}" Width="15" Height="15"
+                                      HorizontalAlignment="Center" VerticalAlignment="Center"
+                                      Opacity="0.55"
+                                      IsVisible="{Binding Player.RepeatMode, Converter={x:Static ObjectConverters.Equal}, ConverterParameter={x:Static m:RepeatMode.Off}}" />
+                            <PathIcon Data="{StaticResource RepeatAllIcon}" Width="15" Height="15"
+                                      HorizontalAlignment="Center" VerticalAlignment="Center"
+                                      Foreground="{DynamicResource AccentColorBrush}"
+                                      IsVisible="{Binding Player.RepeatMode, Converter={x:Static ObjectConverters.Equal}, ConverterParameter={x:Static m:RepeatMode.All}}" />
+                            <PathIcon Data="{StaticResource RepeatOneIcon}" Width="15" Height="15"
+                                      HorizontalAlignment="Center" VerticalAlignment="Center"
+                                      Foreground="{DynamicResource AccentColorBrush}"
+                                      IsVisible="{Binding Player.RepeatMode, Converter={x:Static ObjectConverters.Equal}, ConverterParameter={x:Static m:RepeatMode.One}}" />
+                        </Panel>
+                    </Button>
+                </StackPanel>
+                <Button Grid.Column="1"
+                        Command="{Binding Player.SaveQueueAsPlaylistCommand}"
+                        Background="Transparent"
+                        BorderThickness="0"
+                        Padding="6,3"
+                        Margin="0,0,8,0"
+                        Cursor="Hand"
+                        ToolTip.Tip="{loc:T Queue.SaveCurrentQueueAsTip}"
+                        IsVisible="{Binding !!UpNext.Count}">
+                    <StackPanel Orientation="Horizontal" Spacing="5">
+                        <!-- Same glyph as the menus' "Add to Playlist" (a new playlist from the queue). -->
+                        <controls:LineIcon Data="{StaticResource MenuLinePlaylistAdd}"
+                                           Width="14" Height="14"
+                                           Opacity="0.6"
+                                           VerticalAlignment="Center" />
+                        <TextBlock Text="{loc:T Queue.SaveAsPlaylist}"
+                                   FontSize="12"
+                                   Opacity="0.6"
+                                   VerticalAlignment="Center" />
+                    </StackPanel>
+                </Button>
+                <Button Grid.Column="2"
+                        Command="{Binding ClearQueueCommand}"
+                        AutomationProperties.Name="{loc:T Queue.Clear}"
+                        Background="Transparent"
+                        BorderThickness="0"
+                        Padding="6,3"
+                        Cursor="Hand"
+                        IsVisible="{Binding !!UpNext.Count}">
+                    <StackPanel Orientation="Horizontal" Spacing="5">
+                        <!-- Vector line icon (was the 512px Clear Queue ICON.png mask). Dynamic:
+                             IconsPages.axaml is merged at the app level. -->
+                        <controls:LineIcon Data="{DynamicResource PageLineQueueClear}"
+                                           Width="14" Height="14"
+                                           VerticalAlignment="Center"
+                                           Opacity="0.6" />
+                        <TextBlock Text="{loc:T Queue.Clear}"
+                                   FontSize="12"
+                                   Opacity="0.6"
+                                   VerticalAlignment="Center" />
+                    </StackPanel>
+                </Button>
+            </Grid>
+
+
+            <ListBox Grid.Row="4"
+                     Classes="track-list"
+                     ItemsSource="{Binding UpNext}"
+                     Margin="0,0,0,24">
+                <ListBox.ItemTemplate>
+                    <DataTemplate x:DataType="m:Track">
+                        <Grid ColumnDefinitions="*,Auto" Margin="0,2"
+                              helpers:DragFileBehavior.EnableFileDrag="True">
+                            <StackPanel Grid.Column="0">
+                                <Grid ColumnDefinitions="*,Auto">
+                                    <TextBlock Grid.Column="0"
+                                               Classes="one-line-explicit-title"
+                                               FontSize="13">
+                                        <TextBlock.Text>
+                                            <MultiBinding Converter="{x:Static helpers:QueueRowConverters.Line1}">
+                                                <Binding />
+                                                <Binding Path="$parent[UserControl].((vm:QueueViewModel)DataContext).Player.QueueRowLayout" />
+                                            </MultiBinding>
+                                        </TextBlock.Text>
+                                    </TextBlock>
+                                    <Border Grid.Column="1"
+                                            Classes="explicit-badge compact"
+                                            Margin="6,0,0,0"
+                                            IsVisible="{Binding IsExplicit}"
+                                            ToolTip.Tip="{loc:T Queue.ExplicitTip}">
+                                        <TextBlock Text="E"
+                                                   Classes="explicit-badge-text compact"
+                                                   FontSize="8"
+                                                   Opacity="0.9" />
+                                    </Border>
+                                </Grid>
+                                <!-- GitHub #147: the rows follow Settings ▸ Player ▸ Queue ▸ Queue Rows. -->
+                                <TextBlock FontSize="11"
+                                           Opacity="0.6"
+                                           TextTrimming="CharacterEllipsis"
+                                           IsVisible="{Binding $parent[UserControl].((vm:QueueViewModel)DataContext).Player.QueueRowLayout.HasLine2, FallbackValue=True}">
+                                    <TextBlock.Text>
+                                        <MultiBinding Converter="{x:Static helpers:QueueRowConverters.Line2}">
+                                            <Binding />
+                                            <Binding Path="$parent[UserControl].((vm:QueueViewModel)DataContext).Player.QueueRowLayout" />
+                                        </MultiBinding>
+                                    </TextBlock.Text>
+                                </TextBlock>
+                            </StackPanel>
+                            <TextBlock Grid.Column="1"
+                                       Text="{Binding DurationFormatted}"
+                                       FontSize="12"
+                                       Opacity="0.5"
+                                       VerticalAlignment="Center"
+                                       Margin="8,0" />
+                        </Grid>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+
+            <!-- History section -->
+            <TextBlock Text="{loc:T Queue.History}"
+                       Grid.Row="5"
+                       FontSize="18"
+                       FontWeight="SemiBold"
+                       Margin="0,0,0,8"
+                       IsVisible="{Binding !!History.Count}" />
+
+            <ListBox Grid.Row="6"
+                     Classes="track-list"
+                     ItemsSource="{Binding History}"
+                     MaxHeight="240"
+                     IsVisible="{Binding !!History.Count}"
+                     Opacity="0.6">
+                <ListBox.ItemTemplate>
+                    <DataTemplate x:DataType="m:Track">
+                        <Grid ColumnDefinitions="*,Auto" Margin="0,2"
+                              helpers:DragFileBehavior.EnableFileDrag="True">
+                            <StackPanel Grid.Column="0">
+                                <Grid ColumnDefinitions="*,Auto">
+                                    <TextBlock Grid.Column="0"
+                                               Classes="one-line-explicit-title"
+                                               FontSize="13">
+                                        <TextBlock.Text>
+                                            <MultiBinding Converter="{x:Static helpers:QueueRowConverters.Line1}">
+                                                <Binding />
+                                                <Binding Path="$parent[UserControl].((vm:QueueViewModel)DataContext).Player.QueueRowLayout" />
+                                            </MultiBinding>
+                                        </TextBlock.Text>
+                                    </TextBlock>
+                                    <Border Grid.Column="1"
+                                            Classes="explicit-badge compact"
+                                            Margin="6,0,0,0"
+                                            IsVisible="{Binding IsExplicit}"
+                                            ToolTip.Tip="{loc:T Queue.ExplicitTip}">
+                                        <TextBlock Text="E"
+                                                   Classes="explicit-badge-text compact"
+                                                   FontSize="8"
+                                                   Opacity="0.9" />
+                                    </Border>
+                                </Grid>
+                                <!-- GitHub #147: the rows follow Settings ▸ Player ▸ Queue ▸ Queue Rows. -->
+                                <TextBlock FontSize="11"
+                                           Opacity="0.6"
+                                           TextTrimming="CharacterEllipsis"
+                                           IsVisible="{Binding $parent[UserControl].((vm:QueueViewModel)DataContext).Player.QueueRowLayout.HasLine2, FallbackValue=True}">
+                                    <TextBlock.Text>
+                                        <MultiBinding Converter="{x:Static helpers:QueueRowConverters.Line2}">
+                                            <Binding />
+                                            <Binding Path="$parent[UserControl].((vm:QueueViewModel)DataContext).Player.QueueRowLayout" />
+                                        </MultiBinding>
+                                    </TextBlock.Text>
+                                </TextBlock>
+                            </StackPanel>
+                            <TextBlock Grid.Column="1"
+                                       Text="{Binding DurationFormatted}"
+                                       FontSize="12"
+                                       Opacity="0.5"
+                                       VerticalAlignment="Center"
+                                       Margin="8,0" />
+                        </Grid>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+
+    </Grid>
+
+</UserControl>

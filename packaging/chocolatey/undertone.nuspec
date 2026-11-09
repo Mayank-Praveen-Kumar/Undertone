@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>undertone</id>
+    <version>1.1.14</version>
+    <packageSourceUrl>https://github.com/Mayank-Praveen-Kumar/Undertone/tree/main/packaging/chocolatey</packageSourceUrl>
+    <owners>heartached</owners>
+    <title>Undertone</title>
+    <authors>heartached</authors>
+    <projectUrl>https://github.com/Mayank-Praveen-Kumar/Undertone</projectUrl>
+    <iconUrl>https://raw.githubusercontent.com/Mayank-Praveen-Kumar/Undertone/main/src/Undertone/Assets/Icons/Undertone.ico</iconUrl>
+    <licenseUrl>https://github.com/Mayank-Praveen-Kumar/Undertone/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <projectSourceUrl>https://github.com/Mayank-Praveen-Kumar/Undertone</projectSourceUrl>
+    <!-- USAGE.md is gitignored as an internal doc, so the old link 404'd for everyone
+         who followed it from community.chocolatey.org. -->
+    <docsUrl>https://github.com/Mayank-Praveen-Kumar/Undertone/blob/main/README.md</docsUrl>
+    <bugTrackerUrl>https://github.com/Mayank-Praveen-Kumar/Undertone/issues</bugTrackerUrl>
+    <tags>undertone music music-player audio player lyrics</tags>
+    <summary>A music player that respects what's yours.</summary>
+    <description>
+Undertone is a desktop music player for your local library — fast browsing, synced
+lyrics, metadata editing, EQ, and more.
+
+This package downloads the official installer from the Undertone GitHub Releases
+page and installs it per-user.
+    </description>
+    <releaseNotes>https://github.com/Mayank-Praveen-Kumar/Undertone/releases/tag/v1.1.14</releaseNotes>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

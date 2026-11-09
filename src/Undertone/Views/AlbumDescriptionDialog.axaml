@@ -1,0 +1,199 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:loc="using:Undertone.Localization"
+        xmlns:vm="using:Undertone.ViewModels"
+        xmlns:controls="using:Undertone.Controls"
+        x:Class="Undertone.Views.AlbumDescriptionDialog"
+        x:DataType="vm:AlbumDetailViewModel"
+        Title="{loc:T AlbumDescription.AlbumDescription}"
+        CanResize="False"
+        WindowDecorations="None"
+        Background="Transparent"
+        TransparencyLevelHint="Transparent"
+        ShowInTaskbar="False">
+
+    <Window.Styles>
+        <!-- Shared with PlaylistDescriptionDialog (same class names, same values): the two
+             description editors are one design. -->
+        <Style Selector="TextBlock.desc-label">
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="Opacity" Value="0.5" />
+            <Setter Property="Margin" Value="16,0,0,0" />
+        </Style>
+        <!-- Fact chips under the title: small filled pills instead of the old big tiles. -->
+        <Style Selector="Border.desc-chip">
+            <Setter Property="Background" Value="{DynamicResource ChipBackground}" />
+            <Setter Property="CornerRadius" Value="999" />
+            <Setter Property="Padding" Value="10,3" />
+            <Setter Property="Margin" Value="0,0,6,6" />
+        </Style>
+        <Style Selector="Border.desc-chip > TextBlock">
+            <Setter Property="FontSize" Value="11.5" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Opacity" Value="0.8" />
+            <Setter Property="MaxWidth" Value="220" />
+            <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+        </Style>
+        <!-- The editor's text: reading size, roomy lines. -->
+        <Style Selector="TextBox.desc-editor">
+            <Setter Property="FontSize" Value="14" />
+            <Setter Property="LineHeight" Value="22" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+            <Setter Property="AcceptsReturn" Value="True" />
+        </Style>
+        <!-- Scroll bar at the pill's right edge (owner 10-09): the template's Padding wraps the
+             ScrollViewer, so the editor's right Padding is only 4 (set on the TextBox: the
+             pill-area style from PillDialogHost sits nearer and would win over a setter here)
+             and the text keeps its 18 through this margin (4 + 14). -->
+        <Style Selector="TextBox.desc-editor /template/ TextPresenter#PART_TextPresenter, TextBox.desc-editor /template/ TextBlock#PART_Placeholder">
+            <Setter Property="Margin" Value="0,0,14,0" />
+        </Style>
+        <!-- Clear: a quiet text action beside the count, not a third pill. -->
+        <Style Selector="Button.desc-clear">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="CornerRadius" Value="999" />
+            <Setter Property="Padding" Value="10,4" />
+            <Setter Property="MinHeight" Value="0" />
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Opacity" Value="0.7" />
+            <Setter Property="Cursor" Value="Hand" />
+        </Style>
+        <Style Selector="Button.desc-clear:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="{DynamicResource PillFieldBackgroundPointerOver}" />
+            <Setter Property="BorderBrush" Value="Transparent" />
+            <Setter Property="Foreground" Value="{DynamicResource SystemControlForegroundBaseHighBrush}" />
+        </Style>
+    </Window.Styles>
+
+    <!-- Owner 10-08: a brand new design in the rounded pill pop-up (blurred app behind,
+         PillDialogHost's open/close animation; every close path — Cancel, Save, Esc, Alt+F4 —
+         animates out once). Compact header (cover, one-line title, artist, fact chips), one
+         filled editor with a live count, Cancel / Save in the footer. Save goes through the
+         view model and closes on its AlbumDescriptionSaved, never through Close(result). -->
+    <controls:PillDialogHost x:Name="DialogHost">
+
+    <Grid x:Name="CardRoot" Width="640" RowDefinitions="Auto,Auto,Auto">
+
+        <!-- Header -->
+        <Border Grid.Row="0"
+                Padding="28,24,28,16"
+                BorderBrush="{DynamicResource SystemControlForegroundBaseLowBrush}"
+                BorderThickness="0,0,0,1">
+            <Grid ColumnDefinitions="84,18,*">
+                <Border Grid.Column="0"
+                        Width="84" Height="84"
+                        CornerRadius="18"
+                        ClipToBounds="True"
+                        VerticalAlignment="Top"
+                        Classes="pill-well">
+                    <Panel>
+                        <PathIcon Data="{StaticResource AlbumsIcon}"
+                                  Width="28" Height="28"
+                                  Opacity="0.45"
+                                  HorizontalAlignment="Center"
+                                  VerticalAlignment="Center"
+                                  IsVisible="{Binding HeaderArtPath, Converter={x:Static StringConverters.IsNullOrEmpty}}" />
+                        <controls:CachedImage x:Name="CoverImage"
+                                              SourcePath="{Binding HeaderArtPath}"
+                                              DecodeWidth="256"
+                                              Stretch="UniformToFill"
+                                              RenderOptions.BitmapInterpolationMode="HighQuality"
+                                              IsVisible="{Binding HeaderArtPath, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                    </Panel>
+                </Border>
+
+                <StackPanel Grid.Column="2" Spacing="2" VerticalAlignment="Center">
+                    <!-- One line, trimmed; the whole title is in the tooltip. -->
+                    <Grid ColumnDefinitions="Auto,Auto">
+                        <TextBlock x:Name="TitleText"
+                                   Grid.Column="0"
+                                   Classes="one-line-explicit-title"
+                                   Text="{Binding Album.Name}"
+                                   ToolTip.Tip="{Binding Album.Name}"
+                                   FontSize="20"
+                                   FontWeight="Bold"
+                                   MaxWidth="470" />
+                        <Border Grid.Column="1"
+                                Classes="explicit-badge"
+                                Margin="8,0,0,0"
+                                IsVisible="{Binding Album.IsExplicit}"
+                                ToolTip.Tip="{loc:T AlbumDescription.ExplicitTip}">
+                            <TextBlock Text="E"
+                                       Classes="explicit-badge-text"
+                                       FontSize="9"
+                                       Opacity="0.9" />
+                        </Border>
+                    </Grid>
+                    <TextBlock Text="{Binding Album.ArtistDisplay}"
+                               FontSize="13.5"
+                               Opacity="0.7"
+                               TextTrimming="CharacterEllipsis" />
+                    <ItemsControl x:Name="FactChips" Margin="0,8,0,-6">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <WrapPanel Orientation="Horizontal" />
+                            </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="x:String">
+                                <Border Classes="desc-chip">
+                                    <TextBlock Text="{Binding}" ToolTip.Tip="{Binding}" />
+                                </Border>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- The description: one filled editor, no white outline (accent ring on focus).
+             Enter is a new line; Ctrl+Enter saves (code-behind). -->
+        <StackPanel Grid.Row="1" Margin="28,18,28,22" Spacing="8">
+            <TextBlock Classes="desc-label" Text="{loc:T DescriptionDialog.Label}" />
+            <TextBox x:Name="DescriptionEditor"
+                     Classes="pill-area desc-editor"
+                     Text="{Binding AlbumDescriptionEditorText}"
+                     Padding="18,14,4,14"
+                     Watermark="{loc:T DescriptionDialog.AlbumPlaceholder}"
+                     Height="300"
+                     ScrollViewer.VerticalScrollBarVisibility="Auto" />
+        </StackPanel>
+
+        <!-- Footer: count + Clear on the left, Cancel / Save on the right. -->
+        <Border Grid.Row="2"
+                Padding="28,14"
+                BorderBrush="{DynamicResource SystemControlForegroundBaseLowBrush}"
+                BorderThickness="0,1,0,0">
+            <Grid ColumnDefinitions="*,Auto">
+                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                    <TextBlock x:Name="CountText"
+                               FontSize="12"
+                               Opacity="0.55"
+                               Margin="16,0,0,0"
+                               VerticalAlignment="Center" />
+                    <Button x:Name="ClearButton"
+                            Classes="desc-clear"
+                            Content="{loc:T DescriptionDialog.Clear}"
+                            ToolTip.Tip="{loc:T DescriptionDialog.ClearTip}"
+                            Click="OnClearClick" />
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="10">
+                    <Button x:Name="CancelButton"
+                            Classes="pill-secondary"
+                            Content="{loc:T AlbumDescription.Cancel}"
+                            Click="OnCancelClick"
+                            MinWidth="108" />
+                    <Button x:Name="SaveButton"
+                            Classes="pill-primary"
+                            Content="{loc:T AlbumDescription.Save}"
+                            ToolTip.Tip="{loc:T DescriptionDialog.SaveTip, MacKeys=True}"
+                            Command="{Binding SaveAlbumDescriptionEditCommand}"
+                            MinWidth="108" />
+                </StackPanel>
+            </Grid>
+        </Border>
+    </Grid>
+    </controls:PillDialogHost>
+</Window>

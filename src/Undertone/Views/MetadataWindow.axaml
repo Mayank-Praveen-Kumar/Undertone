@@ -1,0 +1,2288 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:loc="using:Undertone.Localization"
+        xmlns:presenters="using:Avalonia.Controls.Presenters"
+        xmlns:vm="using:Undertone.ViewModels"
+        xmlns:controls="using:Undertone.Controls"
+        xmlns:views="using:Undertone.Views"
+        x:Class="Undertone.Views.MetadataWindow"
+        x:DataType="vm:MetadataViewModel"
+        Title="{loc:T Metadata.Metadata}"
+        CanResize="False"
+        WindowDecorations="None"
+        Background="Transparent"
+        TransparencyLevelHint="Transparent"
+        ShowInTaskbar="False">
+
+    <Window.Styles>
+        <!-- Circular loading spinner (matches the Scan Library indicator): a rotating arc. -->
+        <Style Selector="Ellipse.loading-spinner">
+            <Setter Property="Width" Value="14"/>
+            <Setter Property="Height" Value="14"/>
+            <Setter Property="Stroke" Value="{DynamicResource AccentColorBrush}"/>
+            <Setter Property="StrokeThickness" Value="2"/>
+            <Setter Property="StrokeDashArray" Value="11,5"/>
+            <Setter Property="StrokeLineCap" Value="Round"/>
+            <Setter Property="RenderTransformOrigin" Value="50%,50%"/>
+        </Style>
+        <!-- Animation keyed on [IsVisible=True] (same pattern as LyricsView's search
+             dots): selector matching ignores visibility, so an ungated INFINITE
+             clock would keep ticking on every hidden spinner. -->
+        <Style Selector="Ellipse.loading-spinner[IsVisible=True]">
+            <Style.Animations>
+                <Animation Duration="0:0:0.85" IterationCount="INFINITE" Easing="LinearEasing">
+                    <KeyFrame Cue="0%"><Setter Property="RotateTransform.Angle" Value="0"/></KeyFrame>
+                    <KeyFrame Cue="100%"><Setter Property="RotateTransform.Angle" Value="360"/></KeyFrame>
+                </Animation>
+            </Style.Animations>
+        </Style>
+
+        <!-- Fields and the footer buttons use the pill classes (pill-field, pill-area,
+             pill-primary, pill-secondary) that PillDialogHost brings with it
+             (Undertone.UI/Assets/PillDialog.axaml). -->
+
+        <!-- The inset pill rows of the drop-downs (media kind, genre, advisory…) come with
+             ComboBox.pill-field from PillDialog.axaml; every ComboBox here is pill-field. -->
+
+        <!-- Sidebar tab rows: full-width vertical list, accent bar + tint when selected -->
+        <Style Selector="TabItem">
+            <!-- Screen readers read a section by its title; unnamed, the TabItem peer fell
+                 back to its content's type ("Avalonia.Controls.ScrollViewer", UIA 10-13). -->
+            <Setter Property="AutomationProperties.Name" Value="{Binding $self.Header}" />
+            <Setter Property="Margin" Value="0,1" />
+            <Setter Property="MinHeight" Value="34" />
+            <Setter Property="HorizontalAlignment" Value="Stretch" />
+            <Setter Property="Foreground" Value="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+            <Setter Property="Template">
+                <ControlTemplate>
+                    <!-- Tag carries the rail group label ("Info", "Lyrics", …) for the first
+                         item of each group; ChangeDot lights via the .changed class when the
+                         section holds unsaved edits. -->
+                    <StackPanel>
+                        <TextBlock Text="{TemplateBinding Tag}"
+                                   IsVisible="{TemplateBinding Tag, Converter={x:Static ObjectConverters.IsNotNull}}"
+                                   FontSize="11.5"
+                                   FontWeight="SemiBold"
+                                   Opacity="0.45"
+                                   Margin="14,12,0,6" />
+                        <Border x:Name="SidebarRow"
+                                Background="Transparent"
+                                CornerRadius="9"
+                                Cursor="Hand">
+                            <Panel>
+                                <Border x:Name="SelectionIndicator"
+                                        Width="3"
+                                        CornerRadius="2"
+                                        Margin="4,9"
+                                        HorizontalAlignment="Left"
+                                        VerticalAlignment="Stretch"
+                                        Background="{DynamicResource AccentColorBrush}"
+                                        IsVisible="False" />
+                                <TextBlock Text="{TemplateBinding Header}"
+                                           FontSize="{TemplateBinding FontSize}"
+                                           FontWeight="{TemplateBinding FontWeight}"
+                                           Foreground="{TemplateBinding Foreground}"
+                                           HorizontalAlignment="Left"
+                                           VerticalAlignment="Center"
+                                           Margin="14,7,28,7"
+                                           TextTrimming="CharacterEllipsis" />
+                                <Border x:Name="ChangeDot"
+                                        Width="6" Height="6"
+                                        CornerRadius="3"
+                                        HorizontalAlignment="Right"
+                                        VerticalAlignment="Center"
+                                        Margin="0,0,12,0"
+                                        Background="{DynamicResource AccentColorBrush}"
+                                        IsVisible="False" />
+                            </Panel>
+                        </Border>
+                    </StackPanel>
+                </ControlTemplate>
+            </Setter>
+        </Style>
+
+        <!-- The genre box is editable, so focus lands on its inner text box: name that too
+             (UIA read it as a nameless Edit, 10-13). -->
+        <Style Selector="ComboBox#GenreCombo /template/ TextBox#PART_EditableTextBox">
+            <Setter Property="AutomationProperties.Name" Value="{loc:T Metadata.Genre}" />
+        </Style>
+
+        <!-- Header "Find online" pill: an accent ring while its panel is open (it toggles). -->
+        <!-- (BorderThickness is set on the button itself: pill-secondary, loaded by the host
+             and so nearer the button than these, sets it to 0.) -->
+        <Style Selector="Button.find-online">
+            <Setter Property="BorderBrush" Value="Transparent" />
+        </Style>
+        <Style Selector="Button.find-online.on">
+            <Setter Property="BorderBrush" Value="{DynamicResource AccentColorBrush}" />
+        </Style>
+        <Style Selector="Button.find-online.on /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="BorderBrush" Value="{DynamicResource AccentColorBrush}" />
+        </Style>
+
+        <Style Selector="TextBlock.change-summary">
+            <Setter Property="Opacity" Value="0.45" />
+        </Style>
+        <Style Selector="TextBlock.change-summary.has">
+            <Setter Property="Opacity" Value="0.9" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Foreground" Value="{DynamicResource AccentColorBrush}" />
+        </Style>
+
+        <Style Selector="TabItem.changed /template/ Border#ChangeDot">
+            <Setter Property="IsVisible" Value="True" />
+        </Style>
+
+        <Style Selector="TabItem:pointerover /template/ Border#SidebarRow">
+            <Setter Property="Background" Value="#14FFFFFF" />
+        </Style>
+
+        <Style Selector="TabItem:selected /template/ Border#SidebarRow">
+            <Setter Property="Background" Value="#1FFFFFFF" />
+        </Style>
+
+        <Style Selector="TabItem:selected /template/ Border#SelectionIndicator">
+            <Setter Property="IsVisible" Value="True" />
+        </Style>
+
+        <Style Selector="TabItem:selected">
+            <Setter Property="Foreground" Value="{DynamicResource SystemControlForegroundBaseHighBrush}" />
+        </Style>
+
+        <!-- Per-line nudge / clear buttons in the Synced Lyrics inline editor -->
+        <Style Selector="Button.synced-nudge">
+            <Setter Property="Background" Value="#1AFFFFFF" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="CornerRadius" Value="6" />
+            <Setter Property="Width" Value="21" />
+            <Setter Property="Height" Value="19" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="FontSize" Value="11" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+        </Style>
+        <Style Selector="Button.synced-nudge:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="#33FFFFFF" />
+        </Style>
+        <Style Selector="Button.synced-nudge:disabled">
+            <Setter Property="Opacity" Value="0.35" />
+        </Style>
+
+        <!-- Calm rows for the Timestamp Lyrics tab: each line stays quiet until you
+             hover or edit it. Hovering brings its nudge/clear cluster to full strength;
+             focusing the timestamp marks the line with an accent bar. -->
+        <Style Selector="Border.synced-row">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="CornerRadius" Value="8" />
+            <Setter Property="Padding" Value="0,7" />
+            <Setter Property="Margin" Value="0,1" />
+        </Style>
+        <Style Selector="Border.synced-row:pointerover">
+            <Setter Property="Background" Value="#14FFFFFF" />
+        </Style>
+        <Style Selector="Border.synced-row:focus-within">
+            <Setter Property="Background" Value="#1FFFFFFF" />
+        </Style>
+
+        <Style Selector="Border.synced-accent">
+            <Setter Property="Opacity" Value="0" />
+            <Setter Property="Background" Value="{DynamicResource AccentColorBrush}" />
+            <Setter Property="Transitions">
+                <Transitions>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.12" />
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Border.synced-row:focus-within Border.synced-accent">
+            <Setter Property="Opacity" Value="1" />
+        </Style>
+
+        <Style Selector="StackPanel.synced-ctl">
+            <Setter Property="Opacity" Value="0.16" />
+            <Setter Property="Transitions">
+                <Transitions>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.12" />
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Border.synced-row:pointerover StackPanel.synced-ctl">
+            <Setter Property="Opacity" Value="1" />
+        </Style>
+        <Style Selector="Border.synced-row:focus-within StackPanel.synced-ctl">
+            <Setter Property="Opacity" Value="1" />
+        </Style>
+
+        <!-- Tab nav: vertical sidebar list on the left, selected content on the right. -->
+        <Style Selector="TabControl">
+            <Setter Property="Template">
+                <ControlTemplate>
+                    <Border Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
+                            CornerRadius="{TemplateBinding CornerRadius}"
+                            Padding="{TemplateBinding Padding}">
+                        <Grid ColumnDefinitions="Auto,*">
+                            <Border Grid.Column="0"
+                                    Width="220"
+                                    Padding="10,4,10,14"
+                                    BorderBrush="{DynamicResource SystemControlForegroundBaseLowBrush}"
+                                    BorderThickness="0,0,1,0">
+                                <ScrollViewer HorizontalScrollBarVisibility="Disabled"
+                                              VerticalScrollBarVisibility="Auto">
+                                    <ItemsPresenter Name="PART_ItemsPresenter"
+                                                    ItemsPanel="{TemplateBinding ItemsPanel}" />
+                                </ScrollViewer>
+                            </Border>
+                            <ContentPresenter Name="PART_SelectedContentHost"
+                                              Grid.Column="1"
+                                              Content="{TemplateBinding SelectedContent}"
+                                              ContentTemplate="{TemplateBinding SelectedContentTemplate}"
+                                              HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                              VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}" />
+                        </Grid>
+                    </Border>
+                </ControlTemplate>
+            </Setter>
+            <Setter Property="ItemsPanel">
+                <ItemsPanelTemplate>
+                    <StackPanel Orientation="Vertical" />
+                </ItemsPanelTemplate>
+            </Setter>
+        </Style>
+
+        <!-- Metadata volume slider uses custom visuals; the real Slider is transparent hit testing. -->
+        <Style Selector="Slider.volume-horizontal">
+            <Setter Property="Orientation" Value="Horizontal"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="{DynamicResource IslandSliderFilled}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Height" Value="20"/>
+            <Setter Property="Opacity" Value="0"/>
+        </Style>
+
+        <!-- Chromeless presenter for the artwork/animated search popups: the card
+             inside (Border.pill-popover, PillDialog.axaml) draws all chrome, so the default
+             flyout box must vanish. Padding leaves room for the card's drop shadow
+             (0 10 30: ~20 px above, ~30 at the sides, ~40 below); a uniform 14 cut it off in
+             a straight line under the card. -->
+        <Style Selector="FlyoutPresenter.search-pop">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="32,24,32,40"/>
+            <Setter Property="MaxWidth" Value="680"/>
+            <Setter Property="MaxHeight" Value="680"/>
+        </Style>
+
+    </Window.Styles>
+
+    <!-- Rounded pill pop-up (owner 10-08: rounded pill design from their reference,
+         metadata window first): the host draws the blurred, dimmed app behind, the big
+         rounded card with its shadow, and plays the open/close animation (every close
+         path, including the VM's CloseRequested, animates once before the real close).
+         It also swallows clicks/wheel on the dim area like the old overlay Border. -->
+    <controls:PillDialogHost x:Name="DialogHost">
+
+    <Grid x:Name="EditorCard" Margin="0" Width="852" Height="740" RowDefinitions="Auto,*,Auto">
+
+        <!-- Header: artwork + track title, artist, album. No band of its own: the card is
+             one surface, split only by soft hairlines. -->
+        <Border Grid.Row="0" DockPanel.Dock="Top"
+                Padding="28,22,28,16"
+                BorderBrush="{DynamicResource SystemControlForegroundBaseLowBrush}"
+                BorderThickness="0,0,0,1">
+            <Grid ColumnDefinitions="104,18,*,Auto">
+                <!-- Filled like the fields: with the header band gone, the theme's BaseLow
+                     (#000 on Dark) would vanish into the card when there is no art. -->
+                <Border Grid.Column="0"
+                        Width="104" Height="104"
+                        ClipToBounds="True"
+                        Classes="pill-well">
+                    <Panel>
+                        <TextBlock Text="{loc:T Metadata.Album}"
+                                   FontSize="11"
+                                   Opacity="0.35"
+                                   HorizontalAlignment="Center"
+                                   VerticalAlignment="Center"
+                                   IsVisible="{Binding ShowAlbumArtPlaceholderText}" />
+                        <PathIcon Data="{StaticResource SongsIcon}"
+                                  Width="40" Height="40"
+                                  Opacity="0.4"
+                                  HorizontalAlignment="Center"
+                                  VerticalAlignment="Center"
+                                  IsVisible="{Binding IsMultiSelect}" />
+                        <Image x:Name="HeaderArtwork"
+                               Source="{Binding ArtworkPreview}"
+                               Stretch="UniformToFill"
+                               IsVisible="{Binding HasArtwork}" />
+                    </Panel>
+                </Border>
+
+                <StackPanel Grid.Column="2"
+                            Spacing="2"
+                            VerticalAlignment="Center">
+                    <Grid ColumnDefinitions="Auto,Auto">
+                        <TextBlock Grid.Column="0"
+                                   Classes="one-line-explicit-title"
+                                   Text="{Binding HeaderTitle}"
+                                   FontSize="18"
+                                   FontWeight="Bold"
+                                   MaxWidth="350" />
+                        <Border Grid.Column="1"
+                                Classes="explicit-badge"
+                                Margin="8,0,0,0"
+                                IsVisible="{Binding HeaderIsExplicit}"
+                                ToolTip.Tip="{loc:T Metadata.ExplicitTip}">
+                            <TextBlock Text="E"
+                                       Classes="explicit-badge-text"
+                                       FontSize="9"
+                                       Opacity="0.9" />
+                        </Border>
+                    </Grid>
+                    <TextBlock Text="{Binding HeaderArtist}"
+                               FontSize="13"
+                               Opacity="0.7" />
+                    <TextBlock Text="{Binding HeaderAlbum}"
+                               FontSize="13"
+                               Opacity="0.5" />
+
+                    <!-- Audio quality badge: Lossless / Hi-Res Lossless / codec -->
+                    <StackPanel Orientation="Horizontal"
+                                Spacing="4"
+                                IsVisible="{Binding HeaderAudioQualityBadge, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+                        <ToolTip.Tip>
+                            <StackPanel Width="220" Spacing="4">
+                                <TextBlock Text="{Binding HeaderAudioQualityBadge}"
+                                           FontSize="13"
+                                           FontWeight="SemiBold"
+                                           Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" />
+                                <TextBlock Text="{Binding HeaderAudioQualityDetail}"
+                                           FontSize="12"
+                                           Opacity="0.9"
+                                           Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+                                <TextBlock Text="{Binding HeaderAudioQualityDescription}"
+                                           FontSize="11"
+                                           TextWrapping="Wrap"
+                                           Opacity="0.85"
+                                           Margin="0,4,0,0"
+                                           Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+                            </StackPanel>
+                        </ToolTip.Tip>
+                        <Viewbox Width="16" Height="11" VerticalAlignment="Center" Margin="0,1,0,0" Opacity="0.5">
+                            <Path Data="M8.184,0.35C9.944,0.35 10.703,3.296 11.338,5.238C11.673,3.842 11.497,3.542 11.857,3.542C11.99,3.542 12.126,3.633 12.126,3.798C12.126,3.809 12.123,3.839 12.117,3.883L12.091,4.058C12.02,4.522 11.845,5.494 11.654,6.144C13.198,10.191 14.345,4.861 14.474,3.772C14.493,3.615 14.612,3.542 14.731,3.542C14.891,3.542 15.022,3.662 14.997,3.843C14.72,5.605 14.295,8.35 12.547,8.35C11.582,8.35 11.04,7.595 10.611,6.73C9.54,4.626 9.047,1.093 7.997,1.093C7.66,1.093 7.411,1.444 7.394,1.444C7.362,1.444 7.337,1.301 7.023,0.909C7.322,0.567 7.734,0.35 8.184,0.35ZM2.458,0.354C5.211,0.354 5.456,7.618 7.014,7.618C7.197,7.618 7.394,7.507 7.61,7.256C7.729,7.458 7.851,7.638 7.978,7.796C7.667,8.151 7.28,8.35 6.795,8.35C5.054,8.349 4.306,5.434 3.663,3.466C3.511,4.097 3.432,4.669 3.402,4.925C3.382,5.088 3.263,5.163 3.143,5.163C3.009,5.163 2.874,5.071 2.874,4.908L2.874,4.908L2.877,4.87C2.966,4.223 3.146,3.243 3.347,2.56C3.079,1.858 2.745,1.091 2.252,1.091C1.257,1.091 0.687,3.591 0.527,4.925C0.508,5.088 0.388,5.163 0.268,5.163C0.135,5.163 0,5.071 0,4.908C0,4.896 0.001,4.883 0.002,4.87C0.283,2.836 0.808,0.354 2.458,0.354ZM5.315,0.35C5.809,0.35 6.339,0.608 6.797,1.211C6.822,1.241 7.078,1.639 7.159,1.777C8.277,3.802 8.818,7.627 9.881,7.627C10.065,7.627 10.264,7.513 10.484,7.256C10.604,7.458 10.726,7.638 10.852,7.796C10.542,8.15 10.155,8.35 9.67,8.35C6.933,8.349 6.636,1.09 5.128,1.09C4.788,1.09 4.536,1.444 4.519,1.444C4.487,1.444 4.462,1.301 4.148,0.909C4.455,0.558 4.87,0.35 5.315,0.35Z"
+                                  Fill="{DynamicResource SystemControlForegroundBaseHighBrush}" />
+                        </Viewbox>
+                        <TextBlock Text="{Binding HeaderAudioQualityBadge}"
+                                   FontSize="13"
+                                   FontWeight="SemiBold"
+                                   VerticalAlignment="Center"
+                                   Opacity="0.5" />
+                    </StackPanel>
+                </StackPanel>
+
+                <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="14" VerticalAlignment="Center">
+                    <!-- Find online (owner 10-08: Search metadata revamp): the entry point lives in
+                         the header so it is one click from every tab, not only Details. -->
+                    <Button Classes="pill-secondary find-online"
+                            Classes.on="{Binding SearchPanel.IsOpen}"
+                            BorderThickness="1.5"
+                            MinHeight="36"
+                            Padding="16,0"
+                            FontSize="12.5"
+                            IsVisible="{Binding ShowSearchMetadata}"
+                            Command="{Binding ToggleSearchPanelCommand}"
+                            ToolTip.Tip="{loc:T MetadataSearch.FindOnlineTip}">
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <PathIcon Data="{StaticResource SearchIcon}" Width="12" Height="12"
+                                      Foreground="{DynamicResource AccentColorBrush}" />
+                            <TextBlock Text="{loc:T MetadataSearch.FindOnline}" VerticalAlignment="Center" />
+                        </StackPanel>
+                    </Button>
+                    <!-- Favorite indicator -->
+                    <controls:HeartIcon Size="20" ShowWhenOff="False"
+                                    VerticalAlignment="Center" HorizontalAlignment="Right"
+                                    IsFavorite="{Binding HeaderIsFavorite}"
+                                    ToolTip.Tip="{loc:T Metadata.FavoritedTip}" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- Bottom: Cancel / Save buttons -->
+        <Border Grid.Row="2" DockPanel.Dock="Bottom"
+                Padding="28,14"
+                BorderBrush="{DynamicResource SystemControlForegroundBaseLowBrush}"
+                BorderThickness="0,1,0,0">
+            <Grid ColumnDefinitions="*,Auto,Auto">
+                <StackPanel Grid.Column="0"
+                            Orientation="Horizontal"
+                            Spacing="8"
+                            VerticalAlignment="Center">
+                    <!-- Save failures used to be swallowed: the dialog closed, the UI showed
+                         the new tags, and the next rescan reverted them. Surface it instead. -->
+                    <TextBlock Text="{Binding SaveErrorMessage}"
+                               Foreground="#E74856"
+                               FontSize="12"
+                               MaxWidth="520"
+                               TextWrapping="Wrap"
+                               VerticalAlignment="Center"
+                               IsVisible="{Binding HasSaveError}" />
+                    <!-- Unsaved-edit summary: "No changes yet" / "2 changes · applies to 22 files" -->
+                    <TextBlock Text="{Binding ChangeSummary}"
+                               Classes="change-summary"
+                               Classes.has="{Binding HasChanges}"
+                               FontSize="12.5"
+                               VerticalAlignment="Center"
+                               IsVisible="{Binding !HasSaveError}" />
+                </StackPanel>
+                <Button Grid.Column="1"
+                        Classes="pill-secondary"
+                        Content="{loc:T Metadata.Cancel}"
+                        Command="{Binding CancelCommand}"
+                        MinWidth="108"
+                        Margin="0,0,10,0" />
+                <!-- Named outright: its label sits in a Panel, which the peer read as
+                     "Avalonia.Controls.Panel" (UIA 10-13). -->
+                <Button Grid.Column="2"
+                        Classes="pill-primary"
+                        Command="{Binding SaveCommand}"
+                        AutomationProperties.Name="{loc:T Metadata.Save}"
+                        MinWidth="108">
+                    <Panel>
+                        <TextBlock Text="{loc:T Metadata.Save}"
+                                   HorizontalAlignment="Center"
+                                   VerticalAlignment="Center"
+                                   IsVisible="{Binding !IsSaving}" />
+                        <StackPanel Orientation="Horizontal"
+                                    Spacing="8"
+                                    HorizontalAlignment="Center"
+                                    VerticalAlignment="Center"
+                                    IsVisible="{Binding IsSaving}">
+                            <TextBlock Text="{loc:T Metadata.Saving}" VerticalAlignment="Center" />
+                            <!-- Own IsVisible mirrors the parent's so the
+                                 [IsVisible=True] animation gate can see it. -->
+                            <Ellipse Classes="loading-spinner"
+                                     Stroke="{DynamicResource AccentForegroundBrush}"
+                                     IsVisible="{Binding IsSaving}" />
+                        </StackPanel>
+                    </Panel>
+                </Button>
+            </Grid>
+        </Border>
+
+        <!-- Tab control -->
+        <TabControl x:Name="MetaTabControl"
+                    Grid.Row="1" SelectedIndex="{Binding SelectedTabIndex}"
+                    Margin="0"
+                    Padding="0"
+                    ClipToBounds="True"
+                    SelectionChanged="OnMetaTabSelectionChanged">
+
+            <!-- ═══════════ DETAILS TAB ═══════════ -->
+            <TabItem Header="{loc:T Metadata.Details}" FontSize="14" FontWeight="SemiBold"
+                     Tag="{loc:T Metadata.GroupInfo}"
+                     Classes.changed="{Binding DetailsChanged}">
+                <ScrollViewer VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled">
+                    <StackPanel Spacing="16" Margin="24,16,24,24">
+                        <!-- Owner 10-08: "remove the Find Online button inside of the Details tab".
+                             The header's Find online pill is the single entry point (one click from
+                             every tab). What stays here: the Mixed hint (multi-track selection, where
+                             most fields read "Mixed") and, after an apply, the banner saying what came
+                             in with Undo until Save. Both are direct children of this StackPanel so,
+                             while hidden, they add no spacing and the first field starts at the top. -->
+                        <TextBlock Text="{Binding MixedHint}"
+                                   IsVisible="{Binding ShowMixedHint}"
+                                   FontSize="11.5"
+                                   Opacity="0.45"
+                                   TextWrapping="Wrap" />
+                        <Border IsVisible="{Binding HasSearchApplied}"
+                                Classes="pill-well"
+                                CornerRadius="999"
+                                Padding="16,6,6,6">
+                            <Grid ColumnDefinitions="Auto,*,Auto,Auto">
+                                <PathIcon Grid.Column="0" Data="{StaticResource CheckmarkIcon}" Width="12" Height="12"
+                                          Foreground="{DynamicResource AccentColorBrush}" VerticalAlignment="Center" />
+                                <TextBlock Grid.Column="1" Text="{Binding SearchAppliedText}" FontSize="12.5"
+                                           Margin="10,0" VerticalAlignment="Center" TextWrapping="Wrap" />
+                                <Button Grid.Column="2" Classes="pill-secondary" MinHeight="30" Padding="16,0"
+                                        FontSize="12"
+                                        Content="{loc:T MetadataSearch.Undo}"
+                                        IsVisible="{Binding CanUndoSearchApply}"
+                                        Command="{Binding UndoSearchApplyCommand}" />
+                                <Button Grid.Column="3" Classes="pill-secondary" MinHeight="30" Width="30" Padding="0"
+                                        Margin="6,0,0,0"
+                                        ToolTip.Tip="{loc:T Common.Close}"
+                                        Command="{Binding DismissSearchAppliedCommand}">
+                                    <controls:LineIcon Data="{StaticResource MenuLineClose}" Width="16" Height="16" />
+                                </Button>
+                            </Grid>
+                        </Border>
+
+                        <!-- Title (per-track; hidden when editing a whole album) -->
+                        <StackPanel Spacing="4" IsVisible="{Binding ShowTrackFields}">
+                            <TextBlock Text="{loc:T Metadata.Title}" FontSize="12" Opacity="0.5" />
+                            <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.Title}" Text="{Binding Title, UpdateSourceTrigger=PropertyChanged}" />
+                        </StackPanel>
+
+                        <!-- Use Work & Movement: the fields glide open under the toggle (same
+                             CollapsibleContent as the Discord "Show album" row). The toggle and the
+                             body share one spacing-free panel so the closed state adds no gap. -->
+                        <StackPanel>
+                            <CheckBox Classes="metadata-pill-checkbox"
+                                      Content="{loc:T Metadata.UseWorkMovement}"
+                                      IsChecked="{Binding UseWorkAndMovement}" />
+                            <controls:CollapsibleContent IsOpen="{Binding UseWorkAndMovement}" Lift="10" Motion="Glide">
+                                <StackPanel Spacing="16" Margin="0,16,0,0">
+                                    <!-- Work Name -->
+                                    <StackPanel Spacing="4">
+                                        <TextBlock Text="{loc:T Metadata.WorkName}" FontSize="12" Opacity="0.5" />
+                                        <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.WorkName}" Text="{Binding WorkName, UpdateSourceTrigger=PropertyChanged}" />
+                                    </StackPanel>
+
+                                    <!-- Movement index + count + title -->
+                                    <Grid ColumnDefinitions="Auto,8,Auto,16,*">
+                                        <StackPanel Grid.Column="0" Spacing="4">
+                                            <TextBlock Text="{loc:T Metadata.Movement}" FontSize="12" Opacity="0.5" />
+                                            <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.Movement}" Text="{Binding MovementNumber, UpdateSourceTrigger=PropertyChanged}" Width="80" />
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="2" Spacing="4">
+                                            <TextBlock Text="of" FontSize="12" Opacity="0.5" />
+                                            <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.MovementCount}" Text="{Binding MovementCount, UpdateSourceTrigger=PropertyChanged}" Width="80" />
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="4" Spacing="4">
+                                            <TextBlock Text="{loc:T Metadata.Title}" FontSize="12" Opacity="0.5" />
+                                            <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.MovementTitle}" Text="{Binding MovementName, UpdateSourceTrigger=PropertyChanged}" />
+                                        </StackPanel>
+                                    </Grid>
+                                </StackPanel>
+                            </controls:CollapsibleContent>
+                        </StackPanel>
+
+                        <!-- Album -->
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="{loc:T Metadata.Album2}" FontSize="12" Opacity="0.5" />
+                            <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.Album2}" Text="{Binding Album, UpdateSourceTrigger=PropertyChanged}" Watermark="{Binding AlbumWatermark}" />
+                        </StackPanel>
+
+                        <!-- Flags in one row: compilation / explicit / show composer -->
+                        <WrapPanel Orientation="Horizontal" ItemSpacing="24" LineSpacing="10" Margin="0,2,0,2">
+                            <CheckBox Classes="metadata-pill-checkbox"
+                                      Content="{loc:T Metadata.AlbumCompilation}"
+                                      IsChecked="{Binding IsCompilation}" />
+                            <!-- Whole-album dialog only: writes ITUNESADVISORY to every track on Save.
+                                 A single track sets its advisory on the Advanced tab instead. -->
+                            <CheckBox Classes="metadata-pill-checkbox"
+                                      Content="{Binding ExplicitCheckboxLabel}"
+                                      IsChecked="{Binding IsExplicit}"
+                                      IsVisible="{Binding ShowExplicitCheckbox}"
+                                      ToolTip.Tip="{loc:T Metadata.MarksContentAsExplicitTip}" />
+                            <CheckBox Classes="metadata-pill-checkbox"
+                                      Content="{loc:T Metadata.ShowComposerAllViews}"
+                                      IsChecked="{Binding ShowComposerInAllViews}" />
+                        </WrapPanel>
+
+                        <!-- Paired fields: the Sheet layout keeps Details on one screen -->
+                        <Grid ColumnDefinitions="*,20,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto">
+                            <!-- Album Artist | Artist -->
+                            <StackPanel Grid.Row="0" Grid.Column="0" Spacing="4" Margin="0,0,0,16">
+                                <TextBlock Text="{loc:T Metadata.AlbumArtist}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.AlbumArtist}" Text="{Binding AlbumArtist, UpdateSourceTrigger=PropertyChanged}" Watermark="{Binding AlbumArtistWatermark}" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="0" Grid.Column="2" Spacing="4" Margin="0,0,0,16">
+                                <TextBlock Text="{loc:T Metadata.Artist}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.Artist}" Text="{Binding Artist, UpdateSourceTrigger=PropertyChanged}" Watermark="{Binding ArtistWatermark}" />
+                            </StackPanel>
+
+                            <!-- Composer | Grouping -->
+                            <StackPanel Grid.Row="1" Grid.Column="0" Spacing="4" Margin="0,0,0,16">
+                                <TextBlock Text="{loc:T Metadata.Composer}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.Composer}" Text="{Binding Composer, UpdateSourceTrigger=PropertyChanged}" Watermark="{Binding ComposerWatermark}" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="1" Grid.Column="2" Spacing="4" Margin="0,0,0,16">
+                                <TextBlock Text="{loc:T Metadata.Grouping}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.Grouping}" Text="{Binding Grouping, UpdateSourceTrigger=PropertyChanged}" Watermark="{Binding GroupingWatermark}" />
+                            </StackPanel>
+
+                            <!-- Genre | Year -->
+                            <StackPanel Grid.Row="2" Grid.Column="0" Spacing="4" Margin="0,0,0,16">
+                                <TextBlock Text="{loc:T Metadata.Genre}" FontSize="12" Opacity="0.5" />
+                                <!-- Editable: pick a suggestion or type a new genre (GitHub #123,
+                                     2026-10-10). Only Text is bound: a typed off-list genre
+                                     leaves SelectedItem null, which must not clear Genre. -->
+                                <ComboBox x:Name="GenreCombo"
+                                          Classes="pill-field"
+                                          AutomationProperties.Name="{loc:T Metadata.Genre}"
+                                          FontWeight="Normal"
+                                          IsEditable="True"
+                                          ItemsSource="{Binding GenreOptions}"
+                                          Text="{Binding Genre, Mode=TwoWay}"
+                                          PlaceholderText="{Binding GenreWatermark}"
+                                          ToolTip.Tip="{loc:T Metadata.GenreTip}"
+                                          HorizontalAlignment="Stretch" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="2" Grid.Column="2" Spacing="4" Margin="0,0,0,16">
+                                <TextBlock Text="{loc:T Metadata.Year}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.Year}" Text="{Binding Year, UpdateSourceTrigger=PropertyChanged}" Watermark="{Binding YearWatermark}" />
+                            </StackPanel>
+
+                            <!-- Track x of y | Disc x of y -->
+                            <StackPanel Grid.Row="3" Grid.Column="0" Spacing="4" Margin="0,0,0,16">
+                                <TextBlock Text="{loc:T Metadata.Track}" FontSize="12" Opacity="0.5" />
+                                <Grid ColumnDefinitions="*,Auto,*">
+                                    <TextBox Grid.Column="0" Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.Track}" Text="{Binding TrackNumber, UpdateSourceTrigger=PropertyChanged}" Watermark="{Binding TrackNumberWatermark}" />
+                                    <TextBlock Grid.Column="1" Text="of" FontSize="12" Opacity="0.5" VerticalAlignment="Center" Margin="10,0" />
+                                    <TextBox Grid.Column="2" Classes="pill-field" AutomationProperties.Name="{loc:T MetadataSearch.F.TrackCount}" Text="{Binding TrackCount, UpdateSourceTrigger=PropertyChanged}" Watermark="{Binding TrackCountWatermark}" />
+                                </Grid>
+                            </StackPanel>
+                            <StackPanel Grid.Row="3" Grid.Column="2" Spacing="4" Margin="0,0,0,16">
+                                <TextBlock Text="{loc:T Metadata.Disc}" FontSize="12" Opacity="0.5" />
+                                <Grid ColumnDefinitions="*,Auto,*">
+                                    <TextBox Grid.Column="0" Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.Disc}" Text="{Binding DiscNumber, UpdateSourceTrigger=PropertyChanged}" Watermark="{Binding DiscNumberWatermark}" />
+                                    <TextBlock Grid.Column="1" Text="of" FontSize="12" Opacity="0.5" VerticalAlignment="Center" Margin="10,0" />
+                                    <TextBox Grid.Column="2" Classes="pill-field" AutomationProperties.Name="{loc:T MetadataSearch.F.DiscCount}" Text="{Binding DiscCount, UpdateSourceTrigger=PropertyChanged}" Watermark="{Binding DiscCountWatermark}" />
+                                </Grid>
+                            </StackPanel>
+
+                            <!-- BPM | Play count -->
+                            <StackPanel Grid.Row="4" Grid.Column="0" Spacing="4">
+                                <TextBlock Text="{loc:T Metadata.Bpm}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.Bpm}" Text="{Binding Bpm, UpdateSourceTrigger=PropertyChanged}" Watermark="{Binding BpmWatermark}" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="4" Grid.Column="2" Spacing="4">
+                                <TextBlock Text="{loc:T Metadata.PlayCount}" FontSize="12" Opacity="0.5" />
+                                <!-- Star column keeps a long "N (Last Played …)" from pushing Reset off the edge. -->
+                                <Grid ColumnDefinitions="*,Auto" MinHeight="36">
+                                    <TextBlock Grid.Column="0" Text="{Binding PlayCountDisplay}" FontSize="14"
+                                               VerticalAlignment="Center" TextWrapping="Wrap" Margin="0,0,12,0" />
+                                    <Button Grid.Column="1" Content="{loc:T Metadata.Reset}" Command="{Binding ResetPlayCountCommand}"
+                                            Classes="accent-btn"
+                                            Padding="14,5" FontSize="12" FontWeight="Bold" Cursor="Hand" VerticalAlignment="Center"
+                                            Foreground="{DynamicResource AccentForegroundBrush}" Background="{DynamicResource AccentButtonBackground}"
+                                            CornerRadius="999" />
+                                </Grid>
+                            </StackPanel>
+                        </Grid>
+
+                        <!-- Performer | Rating (per-track; hidden for album-scoped edits) -->
+                        <Grid ColumnDefinitions="*,20,*" IsVisible="{Binding ShowTrackFields}">
+                            <StackPanel Grid.Column="0" Spacing="4">
+                                <TextBlock Text="{loc:T Metadata.Performer}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.Performer}" Text="{Binding Performer, UpdateSourceTrigger=PropertyChanged}" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="2" Spacing="6">
+                                <TextBlock Text="{loc:T Metadata.Rating}" FontSize="12" Opacity="0.5" />
+                                <StackPanel Orientation="Horizontal" Spacing="18" VerticalAlignment="Center" MinHeight="36">
+                                    <controls:RatingStars Value="{Binding Rating, Mode=TwoWay}"
+                                                          IsInteractive="True"
+                                                          Focusable="True"
+                                                          AutomationProperties.Name="{loc:T Metadata.Rating}"
+                                                          StarSize="18"
+                                                          StarSpacing="4"
+                                                          Cursor="Hand"
+                                                          Foreground="{DynamicResource AccentColorBrush}"
+                                                          VerticalAlignment="Center" />
+                                    <CheckBox Classes="metadata-pill-checkbox"
+                                              Content="{loc:T Metadata.NotLiked}"
+                                              IsChecked="{Binding IsDisliked}"
+                                              VerticalAlignment="Center" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Grid>
+
+                        <!-- Song comment -->
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="{loc:T Metadata.Comment}" FontSize="12" Opacity="0.5" />
+                            <TextBox Classes="pill-field"
+                                     AutomationProperties.Name="{loc:T Metadata.Comment}"
+                                     Text="{Binding Comment, UpdateSourceTrigger=PropertyChanged}" Watermark="{Binding CommentWatermark}" />
+                        </StackPanel>
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <!-- ═══════════ ADVANCED DETAILS TAB ═══════════ -->
+            <TabItem Header="{loc:T Metadata.AdvancedDetails}" FontSize="14" FontWeight="SemiBold" IsVisible="{Binding ShowAdvancedTab}"
+                     Classes.changed="{Binding AdvancedChanged}">
+                <ScrollViewer VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled">
+                    <StackPanel Spacing="16" Margin="24,16,24,24">
+
+                        <Grid ColumnDefinitions="Auto,*" Margin="0,0,0,0">
+                            <TextBlock Text="{loc:T Metadata.SecSorting}" FontSize="11.5" FontWeight="SemiBold" Opacity="0.45" VerticalAlignment="Center" />
+                            <Border Grid.Column="1" Height="1" Background="{DynamicResource SystemControlForegroundBaseLowBrush}" Margin="12,0,0,0" VerticalAlignment="Center" />
+                        </Grid>
+                        <Grid ColumnDefinitions="*,20,*" RowDefinitions="Auto,Auto,Auto">
+                            <StackPanel Grid.Row="0" Grid.Column="0" Spacing="4" Margin="0,0,0,14">
+                                <TextBlock Text="{loc:T Metadata.TitleSort}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.TitleSort}" Text="{Binding TitleSort}" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="0" Grid.Column="2" Spacing="4" Margin="0,0,0,14">
+                                <TextBlock Text="{loc:T Metadata.ArtistSort}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.ArtistSort}" Text="{Binding ArtistSort}" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="1" Grid.Column="0" Spacing="4" Margin="0,0,0,14">
+                                <TextBlock Text="{loc:T Metadata.AlbumSort}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.AlbumSort}" Text="{Binding AlbumSort}" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="1" Grid.Column="2" Spacing="4" Margin="0,0,0,14">
+                                <TextBlock Text="{loc:T Metadata.AlbumArtistSort}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.AlbumArtistSort}" Text="{Binding AlbumArtistSort}" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3" Spacing="4">
+                                <TextBlock Text="{loc:T Metadata.ComposerSort}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.ComposerSort}" Text="{Binding ComposerSort}" />
+                            </StackPanel>
+                        </Grid>
+
+                        <Grid ColumnDefinitions="Auto,*" Margin="0,18,0,0">
+                            <TextBlock Text="{loc:T Metadata.SecPeople}" FontSize="11.5" FontWeight="SemiBold" Opacity="0.45" VerticalAlignment="Center" />
+                            <Border Grid.Column="1" Height="1" Background="{DynamicResource SystemControlForegroundBaseLowBrush}" Margin="12,0,0,0" VerticalAlignment="Center" />
+                        </Grid>
+                        <Grid ColumnDefinitions="*,20,*" RowDefinitions="Auto,Auto">
+                            <StackPanel Grid.Row="0" Grid.Column="0" Spacing="4" Margin="0,0,0,14">
+                                <TextBlock Text="{loc:T Metadata.Conductor}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.Conductor}" Text="{Binding Conductor}" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="0" Grid.Column="2" Spacing="4" Margin="0,0,0,14">
+                                <TextBlock Text="{loc:T Metadata.Lyricist}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.Lyricist}" Text="{Binding Lyricist}" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="1" Grid.Column="0" Spacing="4" Margin="0,0,0,0">
+                                <TextBlock Text="{loc:T Metadata.PublisherLabel}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.PublisherLabel}" Text="{Binding Publisher}" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="1" Grid.Column="2" Spacing="4" Margin="0,0,0,0">
+                                <TextBlock Text="{loc:T Metadata.EncodedBy}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.EncodedBy}" Text="{Binding EncodedBy}" />
+                            </StackPanel>
+                        </Grid>
+
+                        <Grid ColumnDefinitions="Auto,*" Margin="0,18,0,0">
+                            <TextBlock Text="{loc:T Metadata.SecIdentification}" FontSize="11.5" FontWeight="SemiBold" Opacity="0.45" VerticalAlignment="Center" />
+                            <Border Grid.Column="1" Height="1" Background="{DynamicResource SystemControlForegroundBaseLowBrush}" Margin="12,0,0,0" VerticalAlignment="Center" />
+                        </Grid>
+                        <Grid ColumnDefinitions="*,16,*,16,*">
+                            <StackPanel Grid.Column="0" Spacing="4" Margin="0,0,0,0">
+                                <TextBlock Text="{loc:T Metadata.ISRC}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.ISRC}" Text="{Binding Isrc}" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="2" Spacing="4" Margin="0,0,0,0">
+                                <TextBlock Text="{loc:T Metadata.CatalogNumber}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.CatalogNumber}" Text="{Binding CatalogNumber}" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="4" Spacing="4" Margin="0,0,0,0">
+                                <TextBlock Text="{loc:T Metadata.BarcodeUPC}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.BarcodeUPC}" Text="{Binding Barcode}" />
+                            </StackPanel>
+                        </Grid>
+
+                        <Grid ColumnDefinitions="Auto,*" Margin="0,18,0,0">
+                            <TextBlock Text="{loc:T Metadata.SecContent}" FontSize="11.5" FontWeight="SemiBold" Opacity="0.45" VerticalAlignment="Center" />
+                            <Border Grid.Column="1" Height="1" Background="{DynamicResource SystemControlForegroundBaseLowBrush}" Margin="12,0,0,0" VerticalAlignment="Center" />
+                        </Grid>
+                        <Grid ColumnDefinitions="*,20,*" RowDefinitions="Auto,Auto,Auto,Auto">
+                            <StackPanel Grid.Row="0" Grid.Column="0" Spacing="4" Margin="0,0,0,14">
+                                <TextBlock Text="{loc:T Metadata.ITunesAdvisory}" FontSize="12" Opacity="0.5" />
+                                <ComboBox Classes="pill-field"
+                                          AutomationProperties.Name="{loc:T Metadata.ITunesAdvisory}"
+                                          ItemsSource="{x:Static vm:MetadataViewModel.AdvisoryOptions}"
+                                          SelectedItem="{Binding SelectedAdvisory}"
+                                          HorizontalAlignment="Stretch">
+                                    <!-- "Explicit" carries the app's explicit "E" badge (the
+                                         title rows' compact one), in the list and the closed box
+                                         (owner 10-27). The item's name stays its string content,
+                                         "Explicit". Pinned by MetadataWindowLyricsScrollTests. -->
+                                    <ComboBox.SelectionBoxItemTemplate>
+                                         <DataTemplate>
+                                             <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                                 <presenters:TextPresenter Text="{Binding}"
+                                                                           FontWeight="Normal"
+                                                                           VerticalAlignment="Center" />
+                                                 <Border Classes="explicit-badge compact"
+                                                         Margin="6,0,0,0"
+                                                         IsVisible="{Binding Converter={x:Static ObjectConverters.Equal}, ConverterParameter=Explicit}">
+                                                     <TextBlock Text="E"
+                                                                Classes="explicit-badge-text compact"
+                                                                FontSize="8"
+                                                                Opacity="0.9" />
+                                                 </Border>
+                                             </StackPanel>
+                                         </DataTemplate>
+                                    </ComboBox.SelectionBoxItemTemplate>
+                                    <ComboBox.ItemTemplate>
+                                        <DataTemplate>
+                                            <StackPanel Orientation="Horizontal">
+                                                <presenters:TextPresenter Text="{Binding}"
+                                                                          FontWeight="Normal"
+                                                                          VerticalAlignment="Center" />
+                                                <Border Classes="explicit-badge compact"
+                                                        Margin="6,0,0,0"
+                                                        IsVisible="{Binding Converter={x:Static ObjectConverters.Equal}, ConverterParameter=Explicit}">
+                                                    <TextBlock Text="E"
+                                                               Classes="explicit-badge-text compact"
+                                                               FontSize="8"
+                                                               Opacity="0.9" />
+                                                </Border>
+                                            </StackPanel>
+                                        </DataTemplate>
+                                    </ComboBox.ItemTemplate>
+                                </ComboBox>
+                            </StackPanel>
+                            <StackPanel Grid.Row="0" Grid.Column="2" Spacing="4" Margin="0,0,0,14">
+                                <TextBlock Text="{loc:T Metadata.Language}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.Language}" Text="{Binding Language}" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="1" Grid.Column="0" Spacing="4" Margin="0,0,0,14">
+                                <TextBlock Text="{loc:T Metadata.Mood}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.Mood}" Text="{Binding Mood}" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="1" Grid.Column="2" Spacing="4" Margin="0,0,0,14">
+                                <TextBlock Text="{loc:T Metadata.ReleaseDate}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.ReleaseDate}" Text="{Binding AdvReleaseDate}" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3" Spacing="4" Margin="0,0,0,14">
+                                <TextBlock Text="{loc:T Metadata.Description}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.Description}" Text="{Binding AdvDescription}" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="3" Spacing="4">
+                                <TextBlock Text="{loc:T Metadata.Copyright}" FontSize="12" Opacity="0.5" />
+                                <TextBox Classes="pill-field" AutomationProperties.Name="{loc:T Metadata.Copyright}" Text="{Binding Copyright}" />
+                            </StackPanel>
+                        </Grid>
+
+                        <Grid ColumnDefinitions="Auto,*" Margin="0,18,0,0">
+                            <TextBlock Text="{loc:T Metadata.SecTechnical}" FontSize="11.5" FontWeight="SemiBold" Opacity="0.45" VerticalAlignment="Center" />
+                            <Border Grid.Column="1" Height="1" Background="{DynamicResource SystemControlForegroundBaseLowBrush}" Margin="12,0,0,0" VerticalAlignment="Center" />
+                        </Grid>
+                        <Grid ColumnDefinitions="*,20,*" RowDefinitions="Auto,Auto">
+                            <StackPanel Grid.Row="0" Grid.Column="0" Spacing="2" Margin="0,0,0,12">
+                                <TextBlock Text="{loc:T Metadata.Encoder}" FontSize="12" Opacity="0.5" />
+                                <TextBlock Text="{Binding Encoder}" FontSize="14" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="0" Grid.Column="2" Spacing="2" Margin="0,0,0,12"
+                                        IsVisible="{Binding ReplayGainTrackGain, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+                                <TextBlock Text="{loc:T Metadata.TrackGain}" FontSize="12" Opacity="0.5" />
+                                <TextBlock FontSize="14"><Run Text="{Binding ReplayGainTrackGain}" /><Run Text="  ·  " Foreground="{DynamicResource SystemControlForegroundBaseMediumLowBrush}" /><Run Text="{loc:T Metadata.TrackPeak}" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" /><Run Text=" " /><Run Text="{Binding ReplayGainTrackPeak}" /></TextBlock>
+                            </StackPanel>
+                            <StackPanel Grid.Row="1" Grid.Column="2" Spacing="2"
+                                        IsVisible="{Binding ReplayGainAlbumGain, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+                                <TextBlock Text="{loc:T Metadata.AlbumGain}" FontSize="12" Opacity="0.5" />
+                                <TextBlock FontSize="14"><Run Text="{Binding ReplayGainAlbumGain}" /><Run Text="  ·  " Foreground="{DynamicResource SystemControlForegroundBaseMediumLowBrush}" /><Run Text="{loc:T Metadata.AlbumPeak}" Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" /><Run Text=" " /><Run Text="{Binding ReplayGainAlbumPeak}" /></TextBlock>
+                            </StackPanel>
+                        </Grid>
+
+                        <Grid ColumnDefinitions="Auto,*,Auto" Margin="0,18,0,0">
+                            <TextBlock Grid.Column="0" Text="{loc:T Metadata.SecCustomTags}" FontSize="11.5" FontWeight="SemiBold" Opacity="0.45" VerticalAlignment="Center" />
+                            <Border Grid.Column="1" Height="1" Background="{DynamicResource SystemControlForegroundBaseLowBrush}" Margin="12,0" VerticalAlignment="Center" />
+                            <Button Grid.Column="2"
+                                    Content="{loc:T Metadata.Add}"
+                                    Command="{Binding AddCustomTagCommand}"
+                                    Padding="12,4"
+                                    FontSize="11.5"
+                                    FontWeight="SemiBold"
+                                    CornerRadius="999"
+                                    Cursor="Hand" />
+                        </Grid>
+
+                        <ItemsControl ItemsSource="{Binding CustomTags}" Margin="0,4,0,0">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:DataType="vm:CustomTagItem">
+                                    <Grid ColumnDefinitions="*,8,2*,8,Auto" Margin="0,0,0,8">
+                                        <TextBox Grid.Column="0"
+                                                 Classes="pill-field"
+                                                 AutomationProperties.Name="{loc:T Metadata.Key}"
+                                                 Text="{Binding Key}"
+                                                 Watermark="{loc:T Metadata.Key}" />
+                                        <TextBox Grid.Column="2"
+                                                 Classes="pill-field"
+                                                 AutomationProperties.Name="{loc:T Metadata.Value}"
+                                                 Text="{Binding Value}"
+                                                 Watermark="{loc:T Metadata.Value}" />
+                                        <!-- Vector ✕ (MenuLineClose): the "✕" character isn't in
+                                             Inter and fell back to a different font per OS. -->
+                                        <Button Grid.Column="4"
+                                                Command="{Binding $parent[ItemsControl].((vm:MetadataViewModel)DataContext).RemoveCustomTagCommand}"
+                                                CommandParameter="{Binding}"
+                                                ToolTip.Tip="{loc:T Metadata.Remove}"
+                                                Width="30" Height="30"
+                                                Padding="0"
+                                                HorizontalContentAlignment="Center"
+                                                VerticalContentAlignment="Center"
+                                                CornerRadius="999"
+                                                Cursor="Hand"
+                                                VerticalAlignment="Center">
+                                            <controls:LineIcon Data="{StaticResource MenuLineClose}" Width="16" Height="16" />
+                                        </Button>
+                                    </Grid>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+
+                        <TextBlock Text="{loc:T Metadata.TagsNotCoveredBy}"
+                                   FontSize="11"
+                                   Opacity="0.3"
+                                   TextWrapping="Wrap"
+                                   IsVisible="{Binding !CustomTags.Count}" />
+
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <!-- ═══════════ ARTWORK TAB ═══════════ -->
+            <TabItem Header="{loc:T Metadata.Artwork}" FontSize="14" FontWeight="SemiBold"
+                     Classes.changed="{Binding ArtworkChanged}">
+                <DockPanel Margin="24,16">
+                    <!-- Toolbar: tab title (actions live in the stack beside the preview) -->
+                    <Grid DockPanel.Dock="Top" ColumnDefinitions="Auto,Auto,*" Margin="2,0,0,12">
+                        <TextBlock Grid.Column="0"
+                                   Text="{loc:T Metadata.Artwork}"
+                                   FontSize="14.5"
+                                   FontWeight="Bold"
+                                   VerticalAlignment="Center" />
+                        <Border Grid.Column="1"
+                                Background="#12FFFFFF"
+                                CornerRadius="999"
+                                Padding="10,3"
+                                Margin="10,0,0,0"
+                                VerticalAlignment="Center"
+                                IsVisible="{Binding ArtworkDimensions, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+                            <TextBlock Text="{Binding ArtworkDimensions}"
+                                       FontSize="10.5"
+                                       FontWeight="Bold"
+                                       Opacity="0.75" />
+                        </Border>
+                        <TextBlock Grid.Column="2"
+                                   Text="{loc:T Metadata.ArtworkSharedByAlbum}"
+                                   FontSize="12" Opacity="0.5"
+                                   HorizontalAlignment="Right"
+                                   VerticalAlignment="Center"
+                                   IsVisible="{Binding ShowSharedByAlbumHint}" />
+                        <!-- This track's own embedded cover (per-track covers) -->
+                        <TextBlock Grid.Column="2"
+                                   Text="{loc:T Metadata.ArtworkOwnTrack}"
+                                   FontSize="12" Opacity="0.5"
+                                   HorizontalAlignment="Right"
+                                   VerticalAlignment="Center"
+                                   IsVisible="{Binding ShowsOwnTrackArtwork}" />
+                    </Grid>
+
+                    <!-- Artwork action buttons (vertical stack right of the preview) -->
+                    <StackPanel x:Name="ArtworkButtonsBar"
+                                DockPanel.Dock="Right"
+                                Orientation="Vertical"
+                                Width="168"
+                                VerticalAlignment="Center"
+                                Spacing="9"
+                                Margin="18,0,0,0">
+                        <!-- Search popup: opened from code-behind, centered over the
+                             artwork preview so it reads as part of the tab. -->
+                        <FlyoutBase.AttachedFlyout>
+                            <Flyout Placement="Center" ShowMode="Standard"
+                                    FlyoutPresenterClasses="search-pop">
+                                <Panel>
+                                    <!-- Searching / status card (shown while loading, before results exist) -->
+                                    <Border Classes="pill-popover"
+                                            Padding="26,20"
+                                            MinWidth="220"
+                                            HorizontalAlignment="Center"
+                                            IsVisible="{Binding !HasArtworkSearchResults}">
+                                        <StackPanel Spacing="12">
+                                            <Ellipse Classes="loading-spinner"
+                                                     Width="18" Height="18"
+                                                     HorizontalAlignment="Center"
+                                                     IsVisible="{Binding IsSearchingArtwork}" />
+                                            <TextBlock Text="{Binding ArtworkSearchStatus}"
+                                                       FontSize="12.5"
+                                                       Opacity="0.85"
+                                                       TextWrapping="Wrap"
+                                                       TextAlignment="Center"
+                                                       MaxWidth="260"
+                                                       HorizontalAlignment="Center"/>
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- Full results card: hugs its content instead of a
+                                         fixed width so a single result doesn't float in a
+                                         huge empty box. -->
+                                    <Border Classes="pill-popover" Padding="22,18,22,20" MaxWidth="580"
+                                            HorizontalAlignment="Center"
+                                            IsVisible="{Binding HasArtworkSearchResults}">
+                                    <StackPanel Spacing="14">
+                                        <StackPanel Spacing="1">
+                                            <TextBlock Text="{loc:T Metadata.ChooseArtwork}"
+                                                       FontSize="14" FontWeight="Bold"/>
+                                            <TextBlock Text="{loc:T Metadata.FromAppleMusic}"
+                                                       FontSize="11" Opacity="0.5"/>
+                                        </StackPanel>
+                                        <ScrollViewer MaxHeight="340" HorizontalScrollBarVisibility="Disabled">
+                                            <ItemsControl ItemsSource="{Binding ArtworkSearchResults}"
+                                                          Margin="0,0,-14,-14">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate>
+                                                        <WrapPanel Orientation="Horizontal"/>
+                                                    </ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <StackPanel Spacing="7" Width="118"
+                                                                    Margin="0,0,14,14"
+                                                                    ToolTip.Tip="{Binding CollectionName}">
+                                                            <Border CornerRadius="10" ClipToBounds="True"
+                                                                    Width="118" Height="118"
+                                                                    Background="#1AFFFFFF">
+                                                                <Image Source="{Binding Thumbnail}"
+                                                                       Stretch="UniformToFill"
+                                                                       RenderOptions.BitmapInterpolationMode="HighQuality"/>
+                                                            </Border>
+                                                            <StackPanel Spacing="1">
+                                                                <TextBlock Text="{Binding CollectionName}"
+                                                                           FontSize="11.5" FontWeight="SemiBold"
+                                                                           TextTrimming="CharacterEllipsis"
+                                                                           MaxLines="1"/>
+                                                                <TextBlock Text="{Binding ArtistName}"
+                                                                           FontSize="10.5" Opacity="0.55"
+                                                                           TextTrimming="CharacterEllipsis"
+                                                                           MaxLines="1"/>
+                                                            </StackPanel>
+                                                            <Grid ColumnDefinitions="*,6,*">
+                                                                <Button Grid.Column="0"
+                                                                        Classes="pill-secondary"
+                                                                        Content="{loc:T Metadata.Standard}"
+                                                                        HorizontalAlignment="Stretch"
+                                                                        MinHeight="0"
+                                                                        Padding="0,5"
+                                                                        FontSize="10.5"
+                                                                        Command="{Binding $parent[Window].((vm:MetadataViewModel)DataContext).SelectStandardArtworkResultCommand}"
+                                                                        CommandParameter="{Binding}" />
+                                                                <Button Grid.Column="2"
+                                                                        Classes="pill-primary"
+                                                                        Content="{loc:T Metadata.Max}"
+                                                                        HorizontalAlignment="Stretch"
+                                                                        MinHeight="0"
+                                                                        Padding="0,5"
+                                                                        FontSize="10.5"
+                                                                        Command="{Binding $parent[Window].((vm:MetadataViewModel)DataContext).SelectHighestArtworkResultCommand}"
+                                                                        CommandParameter="{Binding}" />
+                                                            </Grid>
+                                                        </StackPanel>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+                                        </ScrollViewer>
+
+                                        <!-- Downloading indicator (shown after Standard/Max is clicked) -->
+                                        <StackPanel Orientation="Horizontal"
+                                                    HorizontalAlignment="Center"
+                                                    Spacing="8"
+                                                    IsVisible="{Binding IsDownloadingArtwork}">
+                                            <!-- Own IsVisible mirrors the parent's so the
+                                                 [IsVisible=True] animation gate can see it. -->
+                                            <Ellipse Classes="loading-spinner"
+                                                     VerticalAlignment="Center"
+                                                     IsVisible="{Binding IsDownloadingArtwork}"/>
+                                            <TextBlock Text="{loc:T Metadata.Downloading}"
+                                                       FontSize="11"
+                                                       Opacity="0.75"
+                                                       VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                    </StackPanel>
+                                    </Border>
+                                </Panel>
+                            </Flyout>
+                        </FlyoutBase.AttachedFlyout>
+
+                        <Button x:Name="SearchArtworkBtn"
+                                Command="{Binding SearchArtworkCommand}"
+                                Classes="accent-pill"
+                                HorizontalAlignment="Stretch"
+                                Padding="14,7"
+                                CornerRadius="999"
+                                Cursor="Hand"
+                                FontWeight="SemiBold"
+                                FontSize="12"
+                                Content="{loc:T Metadata.SearchArtwork}" />
+                        <Button Command="{Binding AddArtworkCommand}"
+                                CommandParameter="{Binding $parent[Window]}"
+                                HorizontalAlignment="Stretch"
+                                Padding="14,7"
+                                CornerRadius="999"
+                                Cursor="Hand"
+                                FontWeight="SemiBold"
+                                FontSize="12"
+                                Content="{loc:T Metadata.AddFromFile}" />
+                        <Button Command="{Binding DownloadArtworkCommand}"
+                                CommandParameter="{Binding $parent[Window]}"
+                                IsVisible="{Binding HasArtwork}"
+                                HorizontalAlignment="Stretch"
+                                Padding="14,7"
+                                CornerRadius="999"
+                                Cursor="Hand"
+                                FontWeight="SemiBold"
+                                FontSize="12"
+                                Content="{loc:T Metadata.Download}" />
+                        <Button Classes="danger-ghost-pill"
+                                Command="{Binding RemoveArtworkCommand}"
+                                IsVisible="{Binding HasArtwork}"
+                                HorizontalAlignment="Stretch"
+                                Padding="14,7"
+                                CornerRadius="999"
+                                Cursor="Hand"
+                                FontWeight="SemiBold"
+                                FontSize="12"
+                                Content="{loc:T Metadata.Remove}" />
+                    </StackPanel>
+
+                    <!-- Artwork preview centered in the space left of the action stack.
+                         Also the anchor the search popup opens centered over. Filled like the
+                         fields (pill-well): the theme's BaseLow is the card's own colour on
+                         Dark, so an empty preview vanished into the card. -->
+                    <Border x:Name="ArtworkPreviewAnchor"
+                            Classes="pill-well"
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Center"
+                            Width="400" Height="400"
+                            CornerRadius="24"
+                            ClipToBounds="True">
+                        <Panel>
+                            <TextBlock Text="{loc:T Metadata.NoArtwork}"
+                                       FontSize="18"
+                                       Opacity="0.3"
+                                       HorizontalAlignment="Center"
+                                       VerticalAlignment="Center"
+                                       IsVisible="{Binding !HasArtwork}" />
+                            <Image Source="{Binding ArtworkPreview}"
+                                   Stretch="Uniform"
+                                   RenderOptions.BitmapInterpolationMode="HighQuality"
+                                   IsVisible="{Binding HasArtwork}" />
+                        </Panel>
+                    </Border>
+                </DockPanel>
+            </TabItem>
+
+            <!-- ═══════════ ANIMATED ARTWORK TAB ═══════════ -->
+            <TabItem Header="{loc:T Metadata.AnimatedArtwork}" FontSize="14" FontWeight="SemiBold" IsVisible="{Binding ShowAnimatedArtworkTab}"
+                     Classes.changed="{Binding AnimatedArtworkChanged}">
+                <DockPanel Margin="24,16">
+                    <!-- Toolbar: tab title (actions live in the stack beside the preview) -->
+                    <Grid DockPanel.Dock="Top" ColumnDefinitions="Auto,*" Margin="2,0,0,12">
+                        <TextBlock Grid.Column="0"
+                                   Text="{loc:T Metadata.AnimatedArtwork}"
+                                   FontSize="14.5"
+                                   FontWeight="Bold"
+                                   VerticalAlignment="Center" />
+                        <TextBlock Grid.Column="1"
+                                   Text="{loc:T Metadata.AnimatedArtworkHint}"
+                                   FontSize="12" Opacity="0.5"
+                                   HorizontalAlignment="Right"
+                                   VerticalAlignment="Center"
+                                   Margin="16,0,0,0"
+                                   TextTrimming="CharacterEllipsis" />
+                    </Grid>
+
+                    <!-- Action buttons (vertical stack right of the preview, mirrors the Artwork tab) -->
+                    <StackPanel DockPanel.Dock="Right"
+                                Orientation="Vertical"
+                                Width="168"
+                                VerticalAlignment="Center"
+                                Spacing="9"
+                                Margin="18,0,0,0">
+                        <Button x:Name="SearchAnimatedArtworkButton"
+                                Command="{Binding SearchAnimatedCoverCommand}"
+                                AutomationProperties.Name="{loc:T Metadata.SearchAnimatedArtwork}"
+                                Classes="accent-pill"
+                                HorizontalAlignment="Stretch"
+                                Padding="14,7"
+                                CornerRadius="999"
+                                Cursor="Hand"
+                                FontWeight="SemiBold"
+                                FontSize="12"
+                                ToolTip.Tip="{Binding AnimatedSearchStatus}">
+                            <!-- Wraps: the label no longer fits the 168px column on one line. -->
+                            <TextBlock Text="{loc:T Metadata.SearchAnimatedArtwork}"
+                                       TextWrapping="Wrap"
+                                       TextAlignment="Center" />
+                        </Button>
+
+                        <Button Content="{loc:T Metadata.AddFromFile}"
+                                Command="{Binding AddAnimatedCoverCommand}"
+                                CommandParameter="{Binding $parent[Window]}"
+                                HorizontalAlignment="Stretch"
+                                Padding="14,7"
+                                CornerRadius="999"
+                                Cursor="Hand"
+                                FontWeight="SemiBold"
+                                FontSize="12" />
+                        <Button Content="{loc:T Metadata.Download}"
+                                Command="{Binding DownloadAnimatedCoverCommand}"
+                                CommandParameter="{Binding $parent[Window]}"
+                                IsVisible="{Binding HasAnimatedCover}"
+                                HorizontalAlignment="Stretch"
+                                Padding="14,7"
+                                CornerRadius="999"
+                                Cursor="Hand"
+                                FontWeight="SemiBold"
+                                FontSize="12" />
+                        <Button Classes="danger-ghost-pill"
+                                Content="{loc:T Metadata.Remove}"
+                                Command="{Binding RemoveAnimatedCoverCommand}"
+                                IsVisible="{Binding HasAnimatedCover}"
+                                HorizontalAlignment="Stretch"
+                                Padding="14,7"
+                                CornerRadius="999"
+                                Cursor="Hand"
+                                FontWeight="SemiBold"
+                                FontSize="12" />
+                    </StackPanel>
+
+                    <!-- pill-well, as the Artwork tab's preview: BaseLow vanished into the card. -->
+                    <Border x:Name="AnimatedCoverPreviewAnchor"
+                            Classes="pill-well"
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Center"
+                            Width="400" Height="400"
+                            CornerRadius="24"
+                            ClipToBounds="True">
+                        <!-- Chooser pop-up: opened from code-behind, centered over the preview so it
+                             reads as part of the tab. Same shape as the Artwork tab's chooser (a
+                             scrollable grid of albums) with the search box inside, so a miss can be
+                             refined and searched again without closing it. -->
+                        <FlyoutBase.AttachedFlyout>
+                            <Flyout Placement="Center" ShowMode="Standard"
+                                    FlyoutPresenterClasses="search-pop">
+                                <Border Classes="pill-popover" Padding="22,18,22,20" Width="600">
+                                    <Border.Styles>
+                                        <!-- Kill the accent-button hover/press scale that gets clipped by the flyout border. -->
+                                        <Style Selector="Button.anim-variant:pointerover">
+                                            <Setter Property="RenderTransform" Value="scale(1)" />
+                                        </Style>
+                                        <Style Selector="Button.anim-variant:pressed">
+                                            <Setter Property="RenderTransform" Value="scale(1)" />
+                                        </Style>
+                                        <!-- The poster is a button (click = preview) but should look like a tile. -->
+                                        <Style Selector="Button.anim-poster">
+                                            <Setter Property="Background" Value="Transparent" />
+                                            <Setter Property="BorderThickness" Value="0" />
+                                            <Setter Property="Padding" Value="0" />
+                                            <Setter Property="Cursor" Value="Hand" />
+                                            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                            <Setter Property="VerticalContentAlignment" Value="Stretch" />
+                                        </Style>
+                                        <Style Selector="Button.anim-poster:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+                                            <Setter Property="Background" Value="Transparent" />
+                                        </Style>
+                                        <Style Selector="Button.anim-poster:pressed /template/ ContentPresenter#PART_ContentPresenter">
+                                            <Setter Property="Background" Value="Transparent" />
+                                        </Style>
+                                        <Style Selector="Button.anim-poster Border.play-badge">
+                                            <Setter Property="Opacity" Value="0.85" />
+                                        </Style>
+                                        <Style Selector="Button.anim-poster:pointerover Border.play-badge">
+                                            <Setter Property="Opacity" Value="1" />
+                                        </Style>
+                                    </Border.Styles>
+                                    <StackPanel Spacing="12">
+                                        <StackPanel Spacing="1">
+                                            <TextBlock Text="{loc:T Metadata.ChooseAnimatedArtwork}"
+                                                       FontSize="14" FontWeight="Bold"/>
+                                            <TextBlock Text="{loc:T Metadata.FromAppleMusic}"
+                                                       FontSize="11" Opacity="0.5"/>
+                                        </StackPanel>
+
+                                        <!-- Refine and search again in place. Empty = the track's tags,
+                                             which the watermark shows. -->
+                                        <Grid ColumnDefinitions="*,8,Auto">
+                                            <TextBox x:Name="AnimatedChooserSearchBox"
+                                                     Grid.Column="0"
+                                                     Classes="pill-field"
+                                                     AutomationProperties.Name="{loc:T Metadata.AnimSearchBoxHint}"
+                                                     ToolTip.Tip="{loc:T Metadata.AnimSearchBoxHint}"
+                                                     Text="{Binding AnimatedSearchInput, Mode=TwoWay}"
+                                                     Watermark="{Binding AnimatedSearchQueryHint}"
+                                                     FontSize="12">
+                                                <TextBox.KeyBindings>
+                                                    <KeyBinding Gesture="Enter" Command="{Binding SearchAnimatedCoverCommand}" />
+                                                </TextBox.KeyBindings>
+                                            </TextBox>
+                                            <Button Grid.Column="2"
+                                                    Classes="pill-primary anim-variant"
+                                                    MinHeight="0"
+                                                    Padding="16,7"
+                                                    FontSize="12"
+                                                    Command="{Binding SearchAnimatedCoverCommand}"
+                                                    AutomationProperties.Name="{loc:T Metadata.AnimSearchButton}">
+                                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                                    <PathIcon Data="{StaticResource SearchIcon}" Width="11" Height="11"
+                                                              VerticalAlignment="Center" />
+                                                    <TextBlock Text="{loc:T Metadata.AnimSearchButton}" VerticalAlignment="Center" />
+                                                </StackPanel>
+                                            </Button>
+                                        </Grid>
+
+                                        <!-- Searching / nothing found / error (before any result exists) -->
+                                        <StackPanel Spacing="8"
+                                                    Margin="0,14"
+                                                    HorizontalAlignment="Center"
+                                                    IsVisible="{Binding !HasAnimatedArtworkSearchResults}">
+                                            <Ellipse Classes="loading-spinner"
+                                                     Width="18" Height="18"
+                                                     HorizontalAlignment="Center"
+                                                     IsVisible="{Binding IsSearchingAnimatedCover}" />
+                                            <TextBlock Text="{Binding AnimatedSearchStatus}"
+                                                       FontSize="12.5"
+                                                       Opacity="0.85"
+                                                       TextWrapping="Wrap"
+                                                       TextAlignment="Center"
+                                                       MaxWidth="420"
+                                                       HorizontalAlignment="Center"/>
+                                            <TextBlock Text="{Binding AnimatedSearchDetail}"
+                                                       FontSize="11"
+                                                       Opacity="0.55"
+                                                       TextWrapping="Wrap"
+                                                       TextAlignment="Center"
+                                                       MaxWidth="420"
+                                                       HorizontalAlignment="Center"
+                                                       IsVisible="{Binding AnimatedSearchDetail, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+                                        </StackPanel>
+
+                                        <!-- Results grid, best match first -->
+                                        <ScrollViewer MaxHeight="372"
+                                                      HorizontalScrollBarVisibility="Disabled"
+                                                      IsVisible="{Binding HasAnimatedArtworkSearchResults}">
+                                            <ItemsControl ItemsSource="{Binding AnimatedArtworkSearchResults}"
+                                                          Margin="0,0,-14,-14">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate>
+                                                        <WrapPanel Orientation="Horizontal"/>
+                                                    </ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <StackPanel Spacing="7" Width="124"
+                                                                    Margin="0,0,14,14">
+                                                            <!-- Poster: the loop's still; click plays the loop in place. -->
+                                                            <Button Classes="anim-poster"
+                                                                    Width="124" Height="124"
+                                                                    ToolTip.Tip="{loc:T Metadata.AnimPreviewTip}"
+                                                                    AutomationProperties.Name="{Binding CollectionName}"
+                                                                    Command="{Binding $parent[Window].((vm:MetadataViewModel)DataContext).PreviewAnimatedArtworkResultCommand}"
+                                                                    CommandParameter="{Binding}">
+                                                                <Border CornerRadius="10" ClipToBounds="True"
+                                                                        Background="#1AFFFFFF">
+                                                                    <Panel>
+                                                                        <Image Source="{Binding Poster}"
+                                                                               Stretch="UniformToFill"
+                                                                               RenderOptions.BitmapInterpolationMode="HighQuality"/>
+                                                                        <controls:AnimatedCoverImage
+                                                                            Source="{Binding PreviewPath}"
+                                                                            IsActive="{Binding IsPreviewing}"
+                                                                            IsVisible="{Binding IsPreviewing}"/>
+                                                                        <Ellipse Classes="loading-spinner"
+                                                                                 Width="16" Height="16"
+                                                                                 HorizontalAlignment="Center"
+                                                                                 VerticalAlignment="Center"
+                                                                                 IsVisible="{Binding IsPreviewLoading}"/>
+                                                                        <Border Classes="play-badge"
+                                                                                Width="26" Height="26"
+                                                                                CornerRadius="13"
+                                                                                Background="#99000000"
+                                                                                HorizontalAlignment="Left"
+                                                                                VerticalAlignment="Bottom"
+                                                                                Margin="7">
+                                                                            <Border.IsVisible>
+                                                                                <MultiBinding Converter="{x:Static BoolConverters.And}" FallbackValue="{x:False}">
+                                                                                    <Binding Path="!IsPreviewing" />
+                                                                                    <Binding Path="!IsPreviewLoading" />
+                                                                                </MultiBinding>
+                                                                            </Border.IsVisible>
+                                                                            <Viewbox Width="10" Height="10" Margin="1,0,0,0"
+                                                                                     HorizontalAlignment="Center" VerticalAlignment="Center">
+                                                                                <Path Data="{StaticResource PlayIcon}" Fill="White" />
+                                                                            </Viewbox>
+                                                                        </Border>
+                                                                    </Panel>
+                                                                </Border>
+                                                            </Button>
+                                                            <StackPanel Spacing="1" ToolTip.Tip="{Binding CollectionName}">
+                                                                <TextBlock Text="{Binding CollectionName}"
+                                                                           FontSize="11.5" FontWeight="SemiBold"
+                                                                           TextTrimming="CharacterEllipsis"
+                                                                           MaxLines="1"/>
+                                                                <TextBlock Text="{Binding ArtistName}"
+                                                                           FontSize="10.5" Opacity="0.55"
+                                                                           TextTrimming="CharacterEllipsis"
+                                                                           MaxLines="1"/>
+                                                                <TextBlock Text="{Binding Detail}"
+                                                                           FontSize="10" Opacity="0.45"
+                                                                           TextTrimming="CharacterEllipsis"
+                                                                           MaxLines="1"
+                                                                           IsVisible="{Binding HasDetail}"/>
+                                                            </StackPanel>
+                                                            <!-- One button per quality; the largest is the accent one,
+                                                                 as Standard / Max on the Artwork chooser. -->
+                                                            <ItemsControl ItemsSource="{Binding Choices}" Margin="-3,0">
+                                                                <ItemsControl.ItemsPanel>
+                                                                    <ItemsPanelTemplate>
+                                                                        <UniformGrid Rows="1" />
+                                                                    </ItemsPanelTemplate>
+                                                                </ItemsControl.ItemsPanel>
+                                                                <ItemsControl.ItemTemplate>
+                                                                    <DataTemplate>
+                                                                        <Button Classes="anim-variant"
+                                                                                Classes.pill-primary="{Binding IsPrimary}"
+                                                                                Classes.pill-secondary="{Binding IsSecondary}"
+                                                                                Content="{Binding Label}"
+                                                                                HorizontalAlignment="Stretch"
+                                                                                HorizontalContentAlignment="Center"
+                                                                                Margin="3,0"
+                                                                                MinHeight="0"
+                                                                                Padding="0,5"
+                                                                                FontSize="10.5"
+                                                                                Command="{Binding $parent[Window].((vm:MetadataViewModel)DataContext).SelectAnimatedArtworkResultCommand}"
+                                                                                CommandParameter="{Binding}" />
+                                                                    </DataTemplate>
+                                                                </ItemsControl.ItemTemplate>
+                                                            </ItemsControl>
+                                                        </StackPanel>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+                                        </ScrollViewer>
+
+                                        <!-- More albums still being opened while some results already show -->
+                                        <StackPanel Orientation="Horizontal"
+                                                    HorizontalAlignment="Center"
+                                                    Spacing="8">
+                                            <StackPanel.IsVisible>
+                                                <MultiBinding Converter="{x:Static BoolConverters.And}" FallbackValue="{x:False}">
+                                                    <Binding Path="HasAnimatedArtworkSearchResults" />
+                                                    <Binding Path="IsProbingAnimatedCandidates" />
+                                                </MultiBinding>
+                                            </StackPanel.IsVisible>
+                                            <Ellipse Classes="loading-spinner"
+                                                     VerticalAlignment="Center"
+                                                     IsVisible="{Binding IsProbingAnimatedCandidates}"/>
+                                            <TextBlock Text="{loc:T Metadata.AnimCheckingMore}"
+                                                       FontSize="11"
+                                                       Opacity="0.75"
+                                                       VerticalAlignment="Center"/>
+                                        </StackPanel>
+
+                                        <!-- Downloading indicator (shown after a quality is clicked) -->
+                                        <StackPanel Orientation="Horizontal"
+                                                    HorizontalAlignment="Center"
+                                                    Spacing="8"
+                                                    IsVisible="{Binding IsDownloadingAnimatedCover}">
+                                            <!-- Own IsVisible mirrors the parent's so the
+                                                 [IsVisible=True] animation gate can see it. -->
+                                            <Ellipse Classes="loading-spinner"
+                                                     VerticalAlignment="Center"
+                                                     IsVisible="{Binding IsDownloadingAnimatedCover}"/>
+                                            <TextBlock Text="{loc:T Metadata.Downloading}"
+                                                       FontSize="11"
+                                                       Opacity="0.75"
+                                                       VerticalAlignment="Center"/>
+                                        </StackPanel>
+
+                                        <!-- Errors once results are showing (a failed download), so a
+                                             failed pick is never a silent no-op. Hidden while empty. -->
+                                        <TextBlock Text="{Binding AnimatedSearchStatus}"
+                                                   FontSize="11"
+                                                   Opacity="0.75"
+                                                   HorizontalAlignment="Center"
+                                                   TextWrapping="Wrap"
+                                                   MaxWidth="420"
+                                                   TextAlignment="Center">
+                                            <TextBlock.IsVisible>
+                                                <MultiBinding Converter="{x:Static BoolConverters.And}" FallbackValue="{x:False}">
+                                                    <Binding Path="HasAnimatedArtworkSearchResults" />
+                                                    <Binding Path="AnimatedSearchStatus" Converter="{x:Static StringConverters.IsNotNullOrEmpty}" />
+                                                </MultiBinding>
+                                            </TextBlock.IsVisible>
+                                        </TextBlock>
+                                    </StackPanel>
+                                </Border>
+                            </Flyout>
+                        </FlyoutBase.AttachedFlyout>
+                        <Panel>
+                            <TextBlock Text="{loc:T Metadata.NoAnimatedArtwork}"
+                                       FontSize="18"
+                                       Opacity="0.3"
+                                       HorizontalAlignment="Center"
+                                       VerticalAlignment="Center"
+                                       IsVisible="{Binding !HasAnimatedCover}" />
+
+                            <!-- Still cover sits behind the video so there's no blank
+                                 flash while the first frame decodes after a tab switch. -->
+                            <Image Source="{Binding ArtworkPreview}"
+                                   Stretch="UniformToFill"
+                                   RenderOptions.BitmapInterpolationMode="HighQuality"
+                                   IsVisible="{Binding HasAnimatedCover}" />
+
+                            <controls:AnimatedCoverImage Source="{Binding AnimatedCoverPath}"
+                                                         IsActive="{Binding HasAnimatedCover}"
+                                                         IsVisible="{Binding HasAnimatedCover}" />
+                        </Panel>
+                    </Border>
+                </DockPanel>
+            </TabItem>
+
+            <!-- ═══════════ LYRICS TAB ═══════════ -->
+            <TabItem Header="{loc:T Metadata.PlainLyrics}" FontSize="14" FontWeight="SemiBold" IsVisible="{Binding ShowLyricsTab}"
+                     Tag="{loc:T Metadata.GroupLyrics}"
+                     Classes.changed="{Binding PlainLyricsChanged}">
+                <!-- Scrolls as a page, like Details (owner 10-27: the bar sat inside the rounded
+                     box on its own track; "move it to the right just like Details"). The box
+                     grows with its text (its own ScrollViewer is Disabled) and this page bar runs
+                     down the pane's right edge. The Border's MinHeight is the viewport, so short
+                     lyrics still fill the page with the buttons at the bottom. Typing, Ctrl+End,
+                     PageDown and the wheel bring the caret into view through this ScrollViewer.
+                     Pinned by MetadataWindowLyricsScrollTests. -->
+                <ScrollViewer x:Name="PlainLyricsScroll"
+                              VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled">
+                    <Border Padding="24,16"
+                            MinHeight="{Binding #PlainLyricsScroll.Viewport.Height}">
+                        <DockPanel>
+                            <!-- Toolbar: title left, Enable switch right -->
+                            <Grid DockPanel.Dock="Top"
+                                  ColumnDefinitions="Auto,*,Auto"
+                                  Margin="0,0,0,12">
+                                <TextBlock Grid.Column="0"
+                                           Text="{loc:T Metadata.PlainLyrics}"
+                                           FontSize="14.5"
+                                           FontWeight="Bold"
+                                           VerticalAlignment="Center"
+                                           Margin="2,0,0,0" />
+                                <StackPanel Grid.Column="2"
+                                            Orientation="Horizontal"
+                                            Spacing="10"
+                                            VerticalAlignment="Center">
+                                    <TextBlock Text="{loc:T Metadata.Enable}"
+                                               FontSize="13"
+                                               FontWeight="SemiBold"
+                                               VerticalAlignment="Center" />
+                                    <controls:LottieToggle IsChecked="{Binding HasCustomLyrics}"
+                                                           AutomationProperties.Name="{loc:T Metadata.Enable}"
+                                                           VerticalAlignment="Center" />
+                                </StackPanel>
+                            </Grid>
+
+                            <!-- Actions: bottom right -->
+                            <StackPanel DockPanel.Dock="Bottom"
+                                        Orientation="Horizontal"
+                                        HorizontalAlignment="Right"
+                                        Spacing="10"
+                                        Margin="0,12,0,0">
+                                <Button Content="{loc:T Metadata.ImportFile}"
+                                        Command="{Binding ImportLyricsFileCommand}"
+                                        CommandParameter="{Binding $self}"
+                                        ToolTip.Tip="{loc:T Metadata.LoadTxtPlainLrcTip}"
+                                        Padding="14,6"
+                                        CornerRadius="999"
+                                        FontWeight="SemiBold"
+                                        FontSize="12"
+                                        VerticalAlignment="Center"
+                                        Cursor="Hand" />
+                                <Button Content="{loc:T Metadata.ShareLyrics}"
+                                        Command="{Binding ShareLyricsCommand}"
+                                        Padding="14,6"
+                                        CornerRadius="999"
+                                        FontWeight="SemiBold"
+                                        FontSize="12"
+                                        VerticalAlignment="Center"
+                                        Cursor="Hand" />
+                            </StackPanel>
+
+                            <TextBox x:Name="PlainLyricsBox"
+                                     Classes="pill-area"
+                                     AutomationProperties.Name="{loc:T Metadata.PlainLyrics}"
+                                     Text="{Binding Lyrics}"
+                                     AcceptsReturn="True"
+                                     TextWrapping="Wrap"
+                                     MinHeight="300"
+                                     ScrollViewer.VerticalScrollBarVisibility="Disabled"
+                                     IsEnabled="{Binding HasCustomLyrics}" />
+                        </DockPanel>
+                    </Border>
+                </ScrollViewer>
+            </TabItem>
+
+            <!-- ═══════════ SYNCED LYRICS TAB ═══════════ -->
+            <TabItem Header="{loc:T Metadata.SyncedLyrics}" FontSize="14" FontWeight="SemiBold" IsVisible="{Binding ShowSyncedLyricsTab}"
+                     Classes.changed="{Binding SyncedLyricsChanged}">
+                <DockPanel Margin="24,16">
+                    <!-- Toolbar: title + line-count chip left, Formatted/Raw toggle + Enable switch right -->
+                    <Grid DockPanel.Dock="Top"
+                          ColumnDefinitions="Auto,Auto,Auto,*,Auto,Auto"
+                          Margin="0,0,0,12">
+                        <TextBlock Grid.Column="0"
+                                   Text="{loc:T Metadata.SyncedLyrics}"
+                                   FontSize="14.5"
+                                   FontWeight="Bold"
+                                   VerticalAlignment="Center"
+                                   Margin="2,0,0,0" />
+                        <Border Grid.Column="1"
+                                Background="#12FFFFFF"
+                                CornerRadius="999"
+                                Padding="10,3"
+                                Margin="10,0,0,0"
+                                VerticalAlignment="Center"
+                                IsVisible="{Binding HasSyncedLines}">
+                            <TextBlock Text="{Binding SyncedLyricLines.Count, StringFormat='{}{0} lines'}"
+                                       FontSize="10.5"
+                                       FontWeight="Bold"
+                                       Opacity="0.75" />
+                        </Border>
+                        <Border Grid.Column="2"
+                                Background="#12FFFFFF"
+                                CornerRadius="999"
+                                Padding="10,3"
+                                Margin="8,0,0,0"
+                                VerticalAlignment="Center"
+                                IsVisible="{Binding HasWordTimedLines}"
+                                ToolTip.Tip="{loc:T Metadata.LinesCarryPerWordTip}">
+                            <TextBlock Text="{loc:T Metadata.WordTiming}"
+                                       FontSize="10.5"
+                                       FontWeight="Bold"
+                                       Opacity="0.75" />
+                        </Border>
+                        <ToggleButton Grid.Column="4"
+                                      x:Name="SyncedRawToggle"
+                                      Content="{loc:T Metadata.Raw}"
+                                      FontSize="11.5"
+                                      FontWeight="SemiBold"
+                                      Padding="13,4"
+                                      CornerRadius="999"
+                                      Cursor="Hand"
+                                      VerticalAlignment="Center"
+                                      ToolTip.Tip="{loc:T Metadata.ShowRawLRCTextTip}" />
+                        <StackPanel Grid.Column="5"
+                                    Orientation="Horizontal"
+                                    Spacing="10"
+                                    Margin="16,0,0,0"
+                                    VerticalAlignment="Center">
+                            <TextBlock Text="{loc:T Metadata.Enable}"
+                                       FontSize="13"
+                                       FontWeight="SemiBold"
+                                       VerticalAlignment="Center" />
+                            <controls:LottieToggle IsChecked="{Binding HasCustomSyncedLyrics}"
+                                                   AutomationProperties.Name="{loc:T Metadata.Enable}"
+                                                   VerticalAlignment="Center" />
+                        </StackPanel>
+                    </Grid>
+
+                    <!-- Actions: status left, Search / Remove right (destructive last) -->
+                    <Grid DockPanel.Dock="Bottom"
+                          Margin="0,12,0,0"
+                          ColumnDefinitions="*,Auto">
+                        <TextBlock Grid.Column="0"
+                                   Text="{Binding SyncedLyricsSearchStatus}"
+                                   FontSize="12"
+                                   Opacity="0.75"
+                                   VerticalAlignment="Center"
+                                   Margin="2,0,16,0"
+                                   TextTrimming="CharacterEllipsis"
+                                   IsVisible="{Binding SyncedLyricsSearchStatus, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                        <StackPanel Grid.Column="1"
+                                    Orientation="Horizontal"
+                                    VerticalAlignment="Center"
+                                    Spacing="10">
+                            <TextBlock Text="{loc:T Metadata.Copied}"
+                                       FontSize="11"
+                                       Foreground="{DynamicResource AccentColorBrush}"
+                                       VerticalAlignment="Center"
+                                       IsVisible="{Binding SyncedLyricsCopied}" />
+                            <Button Content="{loc:T Metadata.CopyLyrics}"
+                                    Command="{Binding CopySyncedLyricsCommand}"
+                                    IsEnabled="{Binding HasSyncedLines}"
+                                    ToolTip.Tip="{loc:T Metadata.CopySyncedLyricsLRCTip}"
+                                    Padding="14,6"
+                                    CornerRadius="999"
+                                    Cursor="Hand"
+                                    FontWeight="SemiBold"
+                                    FontSize="12" />
+                            <Button Content="{loc:T Metadata.ImportFile}"
+                                    Command="{Binding ImportLyricsFileCommand}"
+                                    CommandParameter="{Binding $self}"
+                                    ToolTip.Tip="{loc:T Metadata.LoadLrcSyncedTxtTip}"
+                                    Padding="14,6"
+                                    CornerRadius="999"
+                                    Cursor="Hand"
+                                    FontWeight="SemiBold"
+                                    FontSize="12" />
+                            <Button Content="{loc:T Metadata.SearchLyrics}"
+                                    Command="{Binding SearchSyncedLyricsCommand}"
+                                    Padding="14,6"
+                                    CornerRadius="999"
+                                    Cursor="Hand"
+                                    FontWeight="SemiBold"
+                                    FontSize="12" />
+                            <Button Classes="danger-ghost-pill"
+                                    Content="{loc:T Metadata.Remove}"
+                                    Command="{Binding RemoveSyncedLyricsCommand}"
+                                    IsEnabled="{Binding HasCustomSyncedLyrics}"
+                                    Padding="14,6"
+                                    CornerRadius="999"
+                                    Cursor="Hand"
+                                    FontWeight="SemiBold"
+                                    FontSize="12" />
+                        </StackPanel>
+                    </Grid>
+
+                    <!-- Read-only preview; full per-line editing lives in Timestamp Lyrics.
+                         Formatted view parses lines into timestamp pills + clean text;
+                         the Raw toggle swaps in the untouched LRC text. -->
+                    <Border x:Name="SyncedPreviewCard"
+                            ClipToBounds="True"
+                            Classes="pill-well"
+                            Padding="0,10"
+                            IsEnabled="{Binding HasCustomSyncedLyrics}">
+                        <!-- The formatted preview is plain TextBlocks, which have no
+                             theme disabled-state; dim the whole card so toggling
+                             Enable off greys it like the Plain Lyrics TextBox. -->
+                        <Border.Styles>
+                            <Style Selector="Border#SyncedPreviewCard:disabled">
+                                <Setter Property="Opacity" Value="0.45"/>
+                            </Style>
+                        </Border.Styles>
+                        <Panel MinHeight="300">
+                            <TextBlock Text="{loc:T Metadata.NoSyncedLyricsYet}"
+                                       IsVisible="{Binding !HasSyncedLines}"
+                                       TextWrapping="Wrap"
+                                       TextAlignment="Center"
+                                       MaxWidth="380"
+                                       Opacity="0.6"
+                                       FontSize="13"
+                                       HorizontalAlignment="Center"
+                                       VerticalAlignment="Center"
+                                       Margin="24" />
+
+                            <!-- Formatted: one row per line, timestamp pill + text -->
+                            <ScrollViewer IsVisible="{Binding !#SyncedRawToggle.IsChecked}"
+                                          Classes="well-scroll"
+                                          VerticalScrollBarVisibility="Auto"
+                                          HorizontalScrollBarVisibility="Disabled"
+                                          Padding="12,0,16,0">
+                                <StackPanel>
+                                    <ItemsControl ItemsSource="{Binding SyncedLyricLines}"
+                                                  IsVisible="{Binding HasSyncedLines}">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate x:DataType="vm:SyncedLyricEditorLine">
+                                                <Grid ColumnDefinitions="Auto,*" Margin="0,2">
+                                                    <Border Grid.Column="0"
+                                                            Background="#14FFFFFF"
+                                                            CornerRadius="6"
+                                                            MinWidth="78"
+                                                            Padding="8,3"
+                                                            VerticalAlignment="Top">
+                                                        <TextBlock Text="{Binding TimestampText}"
+                                                                   FontFamily="Consolas, Menlo, Monaco, Courier New, monospace"
+                                                                   FontSize="11.5"
+                                                                   Foreground="{DynamicResource AccentColorBrush}"
+                                                                   HorizontalAlignment="Center" />
+                                                    </Border>
+                                                    <SelectableTextBlock Grid.Column="1"
+                                                                         Text="{Binding DisplayText}"
+                                                                         FontSize="13.5"
+                                                                         TextWrapping="Wrap"
+                                                                         Margin="12,3,8,0" />
+                                                </Grid>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </StackPanel>
+                            </ScrollViewer>
+
+                            <!-- Raw: untouched LRC text with timing tags -->
+                            <TextBox IsVisible="{Binding #SyncedRawToggle.IsChecked}"
+                                     AutomationProperties.Name="{loc:T Metadata.SyncedLyrics}"
+                                     Text="{Binding SyncedLyrics}"
+                                     IsReadOnly="True"
+                                     AcceptsReturn="True"
+                                     TextWrapping="Wrap"
+                                     VerticalContentAlignment="Top"
+                                     Background="Transparent"
+                                     BorderThickness="0"
+                                     ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                     FontFamily="Consolas, Menlo, Monaco, Courier New, monospace"
+                                     FontSize="12" />
+                        </Panel>
+                    </Border>
+                </DockPanel>
+            </TabItem>
+
+            <!-- ═══════════ TIMESTAMP LYRICS TAB ═══════════ -->
+            <!-- Inline twin of the roomy pop-out editor. Binds the same MetadataViewModel,
+                 so per-line edits flow through SyncedLyricLines and persist on Save. -->
+            <TabItem Header="{loc:T Metadata.TimestampLyrics}" FontSize="14" FontWeight="SemiBold" IsVisible="{Binding ShowSyncedLyricsTab}"
+                     Classes.changed="{Binding SyncedLyricsChanged}">
+                <DockPanel Margin="24,16">
+                    <!-- Toolbar: title + status chips left, nudge hint right -->
+                    <Grid DockPanel.Dock="Top"
+                          ColumnDefinitions="Auto,Auto,Auto,*"
+                          Margin="0,0,0,12">
+                        <TextBlock Grid.Column="0"
+                                   Text="{loc:T Metadata.TimestampLyrics}"
+                                   FontSize="14.5"
+                                   FontWeight="Bold"
+                                   VerticalAlignment="Center"
+                                   Margin="2,0,0,0" />
+                        <Border Grid.Column="1"
+                                Background="#12FFFFFF"
+                                CornerRadius="999"
+                                Padding="10,3"
+                                Margin="10,0,0,0"
+                                VerticalAlignment="Center"
+                                IsVisible="{Binding HasSyncedLines}">
+                            <TextBlock Text="{Binding SyncedLyricLines.Count, StringFormat='{}{0} lines'}"
+                                       FontSize="10.5"
+                                       FontWeight="Bold"
+                                       Opacity="0.75" />
+                        </Border>
+                        <Border Grid.Column="2"
+                                Background="#12FFFFFF"
+                                CornerRadius="999"
+                                Padding="10,3"
+                                Margin="8,0,0,0"
+                                VerticalAlignment="Center"
+                                IsVisible="{Binding HasWordTimedLines}"
+                                ToolTip.Tip="{loc:T Metadata.LinesCarryPerWordTip2}">
+                            <TextBlock Text="{loc:T Metadata.WordTiming}"
+                                       FontSize="10.5"
+                                       FontWeight="Bold"
+                                       Opacity="0.75" />
+                        </Border>
+                        <TextBlock Grid.Column="3"
+                                   Text="{loc:T Metadata.HoverOverLineNudge}"
+                                   FontSize="12" Opacity="0.5"
+                                   HorizontalAlignment="Right"
+                                   VerticalAlignment="Center"
+                                   Margin="16,0,2,0"
+                                   TextTrimming="CharacterEllipsis" />
+                    </Grid>
+
+                        <!-- Shift all (GitHub #57): move every timestamp earlier/later by
+                             the given seconds — for lyrics that are uniformly off. -->
+                        <StackPanel DockPanel.Dock="Top"
+                                    Orientation="Horizontal"
+                                    Spacing="6"
+                                    VerticalAlignment="Center"
+                                    HorizontalAlignment="Right"
+                                    Margin="0,0,2,12"
+                                    IsVisible="{Binding HasSyncedLines}">
+                            <TextBlock Text="{loc:T Metadata.ShiftAll}"
+                                       FontSize="12" FontWeight="SemiBold" Opacity="0.75"
+                                       VerticalAlignment="Center" Margin="0,0,4,0"/>
+                            <Button Content="{loc:T Metadata.Earlier}"
+                                    Command="{Binding ShiftAllEarlierCommand}"
+                                    ToolTip.Tip="{loc:T Metadata.MoveEveryLineSTip}"
+                                    Padding="12,4" CornerRadius="999" Cursor="Hand"
+                                    FontWeight="SemiBold" FontSize="12"/>
+                            <TextBox Text="{Binding ShiftAllSeconds, Mode=TwoWay}"
+                                     AutomationProperties.Name="{loc:T Metadata.SecondsShiftByTip}"
+                                     Classes="pill-field"
+                                     FontFamily="Consolas, Menlo, Monaco, Courier New, monospace"
+                                     Width="64" MinHeight="0" Padding="10,6,10,4"
+                                     FontSize="12"
+                                     HorizontalContentAlignment="Center"
+                                     VerticalContentAlignment="Center"
+                                     VerticalAlignment="Center"
+                                     ToolTip.Tip="{loc:T Metadata.SecondsShiftByTip}"/>
+                            <TextBlock Text="s" FontSize="12" Opacity="0.6" VerticalAlignment="Center"/>
+                            <Button Content="{loc:T Metadata.Later}"
+                                    Command="{Binding ShiftAllLaterCommand}"
+                                    ToolTip.Tip="{loc:T Metadata.MoveEveryLineSTip2}"
+                                    Padding="12,4" CornerRadius="999" Cursor="Hand"
+                                    FontWeight="SemiBold" FontSize="12"/>
+                        </StackPanel>
+
+                        <!-- Padding, not ScrollViewer.Padding, insets the list: rows scroll
+                             through a ScrollViewer's padding up to the panel's edge, where the
+                             rounded corners sliced the last visible row. Same inset as the
+                             Synced Lyrics card. -->
+                        <Border ClipToBounds="True"
+                                Classes="pill-well"
+                                Padding="0,10">
+                            <Panel MinHeight="300">
+                                <TextBlock Text="{loc:T Metadata.NoSyncedLyricsYet2}"
+                                           IsVisible="{Binding !HasSyncedLines}"
+                                           TextWrapping="Wrap"
+                                           TextAlignment="Center"
+                                           MaxWidth="420"
+                                           Opacity="0.6"
+                                           FontSize="13"
+                                           HorizontalAlignment="Center"
+                                           VerticalAlignment="Center"
+                                           Margin="24" />
+
+                                <ScrollViewer IsVisible="{Binding HasSyncedLines}"
+                                              Classes="well-scroll"
+                                              VerticalScrollBarVisibility="Auto"
+                                              HorizontalScrollBarVisibility="Disabled"
+                                              Padding="14,0,18,0">
+                                    <!-- The list is the ScrollViewer's DIRECT child on purpose: wrapped
+                                         in the old spacer StackPanel, the virtualizing panel could not
+                                         own the viewport (same failure mode as the AlbumDetailView track
+                                         list) and every line inflated on the first click of this tab —
+                                         lag that scaled with lyric length. The trailing bottom gap rides
+                                         as ItemsControl.Padding, which is part of the content's desired
+                                         size and so folds into the scroll extent (ScrollViewer.Padding
+                                         and a content Margin are not — the old spacer's reason to exist).
+                                         Pinned by TimestampLyricsVirtualizationTests. -->
+                                    <ItemsControl ItemsSource="{Binding SyncedLyricLines}"
+                                                  Padding="0,0,0,14">
+                                        <ItemsControl.ItemsPanel>
+                                            <ItemsPanelTemplate>
+                                                <VirtualizingStackPanel />
+                                            </ItemsPanelTemplate>
+                                        </ItemsControl.ItemsPanel>
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate x:DataType="vm:SyncedLyricEditorLine">
+                                                <Border Classes="synced-row">
+                                                    <Grid ColumnDefinitions="3,Auto,*,Auto">
+                                                        <!-- Accent bar: marks the line currently being edited -->
+                                                        <Border Grid.Column="0"
+                                                                Classes="synced-accent"
+                                                                Width="3"
+                                                                CornerRadius="999"
+                                                                Margin="0,3" />
+                                                        <TextBox Grid.Column="1"
+                                                                 Text="{Binding TimestampText, Mode=TwoWay, UpdateSourceTrigger=LostFocus}"
+                                                                 AutomationProperties.Name="{loc:T Metadata.TypeTimestampMmSsTip}"
+                                                                 Watermark="--:--.--"
+                                                                 FontFamily="Consolas, Menlo, Monaco, Courier New, monospace"
+                                                                 FontSize="12"
+                                                                 Width="92"
+                                                                 Margin="11,0,0,0"
+                                                                 Padding="10,6,10,4"
+                                                                 Classes="pill-field"
+                                                                 VerticalAlignment="Center"
+                                                                 VerticalContentAlignment="Center"
+                                                                 HorizontalContentAlignment="Center"
+                                                                 ToolTip.Tip="{loc:T Metadata.TypeTimestampMmSsTip}" />
+                                                        <TextBlock Grid.Column="2"
+                                                                   Text="{Binding DisplayText}"
+                                                                   FontSize="14"
+                                                                   VerticalAlignment="Center"
+                                                                   TextWrapping="Wrap"
+                                                                   Margin="14,0,14,0" />
+                                                        <StackPanel Grid.Column="3"
+                                                                    Classes="synced-ctl"
+                                                                    Orientation="Horizontal"
+                                                                    Spacing="6"
+                                                                    Margin="0,0,16,0"
+                                                                    VerticalAlignment="Center">
+                                                            <Button Classes="synced-nudge"
+                                                                    Content="−"
+                                                                    ToolTip.Tip="{loc:T Metadata.Nudge01sEarlierTip}"
+                                                                    AutomationProperties.Name="{loc:T Metadata.Nudge01sEarlierTip}"
+                                                                    IsEnabled="{Binding HasTimestamp}"
+                                                                    Command="{Binding $parent[Window].((vm:MetadataViewModel)DataContext).NudgeSyncedLineBackCommand}"
+                                                                    CommandParameter="{Binding}" />
+                                                            <Button Classes="synced-nudge"
+                                                                    Content="+"
+                                                                    ToolTip.Tip="{loc:T Metadata.Nudge01sLaterTip}"
+                                                                    AutomationProperties.Name="{loc:T Metadata.Nudge01sLaterTip}"
+                                                                    IsEnabled="{Binding HasTimestamp}"
+                                                                    Command="{Binding $parent[Window].((vm:MetadataViewModel)DataContext).NudgeSyncedLineForwardCommand}"
+                                                                    CommandParameter="{Binding}" />
+                                                            <Button Classes="synced-nudge"
+                                                                    ToolTip.Tip="{loc:T Metadata.ClearTimestampTip}"
+                                                                    IsEnabled="{Binding HasTimestamp}"
+                                                                    Command="{Binding $parent[Window].((vm:MetadataViewModel)DataContext).ClearSyncedLineTimestampCommand}"
+                                                                    CommandParameter="{Binding}">
+                                                                <controls:LineIcon Data="{StaticResource MenuLineClose}" Width="16" Height="16" />
+                                                            </Button>
+                                                        </StackPanel>
+                                                    </Grid>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </ScrollViewer>
+                            </Panel>
+                        </Border>
+                </DockPanel>
+            </TabItem>
+
+            <!-- OPTIONS TAB -->
+            <TabItem Header="{loc:T Metadata.Options}" FontSize="14" FontWeight="SemiBold"
+                     Tag="{loc:T Metadata.GroupPlayback}"
+                     Classes.changed="{Binding OptionsChanged}">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                <StackPanel Margin="24,16,24,24" Spacing="12">
+
+                    <Grid ColumnDefinitions="Auto,*" Margin="0,0,0,0">
+                        <TextBlock Text="{loc:T Metadata.SecKind}" FontSize="11.5" FontWeight="SemiBold" Opacity="0.45" VerticalAlignment="Center" />
+                        <Border Grid.Column="1" Height="1" Background="{DynamicResource SystemControlForegroundBaseLowBrush}" Margin="12,0,0,0" VerticalAlignment="Center" />
+                    </Grid>
+                    <Grid ColumnDefinitions="*,20,*">
+                        <!-- Media Kind (Music, Podcast, Audiobook, ...) -->
+                        <StackPanel Grid.Column="0" Spacing="4">
+                            <TextBlock Text="{loc:T Metadata.MediaKind}" FontSize="12" Opacity="0.5" />
+                            <ComboBox Classes="pill-field"
+                                      AutomationProperties.Name="{loc:T Metadata.MediaKind}"
+                                      ItemsSource="{x:Static vm:MetadataViewModel.AvailableMediaKinds}"
+                                      SelectedItem="{Binding MediaKind}"
+                                      HorizontalAlignment="Stretch" />
+                        </StackPanel>
+                        <!-- Release type override (Auto, Album, Single, EP, ...) -->
+                        <StackPanel Grid.Column="2" Spacing="4">
+                            <TextBlock Text="{loc:T Metadata.ReleaseType}" FontSize="12" Opacity="0.5" />
+                            <ComboBox Classes="pill-field"
+                                      AutomationProperties.Name="{loc:T Metadata.ReleaseType}"
+                                      ItemsSource="{x:Static vm:MetadataViewModel.AvailableReleaseTypes}"
+                                      SelectedItem="{Binding ReleaseTypeOverride}"
+                                      HorizontalAlignment="Stretch" />
+                        </StackPanel>
+                    </Grid>
+
+                    <Grid ColumnDefinitions="Auto,*" Margin="0,18,0,0">
+                        <TextBlock Text="{loc:T Metadata.SecPlayRange}" FontSize="11.5" FontWeight="SemiBold" Opacity="0.45" VerticalAlignment="Center" />
+                        <Border Grid.Column="1" Height="1" Background="{DynamicResource SystemControlForegroundBaseLowBrush}" Margin="12,0,0,0" VerticalAlignment="Center" />
+                    </Grid>
+                    <Grid ColumnDefinitions="*,20,*">
+                        <StackPanel Grid.Column="0" Spacing="4">
+                            <TextBlock Text="{loc:T Metadata.Start}" FontSize="12" Opacity="0.5" />
+                            <Grid ColumnDefinitions="Auto,*">
+                                <CheckBox Classes="metadata-pill-checkbox"
+                                          Grid.Column="0"
+                                          IsChecked="{Binding HasStartTime}"
+                                          AutomationProperties.Name="{loc:T Metadata.Start}"
+                                          Padding="0" Margin="0,0,8,0" MinWidth="0"
+                                          VerticalAlignment="Center" />
+                                <TextBox Classes="pill-field"
+                                         Grid.Column="1"
+                                         Text="{Binding StartTime}"
+                                         AutomationProperties.Name="{loc:T Metadata.Start}"
+                                         IsEnabled="{Binding HasStartTime}"
+                                         VerticalAlignment="Center" />
+                            </Grid>
+                        </StackPanel>
+                        <StackPanel Grid.Column="2" Spacing="4">
+                            <TextBlock Text="{loc:T Metadata.Stop}" FontSize="12" Opacity="0.5" />
+                            <Grid ColumnDefinitions="Auto,*">
+                                <CheckBox Classes="metadata-pill-checkbox"
+                                          Grid.Column="0"
+                                          IsChecked="{Binding HasStopTime}"
+                                          AutomationProperties.Name="{loc:T Metadata.Stop}"
+                                          Padding="0" Margin="0,0,8,0" MinWidth="0"
+                                          VerticalAlignment="Center" />
+                                <TextBox Classes="pill-field"
+                                         Grid.Column="1"
+                                         Text="{Binding StopTime}"
+                                         AutomationProperties.Name="{loc:T Metadata.Stop}"
+                                         IsEnabled="{Binding HasStopTime}"
+                                         VerticalAlignment="Center" />
+                            </Grid>
+                        </StackPanel>
+                    </Grid>
+
+                    <Grid ColumnDefinitions="Auto,*" Margin="0,18,0,0">
+                        <TextBlock Text="{loc:T Metadata.SecBehaviour}" FontSize="11.5" FontWeight="SemiBold" Opacity="0.45" VerticalAlignment="Center" />
+                        <Border Grid.Column="1" Height="1" Background="{DynamicResource SystemControlForegroundBaseLowBrush}" Margin="12,0,0,0" VerticalAlignment="Center" />
+                    </Grid>
+                    <WrapPanel Orientation="Horizontal" ItemSpacing="24" LineSpacing="10">
+                        <CheckBox Classes="metadata-pill-checkbox"
+                                  Content="{loc:T Metadata.RememberPlaybackPosition}"
+                                  IsChecked="{Binding RememberPlaybackPosition}" />
+                        <CheckBox Classes="metadata-pill-checkbox"
+                                  Content="{loc:T Metadata.SkipWhenShuffling}"
+                                  IsChecked="{Binding SkipWhenShuffling}" />
+                    </WrapPanel>
+
+                    <Grid ColumnDefinitions="Auto,*" Margin="0,18,0,0">
+                        <TextBlock Text="{loc:T Metadata.SecSound}" FontSize="11.5" FontWeight="SemiBold" Opacity="0.45" VerticalAlignment="Center" />
+                        <Border Grid.Column="1" Height="1" Background="{DynamicResource SystemControlForegroundBaseLowBrush}" Margin="12,0,0,0" VerticalAlignment="Center" />
+                    </Grid>
+                    <Grid ColumnDefinitions="*,20,*">
+                        <!-- Volume Adjust -->
+                        <StackPanel Grid.Column="0" Spacing="4">
+                            <TextBlock Text="{loc:T Metadata.VolumeAdjust}" FontSize="12" Opacity="0.5" />
+                            <Grid ColumnDefinitions="*,52" MinHeight="36">
+                                <Grid Grid.Column="0" Height="20" ClipToBounds="False" VerticalAlignment="Center">
+                                    <Canvas x:Name="VolumeAdjustVisual"
+                                            Height="20"
+                                            ClipToBounds="False"
+                                            IsHitTestVisible="False">
+                                        <Border x:Name="VolumeAdjustTrackBackground"
+                                                Height="6"
+                                                CornerRadius="3"
+                                                Background="{DynamicResource IslandSliderUnfilled}"
+                                                Opacity="0.4"
+                                                Canvas.Top="7"/>
+                                        <Border x:Name="VolumeAdjustTrackFill"
+                                                Height="6"
+                                                CornerRadius="3"
+                                                Background="{DynamicResource IslandSliderFilled}"
+                                                Canvas.Top="7"/>
+                                        <Border x:Name="VolumeAdjustThumb"
+                                                Width="14"
+                                                Height="14"
+                                                CornerRadius="7"
+                                                Background="{DynamicResource IslandSliderFilled}"
+                                                BoxShadow="0 1 3 0 #40000000"
+                                                Canvas.Top="3"/>
+                                    </Canvas>
+                                    <Slider x:Name="VolumeAdjustSlider"
+                                            Classes="volume-horizontal"
+                                            AutomationProperties.Name="{loc:T Metadata.VolumeAdjust}"
+                                            Value="{Binding VolumeAdjust, Mode=TwoWay}"
+                                            Minimum="-100" Maximum="100"
+                                            HorizontalAlignment="Stretch"
+                                            DoubleTapped="OnVolumeAdjustSliderDoubleTapped" />
+                                </Grid>
+                                <TextBlock Grid.Column="1"
+                                           Text="{Binding VolumeAdjust, StringFormat='{}{0}%'}"
+                                           FontSize="12"
+                                           Opacity="0.6"
+                                           VerticalAlignment="Center"
+                                           HorizontalAlignment="Right" />
+                            </Grid>
+                            <TextBlock Text="{loc:T Metadata.DoubleClickToReset}" FontSize="11" Opacity="0.35" />
+                        </StackPanel>
+                        <!-- Equalizer Preset -->
+                        <StackPanel Grid.Column="2" Spacing="4">
+                            <TextBlock Text="{loc:T Metadata.Equalizer}" FontSize="12" Opacity="0.5" />
+                            <ComboBox Classes="pill-field"
+                                      AutomationProperties.Name="{loc:T Metadata.Equalizer}"
+                                      ItemsSource="{Binding EqPresetOptions}"
+                                      SelectedItem="{Binding SelectedEqPreset}"
+                                      HorizontalAlignment="Stretch" />
+                        </StackPanel>
+                    </Grid>
+
+                    <!-- Rename by pattern (multi-select only) -->
+                    <StackPanel Spacing="8" IsVisible="{Binding ShowRenameSection}">
+                        <Separator Opacity="0.15" Margin="0,2" />
+                        <CheckBox Classes="metadata-pill-checkbox"
+                                  Content="{loc:T Metadata.RenameFilesByPattern}"
+                                  IsChecked="{Binding ApplyRename}" />
+                        <TextBlock Text="{loc:T Metadata.TokensArtistAlbumartistAlbum}"
+                                   FontSize="11" Opacity="0.55" TextWrapping="Wrap" />
+                        <TextBox Classes="pill-field"
+                                 AutomationProperties.Name="{loc:T Metadata.RenameFilesByPattern}"
+                                 Text="{Binding RenamePattern}"
+                                 IsEnabled="{Binding ApplyRename}" />
+                        <Border Background="#10FFFFFF" CornerRadius="8" Padding="10"
+                                IsVisible="{Binding ApplyRename}">
+                            <StackPanel Spacing="2">
+                                <TextBlock Text="{loc:T Metadata.PreviewFirst8Tracks}" FontSize="11" Opacity="0.6" Margin="0,0,0,4" />
+                                <ItemsControl ItemsSource="{Binding RenamePreviews}">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate x:DataType="vm:MetadataViewModel+RenamePreview">
+                                            <Grid ColumnDefinitions="*,Auto,*,Auto" Margin="0,1">
+                                                <TextBlock Grid.Column="0" Text="{Binding OriginalName}" FontSize="11" Opacity="0.7" TextTrimming="CharacterEllipsis" Margin="0,0,8,0" />
+                                                <TextBlock Grid.Column="1" Text="→" FontSize="11" Opacity="0.5" Margin="0,0,8,0" />
+                                                <TextBlock Grid.Column="2" Text="{Binding NewName}" FontSize="11" TextTrimming="CharacterEllipsis" />
+                                                <TextBlock Grid.Column="3" Text="{loc:T Metadata.Conflict}" FontSize="10"
+                                                           Foreground="#E74856" FontWeight="SemiBold"
+                                                           Margin="8,0,0,0"
+                                                           IsVisible="{Binding Conflict}" />
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+
+                </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <!-- ═══════════ FILE TAB ═══════════ -->
+            <TabItem Header="{loc:T Metadata.File}" FontSize="14" FontWeight="SemiBold" IsVisible="{Binding ShowFileTab}"
+                     Tag="{loc:T Metadata.GroupFile}">
+                <ScrollViewer VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled">
+                    <StackPanel Spacing="0" Margin="24,16,24,24">
+                        <Grid ColumnDefinitions="Auto,*" Margin="0,0,0,0">
+                            <TextBlock Text="{loc:T Metadata.SecAudio}" FontSize="11.5" FontWeight="SemiBold" Opacity="0.45" VerticalAlignment="Center" />
+                            <Border Grid.Column="1" Height="1" Background="{DynamicResource SystemControlForegroundBaseLowBrush}" Margin="12,0,0,0" VerticalAlignment="Center" />
+                        </Grid>
+                        <Grid ColumnDefinitions="*,20,*" RowDefinitions="Auto,Auto,Auto" Margin="0,10,0,0">
+                            <StackPanel Grid.Row="0" Grid.Column="0" Spacing="2" Margin="0,0,0,12">
+                                <TextBlock Text="{loc:T Metadata.Format}" FontSize="12" Opacity="0.5" />
+                                <TextBlock Text="{Binding FileFormat}" FontSize="14" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="0" Grid.Column="2" Spacing="2" Margin="0,0,0,12">
+                                <TextBlock Text="{loc:T Metadata.Codec}" FontSize="12" Opacity="0.5" />
+                                <TextBlock Text="{Binding Codec}" FontSize="14" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="1" Grid.Column="0" Spacing="2" Margin="0,0,0,12">
+                                <TextBlock Text="{loc:T Metadata.Bitrate}" FontSize="12" Opacity="0.5" />
+                                <TextBlock Text="{Binding Bitrate}" FontSize="14" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="1" Grid.Column="2" Spacing="2" Margin="0,0,0,12">
+                                <TextBlock Text="{loc:T Metadata.SampleRate}" FontSize="12" Opacity="0.5" />
+                                <TextBlock FontSize="14"><Run Text="{Binding SampleRate}" /><Run Text=" · " Foreground="{DynamicResource SystemControlForegroundBaseMediumLowBrush}" /><Run Text="{Binding BitsPerSample}" /><Run Text=" · " Foreground="{DynamicResource SystemControlForegroundBaseMediumLowBrush}" /><Run Text="{Binding Channels}" /></TextBlock>
+                            </StackPanel>
+                            <StackPanel Grid.Row="2" Grid.Column="0" Spacing="2" Margin="0,0,0,12">
+                                <TextBlock Text="{loc:T Metadata.Duration}" FontSize="12" Opacity="0.5" />
+                                <TextBlock Text="{Binding Duration}" FontSize="14" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="2" Grid.Column="2" Spacing="2" Margin="0,0,0,12">
+                                <TextBlock Text="{loc:T Metadata.Size}" FontSize="12" Opacity="0.5" />
+                                <TextBlock FontSize="14"><Run Text="{Binding FileSize}" /><Run Text=" · " Foreground="{DynamicResource SystemControlForegroundBaseMediumLowBrush}" /><Run Text="{Binding LosslessOrLossy}" /></TextBlock>
+                            </StackPanel>
+                        </Grid>
+
+                        <Grid ColumnDefinitions="Auto,*" Margin="0,6,0,0">
+                            <TextBlock Text="{loc:T Metadata.SecDates}" FontSize="11.5" FontWeight="SemiBold" Opacity="0.45" VerticalAlignment="Center" />
+                            <Border Grid.Column="1" Height="1" Background="{DynamicResource SystemControlForegroundBaseLowBrush}" Margin="12,0,0,0" VerticalAlignment="Center" />
+                        </Grid>
+                        <Grid ColumnDefinitions="*,20,*" Margin="0,10,0,0">
+                            <StackPanel Grid.Column="0" Spacing="2" Margin="0,0,0,12">
+                                <TextBlock Text="{loc:T Metadata.DateAdded}" FontSize="12" Opacity="0.5" />
+                                <TextBlock Text="{Binding DateAdded}" FontSize="14" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="2" Spacing="2" Margin="0,0,0,12">
+                                <TextBlock Text="{loc:T Metadata.DateModified}" FontSize="12" Opacity="0.5" />
+                                <TextBlock Text="{Binding DateModified}" FontSize="14" />
+                            </StackPanel>
+                        </Grid>
+
+                        <Grid ColumnDefinitions="Auto,*" Margin="0,6,0,0">
+                            <TextBlock Text="{loc:T Metadata.SecLocation}" FontSize="11.5" FontWeight="SemiBold" Opacity="0.45" VerticalAlignment="Center" />
+                            <Border Grid.Column="1" Height="1" Background="{DynamicResource SystemControlForegroundBaseLowBrush}" Margin="12,0,0,0" VerticalAlignment="Center" />
+                        </Grid>
+                        <StackPanel Spacing="2" Margin="0,10,0,12">
+                            <TextBlock Text="{loc:T Metadata.File}" FontSize="12" Opacity="0.5" />
+                            <TextBlock Text="{Binding FileName}" FontSize="14" TextWrapping="Wrap" />
+                        </StackPanel>
+                        <StackPanel Spacing="2" Margin="0,0,0,12">
+                            <TextBlock Text="{loc:T Metadata.FolderName}" FontSize="12" Opacity="0.5" />
+                            <TextBlock Text="{Binding FolderName}" FontSize="13" TextWrapping="Wrap" Opacity="0.9" />
+                        </StackPanel>
+                        <StackPanel Spacing="2" Margin="0,0,0,12"
+                                    IsVisible="{Binding Copyright, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+                            <TextBlock Text="{loc:T Metadata.Copyright}" FontSize="12" Opacity="0.5" />
+                            <TextBlock Text="{Binding Copyright}" FontSize="13" TextWrapping="Wrap" Opacity="0.9" />
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,6,0,0">
+                            <Button Content="{loc:T Metadata.ShowInFolder}"
+                                    Command="{Binding ShowInFolderCommand}"
+                                    Padding="14,6" CornerRadius="999" FontWeight="SemiBold" FontSize="12" Cursor="Hand" />
+                            <Button Content="{loc:T Metadata.CopyPath}"
+                                    Command="{Binding CopyPathCommand}"
+                                    CommandParameter="{Binding $parent[Window]}"
+                                    Padding="14,6" CornerRadius="999" FontWeight="SemiBold" FontSize="12" Cursor="Hand" />
+                        </StackPanel>
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+        </TabControl>
+
+        <!-- Find online panel: covers the tabs and the footer (it brings its own Back /
+             Apply), leaving the header so the track being matched stays in view. Shown and
+             animated from code-behind (OnSearchPanelOpenChanged). -->
+        <views:MetadataSearchPanel x:Name="SearchPanelView"
+                                   Grid.Row="1" Grid.RowSpan="2"
+                                   DataContext="{Binding SearchPanel}"
+                                   IsVisible="False" />
+    </Grid>
+    </controls:PillDialogHost>
+</Window>

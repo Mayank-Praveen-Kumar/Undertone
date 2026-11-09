@@ -1,0 +1,152 @@
+using Undertone.Models;
+
+namespace Undertone.Services;
+
+/// <summary>
+/// Reads audio file metadata (tags, artwork) using TagLib#.
+/// </summary>
+public interface IMetadataService
+{
+    /// <summary>
+    /// Reads all metadata tags from an audio file and returns a populated Track model.
+    /// Returns null if the file cannot be read or is not a supported audio format.
+    /// </summary>
+    Track? ReadTrackMetadata(string filePath);
+
+    /// <summary>
+    /// Reads metadata and, in the same file open, returns the best embedded cover
+    /// picture (already in memory from tag parsing — no extra I/O). Lets a scan
+    /// populate album art live without re-reading every file. <paramref name="embeddedArt"/>
+    /// is null when the file has no embedded picture.
+    /// </summary>
+    Track? ReadTrackMetadata(string filePath, out byte[]? embeddedArt);
+
+    /// <summary>
+    /// Reads a scan entry: by path when the entry has one (the desktop path with its
+    /// ffprobe/ALAC/DSDIFF extras), otherwise through the entry's stream (Android SAF).
+    /// The default handles only the path case so test stubs keep compiling.
+    /// </summary>
+    Track? ReadTrackMetadata(ScanEntry entry, out byte[]? embeddedArt)
+    {
+        embeddedArt = null;
+        return entry.LocalPath is { } local ? ReadTrackMetadata(local, out embeddedArt) : null;
+    }
+
+    /// <summary>
+    /// Extracts album artwork for an audio file: the embedded cover if there is one,
+    /// otherwise a cover image sitting next to it — the latter only when the file
+    /// names an album, since art for the shared "Unknown Album" bucket would be
+    /// applied to every untagged file in the library.
+    /// Returns the raw image bytes, or null when no artwork applies.
+    /// </summary>
+    byte[]? ExtractAlbumArt(string filePath);
+
+    /// <summary>
+    /// The file's own embedded cover only (no folder fallback) — what per-track covers
+    /// (<see cref="TrackArtwork"/>) compare. Null when it has none or embedded artwork is
+    /// off in Settings.
+    /// </summary>
+    byte[]? ExtractEmbeddedArt(string filePath) => null;
+
+    /// <summary>
+    /// Just the record label (<see cref="Track.Label"/>), without the rest of a full read —
+    /// for the v11 label backfill, which opens most of the library. Empty when none is set.
+    /// The default falls back to the full read so test stubs keep compiling.
+    /// </summary>
+    string ReadLabel(string filePath) => ReadTrackMetadata(filePath)?.Label ?? string.Empty;
+
+    /// <summary>
+    /// Just the genres, as <see cref="Track.Genre"/> holds them, for the v12 genre pass
+    /// (GitHub #123 follow-up, 2026-10-10). The default falls back to the full read.
+    /// </summary>
+    string ReadGenres(string filePath) => ReadTrackMetadata(filePath)?.Genre ?? string.Empty;
+
+    /// <summary>
+    /// Just the ReplayGain tags, for the ReplayGain column's backfill (GitHub #151). Null when
+    /// the file can't be read now. The default falls back to the full read.
+    /// </summary>
+    ReplayGainValues? ReadReplayGain(string filePath) => ReadTrackMetadata(filePath) is { } t
+        ? new ReplayGainValues(t.ReplayGainTrackDb, t.ReplayGainTrackPeak, t.ReplayGainAlbumDb)
+        : null;
+
+    /// <summary>
+    /// Writes metadata tags back to the audio file.
+    /// </summary>
+    bool WriteTrackMetadata(Track track);
+
+    /// <summary>
+    /// <see cref="WriteTrackMetadata(Track)"/> from the metadata editor. <paramref name="genreEdited"/>
+    /// says the user changed the genre in this save: then the list is written as typed, even
+    /// when it drops some of the file's genres. Every other writer (lyrics, ratings, the
+    /// converter) never shrinks the file's genre list (GitHub #123 follow-up, 2026-10-10).
+    /// The default ignores the flag so test stubs keep compiling.
+    /// </summary>
+    bool WriteTrackMetadata(Track track, bool genreEdited) => WriteTrackMetadata(track);
+
+    /// <summary>
+    /// Writes <paramref name="track"/>'s tags to a specific file (which may differ from
+    /// the track's own path — e.g. a converted copy). When <paramref name="titleOverride"/>
+    /// is set it replaces the title (e.g. "Song (WAV)").
+    /// </summary>
+    bool WriteTrackMetadata(Track track, string targetFilePath, string? titleOverride = null);
+
+    /// <summary>
+    /// Sets the embedded album artwork on an audio file.
+    /// Pass null to remove artwork.
+    /// </summary>
+    bool WriteAlbumArt(string filePath, byte[]? imageData);
+
+    /// <summary>
+    /// Removes the year (and the date frames it lives in) from an audio file. The editor
+    /// calls it when the user empties the Year field, because
+    /// <see cref="WriteTrackMetadata(Track)"/> treats year 0 as unknown and leaves the
+    /// file's date alone. Returns false when the file could not be written.
+    /// </summary>
+    bool ClearYear(string filePath) => false;
+
+    /// <summary>
+    /// Writes only the lyrics fields of an audio file (GitHub #135): the text field gets the
+    /// synced text when there is any, else <paramref name="plain"/>; ID3v2 also gets a SYLT
+    /// frame. Both empty clears them. When <paramref name="onlyIf"/> is given, the file's
+    /// current lyrics are read first and nothing is written unless it approves them — how an
+    /// automatic save avoids replacing lyrics the user put in the file. A read-only file is
+    /// left alone. Returns false when nothing was written for any reason other than the file
+    /// already holding these lyrics. The default writes nothing, so test stubs keep compiling.
+    /// </summary>
+    bool WriteLyrics(string filePath, string? plain, string? synced, Func<EmbeddedLyricsText, bool>? onlyIf = null) => false;
+
+    /// <summary>
+    /// Writes only the rating and "not liked" tags to an audio file
+    /// (ID3 POPM / Vorbis RATING) without touching other metadata.
+    /// </summary>
+    bool WriteRating(string filePath, int rating, bool isDisliked);
+
+    /// <summary>
+    /// Writes the Advanced Details field set (sort names, people, identifiers, custom
+    /// tags) through the same crash-safe temp-copy + atomic-rename path as the standard
+    /// tags. Returns false when the file could not be written.
+    /// </summary>
+    internal bool WriteAdvancedFields(string filePath, AdvancedTagIO.AdvancedFields fields,
+        AdvancedTagIO.AdvancedFields original);
+
+    /// <summary>
+    /// Writes only the iTunes advisory flag (0 = none, 1 = explicit, 2 = clean) through the
+    /// crash-safe atomic path. Used by the album-scoped editor's "Album is explicit" toggle.
+    /// Returns false when the file could not be written.
+    /// The default routes through <see cref="WriteAdvancedFields"/> (read the Advanced set,
+    /// flip the flag, write it back) so existing implementations and test stubs keep
+    /// working; <see cref="MetadataService"/> overrides it with a single-field write.
+    /// </summary>
+    bool WriteAdvisory(string filePath, int advisory)
+    {
+        var original = AdvancedTagIO.ReadAll(filePath);
+        var updated = AdvancedTagIO.ReadAll(filePath);
+        updated.ItunesAdvisory = advisory;
+        return WriteAdvancedFields(filePath, updated, original);
+    }
+
+    /// <summary>
+    /// Reads detailed technical file information from an audio file.
+    /// </summary>
+    AudioFileInfo? ReadFileInfo(string filePath);
+}

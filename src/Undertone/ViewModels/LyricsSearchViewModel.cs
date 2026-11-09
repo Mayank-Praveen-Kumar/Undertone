@@ -1,0 +1,328 @@
+using System.Collections.ObjectModel;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using Undertone.Helpers;
+using Undertone.Models;
+using Undertone.Services;
+using Undertone.Services.Lyrics;
+using Loc = Undertone.Localization.Loc;
+
+namespace Undertone.ViewModels;
+
+/// <summary>
+/// Search Lyrics with a source picker (issue #113): searches one chosen source, or "Auto" —
+/// the sources the automatic lookup uses — lists what each found and in which format, previews
+/// the selected answer and applies it to the lyrics page. Auto marks the answer the automatic
+/// lookup would pick (<see cref="LyricsViewModel.PickBestResult"/>: word-synced over
+/// line-synced over plain, the earlier source on a tie).
+/// </summary>
+public partial class LyricsSearchViewModel : ViewModelBase
+{
+    private readonly Func<Task<IReadOnlyList<string>>> _autoSources;
+    private readonly Func<IReadOnlyList<string>, string, string, CancellationToken, Task<IReadOnlyList<LyricsSourceHit>>> _search;
+    private readonly Action<LrcLibResult, string> _apply;
+    private CancellationTokenSource? _searchCts;
+    private CancellationTokenSource? _modelSyncCts;
+    private int _generation;
+
+    /// <summary>
+    /// lrc.red's model for its row's "Word-sync with lrc.red's model" (ISRC → word-synced lyrics);
+    /// set by the lyrics page. Null: never offered.
+    /// </summary>
+    internal Func<string, CancellationToken, Task<LrcLibResult>>? SyncWithLrcRedModel { get; init; }
+
+    /// <summary>Read after each search: whether the model may be offered (lrc.red is on in Settings).</summary>
+    internal Func<Task<bool>>? CanOfferLrcRedModel { get; init; }
+
+    /// <param name="track">The song the lyrics are for (artist / title prefill the search).</param>
+    /// <param name="sources">Every source the picker offers, in priority order.</param>
+    /// <param name="autoSources">The sources "Auto" searches, read at search time.</param>
+    /// <param name="search">Searches the given sources for (artist, title); one hit per source, in order.</param>
+    /// <param name="apply">Shows and keeps the chosen answer.</param>
+    public LyricsSearchViewModel(
+        Track track,
+        IReadOnlyList<string> sources,
+        Func<Task<IReadOnlyList<string>>> autoSources,
+        Func<IReadOnlyList<string>, string, string, CancellationToken, Task<IReadOnlyList<LyricsSourceHit>>> search,
+        Action<LrcLibResult, string> apply)
+    {
+        _autoSources = autoSources;
+        _search = search;
+        _apply = apply;
+        AutoLabel = Loc.T("LyricsSearch.Auto");
+        Sources = new[] { AutoLabel }.Concat(sources).ToList();
+        _selectedSource = AutoLabel;
+        _artist = LyricsSearchSelector.IsUnknownArtist(track.Artist) ? string.Empty : track.Artist ?? string.Empty;
+        _title = track.Title ?? string.Empty;
+        IsMarkedNoLyrics = track.NoLyrics;
+    }
+
+    /// <summary>GitHub #162: marks (true) or unmarks the song as having no lyrics; set by the
+    /// lyrics page. Null: the footer doesn't offer it.</summary>
+    internal Action<bool>? SetNoLyrics { get; init; }
+
+    /// <summary>The song is marked as having no lyrics: the footer offers to unmark it.</summary>
+    public bool IsMarkedNoLyrics { get; }
+
+    public bool CanMarkNoLyrics => SetNoLyrics != null;
+
+    public string NoLyricsLabel => Loc.T(IsMarkedNoLyrics ? "LyricsSearch.UnmarkNoLyrics" : "LyricsSearch.MarkNoLyrics");
+
+    /// <summary>"No Lyrics" / "Has Lyrics": marks or unmarks the song, then closes.</summary>
+    [RelayCommand]
+    private void ToggleNoLyrics()
+    {
+        SetNoLyrics?.Invoke(!IsMarkedNoLyrics);
+        Close();
+    }
+
+    /// <summary>The picker's first entry: search every Auto source and mark the best answer.</summary>
+    public string AutoLabel { get; }
+
+    public IReadOnlyList<string> Sources { get; }
+
+
+    public ObservableCollection<LyricsSearchResultRow> Results { get; } = new();
+
+    [ObservableProperty] private string _selectedSource;
+    [ObservableProperty] private string _artist;
+    [ObservableProperty] private string _title;
+    [ObservableProperty] private bool _isSearching;
+    [ObservableProperty] private string _statusText = string.Empty;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(PreviewText), nameof(HasPreview), nameof(PreviewDetail))]
+    [NotifyCanExecuteChangedFor(nameof(ApplyCommand))]
+    private LyricsSearchResultRow? _selectedResult;
+
+    public string PreviewText => SelectedResult?.PreviewText ?? string.Empty;
+
+    /// <summary>What the selected answer matched ("Title — Artist · m:ss"), shown above its preview.</summary>
+    public string PreviewDetail => SelectedResult?.Detail ?? string.Empty;
+    public bool HasPreview => !string.IsNullOrWhiteSpace(PreviewText);
+
+    public event EventHandler? Closed;
+
+    private bool IsAuto => string.IsNullOrEmpty(SelectedSource) || SelectedSource == AutoLabel;
+
+    /// <summary>The source the last search ran for, so a picker re-reporting it doesn't search again.</summary>
+    private string? _searchedSource;
+
+    partial void OnSelectedSourceChanged(string value)
+    {
+        // The picker can pass through null while its items bind; only a real pick searches.
+        if (string.IsNullOrEmpty(value) || value == _searchedSource) return;
+        _ = SearchAsync();
+    }
+
+    [RelayCommand]
+    private Task Search() => SearchAsync();
+
+    /// <summary>Runs the search for the picked source; a newer search supersedes (and cancels) an older one.</summary>
+    internal async Task SearchAsync()
+    {
+        _searchCts?.Cancel();
+        _modelSyncCts?.Cancel();
+        var cts = _searchCts = new CancellationTokenSource();
+        var generation = ++_generation;
+        var auto = IsAuto;
+        _searchedSource = auto ? AutoLabel : SelectedSource;
+        IsSearching = true;
+        StatusText = Loc.T("LyricsSearch.Searching");
+        Results.Clear();
+        SelectedResult = null;
+        try
+        {
+            var sources = auto ? await _autoSources() : new[] { SelectedSource };
+            if (generation != _generation) return;
+            if (sources.Count == 0)
+            {
+                StatusText = Loc.T("LyricsSearch.NoSources");
+                return;
+            }
+
+            var hits = await _search(sources, Artist.Trim(), Title.Trim(), cts.Token);
+            if (generation != _generation) return;
+
+            // lrc.red's answer when it is only line-synced or plain: its model can word-sync it.
+            var modelOn = SyncWithLrcRedModel != null && hits.Any(IsModelSyncable)
+                          && CanOfferLrcRedModel != null && await CanOfferLrcRedModel();
+            if (generation != _generation) return;
+
+            var (best, bestSource, _, _) = LyricsViewModel.PickBestResult(hits.Select(h => (h.Result, h.Source)).ToList());
+            foreach (var hit in hits)
+                Results.Add(new LyricsSearchResultRow(hit, isBest: auto && best != null && ReferenceEquals(hit.Result, best))
+                {
+                    CanModelSync = modelOn && IsModelSyncable(hit),
+                });
+            SelectedResult = Results.FirstOrDefault(r => r.IsBest) ?? Results.FirstOrDefault(r => r.HasLyrics);
+
+            // A source that said it was busy answered: the connection works, so "check your
+            // internet connection" would be wrong (lrc.red's 503, live 10-19).
+            var busy = string.Join(", ", hits.Where(h => h.Busy).Select(h => h.Source));
+            StatusText = best != null
+                ? (auto ? Loc.T("LyricsSearch.BestMatch", bestSource) : string.Empty)
+                : hits.Count > 0 && hits.All(h => h.Errored)
+                    ? busy.Length > 0 ? Loc.T("LyricsSearch.BusyStatus", busy) : Loc.T("LyricsSearch.Failed")
+                    : Loc.T("LyricsSearch.NotFound");
+        }
+        catch (OperationCanceledException)
+        {
+            // Superseded by a newer search, or the dialog closed.
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.Warn(DebugLogger.Category.Lyrics, "LyricsSearch:Unhandled", ex.Message);
+            if (generation == _generation) StatusText = Loc.T("LyricsSearch.Failed");
+        }
+        finally
+        {
+            if (generation == _generation) IsSearching = false;
+        }
+    }
+
+    private static bool IsModelSyncable(LyricsSourceHit hit) =>
+        hit.Source == OnlineLyricsSource.LrcRed && hit.Result is { HasLyrics: true, Isrc.Length: > 0 }
+        && LyricsSearchSelector.FormatRank(hit.Result) < LyricsSearchSelector.WordSyncedRank;
+
+    /// <summary>
+    /// lrc.red's row: one request to its model for the recording. The word-synced answer takes the
+    /// row's place and is selected, for Use Lyrics to keep; a failure says why on the row, whose
+    /// button then reads Try again. A new search or closing the dialog cancels it.
+    /// </summary>
+    [RelayCommand]
+    private async Task WordSyncWithLrcRed(LyricsSearchResultRow? row)
+    {
+        if (row is not { CanModelSync: true, IsModelSyncing: false, Result.Isrc: { } isrc } || SyncWithLrcRedModel is null) return;
+        _modelSyncCts?.Cancel();
+        var cts = _modelSyncCts = new CancellationTokenSource();
+        row.IsModelSyncing = true;
+        row.ModelSyncFailed = false;
+        row.ModelSyncStatus = Loc.T("Lyrics.LrcRedSyncWorking");
+        try
+        {
+            var synced = await SyncWithLrcRedModel(isrc, cts.Token);
+            var index = Results.IndexOf(row);
+            if (cts.IsCancellationRequested || index < 0) return;
+            var replaced = new LyricsSearchResultRow(new LyricsSourceHit(row.Source, synced, Errored: false), isBest: false, byModel: true);
+            Results[index] = replaced;
+            SelectedResult = replaced;
+            StatusText = Loc.T("LyricsSearch.ModelSynced");
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+        {
+            // A new search, or the dialog closed.
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.Warn(DebugLogger.Category.Lyrics, "LyricsSearch:ModelSyncFailed", ex.Message);
+            row.ModelSyncFailed = true;
+            row.ModelSyncStatus = LyricsViewModel.LrcRedSyncMessage(ex);
+        }
+        finally
+        {
+            row.IsModelSyncing = false;
+            if (ReferenceEquals(_modelSyncCts, cts)) _modelSyncCts = null;
+            cts.Dispose();
+        }
+    }
+
+    private bool CanApply() => SelectedResult is { HasLyrics: true };
+
+    /// <summary>Shows the selected answer on the lyrics page and keeps it, then closes.</summary>
+    [RelayCommand(CanExecute = nameof(CanApply))]
+    private void Apply()
+    {
+        if (SelectedResult is not { Result: { HasLyrics: true } result } row) return;
+        _apply(result, row.Source);
+        Close();
+    }
+
+    [RelayCommand]
+    private void Close()
+    {
+        StopSearch();
+        Closed?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>Cancels a running search without closing: the dialog calls it however it
+    /// closes (Alt+F4 never goes through <see cref="CloseCommand"/>).</summary>
+    internal void StopSearch()
+    {
+        _searchCts?.Cancel();
+        _modelSyncCts?.Cancel();
+    }
+}
+
+/// <summary>One source's answer in the Search Lyrics list.</summary>
+public sealed partial class LyricsSearchResultRow : ObservableObject
+{
+    /// <param name="byModel">Word-synced by lrc.red's model in this dialog: said instead of "Word-synced".</param>
+    public LyricsSearchResultRow(LyricsSourceHit hit, bool isBest, bool byModel = false)
+    {
+        Source = hit.Source;
+        Result = hit.Result;
+        IsBest = isBest;
+
+        var rank = LyricsSearchSelector.FormatRank(hit.Result);
+        FormatLabel = rank switch
+        {
+            >= LyricsSearchSelector.WordSyncedRank when byModel => Loc.T("Lyrics.LrcRedModelCredit"),
+            >= LyricsSearchSelector.WordSyncedRank => Loc.T("LyricsSearch.WordSynced"),
+            2 => Loc.T("LyricsSearch.LineSynced"),
+            1 => Loc.T("LyricsSearch.Plain"),
+            _ when hit.Errored && hit.Busy => Loc.T("LyricsSearch.Busy"),
+            _ when hit.Errored => Loc.T("LyricsSearch.CouldNotConnect"),
+            _ when hit.Result is { Instrumental: true } => Loc.T("LyricsSearch.Instrumental"),
+            _ => Loc.T("LyricsSearch.NoMatch"),
+        };
+
+        if (HasLyrics)
+        {
+            var r = hit.Result!;
+            var name = string.IsNullOrWhiteSpace(r.ArtistName) ? r.TrackName : $"{r.TrackName} — {r.ArtistName}";
+            Detail = r.Duration > 0 ? $"{name} · {TimeSpan.FromSeconds(r.Duration):m\\:ss}" : name ?? string.Empty;
+            PreviewText = r.HasSyncedLyrics
+                ? LyricsTextHelper.StripTimestamps(r.SyncedLyrics)
+                : r.PlainLyrics ?? string.Empty;
+        }
+    }
+
+    public string Source { get; }
+    public LrcLibResult? Result { get; }
+    public bool IsBest { get; }
+    public bool HasLyrics => Result is { HasLyrics: true };
+
+    /// <summary>Rows that found nothing are dimmed so the answers stand out.</summary>
+    public double RowOpacity => HasLyrics ? 1.0 : 0.45;
+
+    /// <summary>"Word-synced", "Synced", "Plain", or why there is nothing.</summary>
+    public string FormatLabel { get; }
+
+    /// <summary>What the source matched: "Title — Artist · m:ss" (empty without lyrics).</summary>
+    public string Detail { get; } = string.Empty;
+
+    public string PreviewText { get; } = string.Empty;
+
+    // ── lrc.red's row: "Word-sync with lrc.red's model" ──
+
+    /// <summary>The row offers lrc.red's model (its answer is line-synced or plain, lrc.red is on).</summary>
+    [ObservableProperty] private bool _canModelSync;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ModelSyncLabel))]
+    private bool _isModelSyncing;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ModelSyncLabel))]
+    private bool _modelSyncFailed;
+
+    /// <summary>"Timing every word… a few seconds" while it runs, why it failed after; empty otherwise.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasModelSyncStatus))]
+    private string _modelSyncStatus = string.Empty;
+
+    public bool HasModelSyncStatus => ModelSyncStatus.Length > 0;
+
+    public string ModelSyncLabel => Loc.T(ModelSyncFailed && !IsModelSyncing ? "Lyrics.LrcRedSyncRetry" : "Lyrics.LrcRedSync");
+}

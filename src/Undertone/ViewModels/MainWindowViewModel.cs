@@ -1,0 +1,3539 @@
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Windows.Input;
+using Avalonia.Media;
+using Avalonia.Threading;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using Microsoft.Extensions.DependencyInjection;
+using Undertone.Helpers;
+using Undertone.Localization;
+using Undertone.Models;
+using Undertone.Services.Plugins;
+using Undertone.Services;
+using Undertone.Services.Loon;
+using Undertone.Services.MediaServer;
+using Undertone.Services.AudioCd;
+
+namespace Undertone.ViewModels;
+
+/// <summary>
+/// Top-level ViewModel that orchestrates the shell layout:
+/// sidebar navigation, top search bar, content area routing, and the playback bar.
+/// </summary>
+public partial class MainWindowViewModel : ViewModelBase
+{
+    private readonly ILibraryService _library;
+    private readonly IPersistenceService _persistence;
+    private readonly IMetadataService _metadata;
+    private readonly IDiscordPresenceService _discord;
+    private readonly ILastFmService _lastFm;
+    private readonly IListenBrainzService _listenBrainz;
+    private readonly ISyncService _syncService;
+    private readonly ArtistImageService _artistImageService;
+    private readonly LoonClient _loon;
+    private readonly IPlayHistoryService _playHistory;
+
+    // ── Settings modal ──
+    [ObservableProperty] private bool _isSettingsModalOpen;
+
+    /// <summary>One-shot: the next settings-modal open skips the fade/scale entrance so the
+    /// backdrop appears fully formed in the same frame. Used by the stats back-arrow, which
+    /// swaps the underlying page in the same tick — a fade-in would show the restored page
+    /// undimmed for its first frames. Cleared by the MainWindow open handler.</summary>
+    public bool SkipNextSettingsOpenAnimation { get; set; }
+
+    /// <summary>Opens the Settings modal popup. Replaces page-based navigation to Settings.</summary>
+    [RelayCommand]
+    private void OpenSettings()
+    {
+        // Open immediately so the click feels instant. Only the tab it opens on refreshes
+        // its figures (off the UI thread); the others do when they're shown.
+        IsSettingsModalOpen = true;
+        Settings.RefreshShownTabData();
+    }
+
+    /// <summary>Closes the Settings modal popup.</summary>
+    [RelayCommand]
+    private void CloseSettings() => IsSettingsModalOpen = false;
+
+    // The modal fully covers the section beneath it, so that section counts as
+    // hidden while it is open: settings flips that rebuild library views (Merge
+    // Featured, Collapse Album Editions) used to rebuild the covered grid on the
+    // UI thread mid-click, janking the very toggle animation that triggered them.
+    partial void OnIsSettingsModalOpenChanged(bool value)
+    {
+        UpdateSectionActiveFlags();
+        // A plugin view open in place of its page goes with the sheet (its control is released).
+        if (!value) Settings.LeavePluginView();
+    }
+
+    /// <summary>
+    /// A section VM is "active" only while it is the current view AND not covered
+    /// by the Settings modal. Cover Flow is long-lived and subscribes to queue
+    /// changes in its constructor, so it rebuilt ~60 bound properties on every
+    /// queue mutation even while hidden; the big library list VMs each rebuilt
+    /// their full contents on every LibraryUpdated (fired every ~1.5 s during a
+    /// scan). Inactive VMs just mark dirty and catch up once when they become
+    /// current (or uncovered) again.
+    /// </summary>
+    private void UpdateSectionActiveFlags()
+    {
+        var current = IsSettingsModalOpen ? null : CurrentView;
+        _homeVm.IsActive = ReferenceEquals(current, _homeVm);
+        _coverFlowVm.IsActive = ReferenceEquals(current, _coverFlowVm);
+        _songsVm.IsActive = ReferenceEquals(current, _songsVm);
+        _albumsVm.IsActive = ReferenceEquals(current, _albumsVm);
+        _artistsVm.IsActive = ReferenceEquals(current, _artistsVm);
+        _foldersVm.IsActive = ReferenceEquals(current, _foldersVm);
+        _favoritesVm.IsActive = ReferenceEquals(current, _favoritesVm);
+        _inboxVm.IsActive = ReferenceEquals(current, _inboxVm);
+    }
+
+    private readonly DispatcherTimer _coveredRefreshTimer;
+
+    /// <summary>Rebuilds the section under the Settings modal if the library changed
+    /// (each Refresh is a no-op when its view model isn't dirty).</summary>
+    private void RefreshCoveredSection()
+    {
+        var current = CurrentView;
+        DebugLog.Write("Library", $"Covered refresh of {current?.GetType().Name ?? "none"} (library={_library.Tracks.Count})");
+        if (ReferenceEquals(current, _homeVm)) _homeVm.Refresh();
+        else if (ReferenceEquals(current, _songsVm)) _songsVm.Refresh();
+        else if (ReferenceEquals(current, _albumsVm)) _albumsVm.Refresh();
+        else if (ReferenceEquals(current, _artistsVm)) _artistsVm.Refresh();
+        else if (ReferenceEquals(current, _foldersVm)) _foldersVm.Refresh();
+        else if (ReferenceEquals(current, _favoritesVm)) _favoritesVm.Refresh();
+        else if (ReferenceEquals(current, _inboxVm)) _inboxVm.Refresh();
+    }
+
+    // ── Scrobble tracking ──
+    private readonly ScrobblePlayClock _scrobbleClock = new();
+    private Track? _scrobbleTrack;
+    private readonly SemaphoreSlim _dropImportLock = new(1, 1);
+
+    // ── Drop-import progress (spinner pill while dropped files are copied/added) ──
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsDropImportSpinnerVisible))]
+    private bool _isDropImporting;
+    [ObservableProperty] private string _dropImportStatus = string.Empty;
+
+    /// <summary>The pill shows a finished drop's outcome: a check instead of the spinner.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsDropImportSpinnerVisible))]
+    private bool _dropImportDone;
+
+    public bool IsDropImportSpinnerVisible => IsDropImporting && !DropImportDone;
+
+    /// <summary>"Plugin: message" from a plugin's Notify(), shown for a few seconds in the notice pill
+    /// (also the lyrics offset confirmation, GitHub #102).</summary>
+    [ObservableProperty] private string _pluginNotice = string.Empty;
+
+    // ── Discord seek throttle ──
+    private DateTime _lastDiscordSeekUpdate = DateTime.MinValue;
+    private static readonly TimeSpan DiscordSeekThrottle = TimeSpan.FromSeconds(1);
+
+    // ── Top bar page actions (Songs page) ──
+    private PropertyChangedEventHandler? _songsVmTopBarHandler;
+
+    // ── Zone ViewModels (always alive) ──
+
+    public SidebarViewModel Sidebar { get; }
+    public TopBarViewModel TopBar { get; }
+    public PlayerViewModel Player { get; }
+    /// <summary>"Added to Queue" / "Playing Next" pill above the island (owner 10-08).</summary>
+    public QueueToastViewModel QueueToast { get; } = new();
+    /// <summary>"Continue from your phone" pill (Pick Up on Computer).</summary>
+    public HandoffPromptViewModel HandoffPrompt { get; } = new();
+    public SettingsViewModel Settings { get; }
+    public LyricsViewModel Lyrics => _lyricsVm;
+
+    private MiniPlayerViewModel? _miniPlayerVm;
+
+    /// <summary>
+    /// The mini player's ViewModel (shares the always-alive player/lyrics/settings VMs
+    /// and the library for its search layer). A single cached instance: it subscribes
+    /// to the queue/lyrics collections, so per-open instances would pin themselves via
+    /// those handlers. Each open starts with the drawer layers closed.
+    /// </summary>
+    public MiniPlayerViewModel CreateMiniPlayerViewModel()
+    {
+        _miniPlayerVm ??= new MiniPlayerViewModel(Player, _lyricsVm, Settings, _library);
+        _miniPlayerVm.Drawer = MiniDrawer.None;
+        return _miniPlayerVm;
+    }
+
+    // ── Content area ──
+
+    /// <summary>The ViewModel currently displayed in the main content area (Zone C).</summary>
+    [ObservableProperty] private ViewModelBase _currentView;
+
+    /// <summary>Whether the lyrics view is currently active (hides the playback island bar).</summary>
+    public bool IsLyricsViewActive => CurrentView == _lyricsVm;
+
+    /// <summary>
+    /// The album page's tint while "Tint Whole Window" is on and a tinted album page is
+    /// shown (Discord 1v1ctus): MainWindow paints it behind the sidebar and player islands.
+    /// The lyrics page lends its own background colour the same way (GitHub #142).
+    /// Null otherwise, which leaves the theme's own window background.
+    /// </summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsWindowTinted))]
+    private IBrush? _windowTintBrush;
+
+    public bool IsWindowTinted => WindowTintBrush != null;
+
+    private ViewModelBase? _tintSourcePage;
+
+    /// <summary>The window tint for <paramref name="view"/>: its page colour when it is a
+    /// tinted album page or the lyrics page (#142) and the option is on, else null.
+    /// Internal for tests.</summary>
+    internal static IBrush? WindowTintFor(bool wholeWindow, ViewModelBase? view) =>
+        !wholeWindow ? null : view switch
+        {
+            AlbumDetailViewModel { HasTint: true } album => album.BackgroundBrush,
+            LyricsViewModel lyrics => lyrics.PageTintBrush,
+            _ => null
+        };
+
+    /// <summary>"Tint Whole Window" sits under Album Page Colour in Settings and is hidden
+    /// while that is off, so both must be on (an album page has no tint without it).</summary>
+    private bool WholeWindowTintOn => Settings.AlbumPageTintWholeWindow && Settings.AlbumPageTintEnabled;
+
+    private void UpdateWindowTint()
+    {
+        var page = CurrentView is AlbumDetailViewModel or LyricsViewModel ? CurrentView : null;
+        if (!ReferenceEquals(page, _tintSourcePage))
+        {
+            if (_tintSourcePage != null) _tintSourcePage.PropertyChanged -= OnTintSourcePageChanged;
+            _tintSourcePage = page;
+            if (page != null) page.PropertyChanged += OnTintSourcePageChanged;
+        }
+        WindowTintBrush = WindowTintFor(WholeWindowTintOn, CurrentView);
+    }
+
+    private void OnTintSourcePageChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(AlbumDetailViewModel.BackgroundBrush) or nameof(AlbumDetailViewModel.HasTint)
+            or nameof(LyricsViewModel.PageTintBrush))
+            WindowTintBrush = WindowTintFor(WholeWindowTintOn, CurrentView);
+    }
+
+    /// <summary>Whether the playback island bar should be visible (has content and not in lyrics
+    /// view). The lyrics page's own controls are hidden while its music video plays full size,
+    /// so the island comes back over the video for transport.</summary>
+    public bool IsPlaybackBarVisible => Player.HasContent && (!IsLyricsViewActive || Player.ShowsMusicVideoFullSize);
+
+    /// <summary>Whether the playback island should stay mounted in the visual tree.</summary>
+    public bool IsPlaybackBarMounted => Player.HasContent;
+
+    /// <summary>Opacity used to hide the mounted playback bar while fullscreen lyrics owns playback controls.</summary>
+    public double PlaybackBarOpacity => IsPlaybackBarVisible ? 1.0 : 0.0;
+
+    /// <summary>Whether the mounted playback bar should accept pointer input.</summary>
+    public bool IsPlaybackBarHitTestVisible => IsPlaybackBarVisible;
+
+    /// <summary>GitHub #92: the island unmounts while nothing is loaded, taking its Queue
+    /// button with it; a small idle pill stands in so the queue can still be opened.
+    /// Opt-in via Settings → Player (off by default).</summary>
+    public bool IsIdleIslandVisible => Settings.PlaybackBarShowIdlePill && !Player.HasContent && !IsLyricsViewActive;
+
+    /// <summary>
+    /// With "Import dropped files" off, whether a drop plays (nothing loaded and nothing queued)
+    /// or is added to the queue. A queue built up with nothing playing (#92) is kept, not
+    /// replaced. The drag overlay reads this too, so its text matches what the drop does (#90).
+    /// </summary>
+    public bool DropStartsPlayback => !Player.HasContent;
+
+    // ── Sidebar visibility ──
+
+    /// <summary>Whether the sidebar is hidden. Driven by the shell: auto-hidden while
+    /// the lyrics page is up in fullscreen, restored when either condition ends.</summary>
+    [ObservableProperty] private bool _isSidebarHidden;
+
+    [RelayCommand]
+    private void ToggleSidebar() => IsSidebarHidden = !IsSidebarHidden;
+
+    // ── Lyrics side panel ──
+
+    /// <summary>Whether the lyrics side panel overlay is open.</summary>
+    [ObservableProperty] private bool _isLyricsPanelOpen;
+
+    [RelayCommand]
+    private void ToggleLyricsPanel()
+    {
+        if (IsLyricsViewActive) return;
+        IsLyricsPanelOpen = !IsLyricsPanelOpen;
+        if (IsLyricsPanelOpen)
+        {
+            // The lyrics VM reloads on TrackStarted regardless of visibility, but the
+            // panel can open mid-track after a cold start — make sure lyrics exist and
+            // the active line is current before the panel slides in.
+            _lyricsVm.EnsureLyricsForCurrentTrack();
+            Player.IsQueuePopupOpen = false;
+        }
+    }
+
+    private sealed class NavigationEntry
+    {
+        public required ViewModelBase View { get; init; }
+        public required string BackButtonText { get; init; }
+        public required string TabName { get; init; }
+        public required Action RestoreState { get; init; }
+        public required string SearchText { get; init; }
+        public required string SectionKey { get; init; }
+    }
+
+    private readonly Stack<NavigationEntry> _navigationHistory = new();
+    // Forward stack mirrors browser semantics: populated when going back,
+    // consumed when going forward, and cleared whenever a new branch is navigated.
+    private readonly Stack<NavigationEntry> _forwardHistory = new();
+    private string? _albumDetailBackButtonText;
+
+    // ── Cached content ViewModels (created once, reused) ──
+
+    private readonly HomeViewModel _homeVm;
+    private readonly LibrarySongsViewModel _songsVm;
+    private readonly LibraryAlbumsViewModel _albumsVm;
+    private readonly LibraryArtistsViewModel _artistsVm;
+    private readonly LibraryPlaylistsViewModel _playlistsVm;
+    private readonly FavoritesViewModel _favoritesVm;
+    private readonly LibraryFoldersViewModel _foldersVm;
+    private readonly InboxViewModel _inboxVm;
+    private readonly ServerViewModel _serverVm;
+    private readonly AudioCdViewModel _audioCdVm;
+    private readonly VisualizerViewModel _visualizerVm;
+    private readonly LyricsStudioPageViewModel _lyricsStudioPageVm;
+
+    /// <summary>Plugin host (Settings → Plugins; lyrics-page visual layers).</summary>
+    public PluginHost Plugins { get; }
+
+    private readonly QueueViewModel _queueVm;
+    private readonly LyricsViewModel _lyricsVm;
+    private readonly StatisticsViewModel _statisticsVm;
+    private readonly CoverFlowViewModel _coverFlowVm;
+    /// <summary>True when the global Cover Flow overlay is active. Survives sidebar navigation between toggle-eligible sections; auto-exits when navigating to an ineligible section.</summary>
+    private bool _isCoverFlowMode;
+
+    /// <summary>The sidebar key for the section currently selected underneath Cover Flow (e.g. "home", "songs", "albums"). Tracked so clicking Library returns to the right section.</summary>
+    private string _currentSectionKey = "home";
+
+    /// <summary>Set once InitializeAsync has taken App.PendingOpenFiles; see <see cref="OpenExternalFilesWhenReady"/>.</summary>
+    private bool _pendingOpenFilesTaken;
+
+    /// <summary>The non-section view (e.g. a PlaylistViewModel) the user was on when entering Cover Flow. Restored on exit so clicking Library returns to the same detail page.</summary>
+    private ViewModelBase? _preCoverFlowView;
+
+    /// <summary>Sidebar keys whose section is allowed to display the Library/Cover Flow toggle.</summary>
+    private static readonly HashSet<string> ToggleEligibleSections = new(StringComparer.Ordinal)
+    {
+        "home", "songs", "albums", "artists", "folders", "playlists", "favorites"
+    };
+    private string? _preLyricsViewKey;
+
+    public MainWindowViewModel(
+        ILibraryService library,
+        IPersistenceService persistence,
+        IAudioPlayer audioPlayer,
+        IMetadataService metadata,
+        IDiscordPresenceService discord,
+        ILastFmService lastFm,
+        IListenBrainzService listenBrainz,
+        ISyncService syncService,
+        ArtistImageService artistImageService,
+        LoonClient loon,
+        ILrcLibService lrcLib,
+        INetEaseService netEase,
+        IPlayHistoryService playHistory,
+        IMediaServerService mediaServer,
+        IAudioCdService audioCd)
+    {
+        _library = library;
+        _playHistory = playHistory;
+        _persistence = persistence;
+        _metadata = metadata;
+        _discord = discord;
+        _lastFm = lastFm;
+        _listenBrainz = listenBrainz;
+        _syncService = syncService;
+        _artistImageService = artistImageService;
+        _loon = loon;
+
+        // Create long-lived ViewModels
+        Player = new PlayerViewModel(audioPlayer, library, persistence, new AnimatedCoverService(persistence), metadata);
+        QueueToast.Attach(Player);
+        if (App.Services?.GetService<PhoneHandoffInbox>() is { } handoffInbox)
+        {
+            HandoffPrompt.Attach(handoffInbox, Player.LoadPhoneHandoff, id => library.GetTrackById(id)?.Title,
+                () => Player.State == PlaybackState.Playing);
+            var wasPlaying = false;
+            Player.PropertyChanged += (_, e) =>
+            {
+                if (e.PropertyName != nameof(PlayerViewModel.State)) return;
+                var playing = Player.State == PlaybackState.Playing;
+                if (playing || wasPlaying) HandoffPrompt.NotePlaybackHere();
+                wasPlaying = playing;
+            };
+        }
+        Sidebar = new SidebarViewModel(persistence, library);
+        TopBar = new TopBarViewModel();
+        Sidebar.TopBar = TopBar;
+        Settings = new SettingsViewModel(persistence, library, playHistory, mediaServer);
+        Settings.SetAudioPlayer(audioPlayer);
+        Settings.SetPlayer(Player);
+        Player.SetSettingsViewModel(Settings);
+        Player.SetPlayHistory(playHistory);
+        if (App.Services?.GetService<Services.Waveform.WaveformService>() is { } waveforms)
+            Player.SetWaveformService(waveforms);
+        Settings.SetDiscordPresence(discord);
+        Settings.SetLoonClient(loon);
+        Settings.SetLastFm(lastFm);
+        Settings.SetListenBrainz(listenBrainz);
+        Settings.SetTidal(App.Services!.GetRequiredService<ITidalAuthService>());
+        Settings.SetUpdateService(App.Services!.GetRequiredService<UpdateService>());
+        // Deferred tag writes skip the file that is playing; the player knows which one.
+        if (App.Services?.GetService<IDeferredTagWriter>() is { } tagWriter)
+            tagWriter.InUsePath = () => Player.CurrentTrack?.FilePath;
+        Settings.SettingsReset += async (_, _) =>
+        {
+            // Loaded once by the Artists page; the reset deleted the file under it.
+            _artistsVm.ClearFavoriteArtists();
+            // Guarded: an unhandled throw from an async-void handler crashes the app.
+            try { await Sidebar.LoadPlaylistsAsync(); }
+            catch (Exception ex) { DebugLogger.Error(DebugLogger.Category.Error, "SettingsReset.ReloadPlaylists", ex.Message); }
+        };
+
+        // Mirror the "update available" state onto the Settings sidebar item so a
+        // dot nudges the user without them opening Settings. The silent update
+        // check runs on a background thread, so marshal to the UI thread.
+        Settings.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(SettingsViewModel.PlaybackBarShowIdlePill))
+            {
+                OnPropertyChanged(nameof(IsIdleIslandVisible));
+                return;
+            }
+            if (e.PropertyName != nameof(SettingsViewModel.ShowUpdateBadge)) return;
+            Dispatcher.UIThread.Post(() =>
+            {
+                var settingsNav = Sidebar.NavItems.FirstOrDefault(n => n.Key == "settings");
+                if (settingsNav is not null)
+                    settingsNav.ShowBadge = Settings.ShowUpdateBadge;
+            });
+        };
+
+        // Create content ViewModels
+        _serverVm = new ServerViewModel(mediaServer, Player);
+        // The Server entry only exists in the rail while a server is configured;
+        // hydration (Settings.LoadAsync), Connect and Disconnect all raise this.
+        Settings.MediaServerConnectionChanged += (_, _) =>
+        {
+            var configured = mediaServer.IsConfigured;
+            Sidebar.SetServerSectionVisible(configured);
+            if (!configured && ReferenceEquals(CurrentView, _serverVm))
+                Navigate("home");
+        };
+        // The Audio CD entry only exists in the rail while an optical drive does; the
+        // service polls for drive/disc changes once the shell is up.
+        _audioCdVm = new AudioCdViewModel(audioCd, Player);
+        _visualizerVm = new VisualizerViewModel(Player, Settings);
+        _lyricsStudioPageVm = new LyricsStudioPageViewModel(library,
+            () => Settings.GetSettings().LyricsStudioWordTimings, MetadataHelper.CreateLyricsStudioViewModel);
+
+        // Plugins load once settings are read so the disabled list is honoured on the first pass.
+        // Plugins see the bare version ("1.5.3"), which is also what plugin.json's minAppVersion is checked against.
+        Plugins = new PluginHost(Player, persistence.DataDirectory, () => Settings.GetSettings(),
+            () => _ = Settings.SaveAsync(), UpdateService.CurrentVersion.ToString(3), library);
+        Settings.Plugins = Plugins;
+        // Get plugins (official list) fetches only when the Plugins page opens.
+        if (App.Services?.GetService<System.Net.Http.HttpClient>() is { } pluginHttp)
+            Settings.PluginCatalogClient = new PluginCatalogClient(pluginHttp);
+        TrackContextMenuBuilder.PluginCommandSource = () => Plugins.TrackCommands;
+        TrackContextMenuBuilder.CreateMixCommand = CreateMixFromSongCommand;
+        // API 1.3: plugin views open in a window of their own; ShowAlbum opens the album page here.
+        Plugins.ViewPresenter = Views.PluginViewWindow.Present;
+        // The sidebar's Plugins section follows the running plugins' views (loads and unloads
+        // raise VisualLayersChanged; registrations and Show in sidebar raise ViewsChanged).
+        void SyncPluginSidebar() => Dispatcher.UIThread.Post(() => Sidebar.SyncPluginItems(Plugins.Views));
+        Plugins.VisualLayersChanged += (_, _) => SyncPluginSidebar();
+        Plugins.ViewsChanged += (_, _) => SyncPluginSidebar();
+        Sidebar.PluginSettingsRequested += (_, item) =>
+        {
+            if (Settings.OpenPluginPageFor(item.View.Plugin)) OpenSettings();
+        };
+        // API 1.4: plugins read the playlists the sidebar holds (copied by the adapter).
+        Plugins.PlaylistSource = () => Sidebar.Playlists.ToArray();
+        // API 1.6: plugins decode songs with the ffmpeg the converter and the BPM/key analysis use.
+        Plugins.FfmpegPathSource = () => App.Services?.GetService<IAudioConverterService>()?.GetFfmpegPath();
+        Plugins.AlbumOpener = albumId =>
+        {
+            if (_library.GetAlbumById(albumId) is not { } album) return false;
+            OpenAlbumDetail(album);
+            if (Avalonia.Application.Current?.ApplicationLifetime is Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime { MainWindow: { } window })
+            {
+                if (window.WindowState == Avalonia.Controls.WindowState.Minimized) window.WindowState = Avalonia.Controls.WindowState.Normal;
+                if (!window.IsVisible) window.Show();
+                window.Activate();
+            }
+            return true;
+        };
+        TrackContextMenuBuilder.ArtistPhotoSource = name => HomeViewModel.CachedArtistPhoto(name, _library, _artistImageService);
+        Plugins.NotificationRequested += (_, notice) =>
+            TransientStatus.Show(nameof(PluginNotice), v => PluginNotice = v, $"{notice.PluginName}: {notice.Message}", TimeSpan.FromSeconds(4));
+        // GitHub #154: songs passed over because their file is missing, in the same notice pill.
+        Player.MissingTracksNotice += (_, text) =>
+            TransientStatus.Show(nameof(PluginNotice), v => PluginNotice = v, text, TimeSpan.FromSeconds(4));
+        // LoadAll walks the plugins folder, loads assemblies and reflects over their
+        // types on the UI thread. Settings finish loading right after the window
+        // shows, so running it inline there held the first frame hostage to however
+        // many plugins are installed. Background priority lets the first page paint
+        // and settle first; VisualLayersChanged re-syncs any view that cares.
+        void LoadPluginsWhenIdle() =>
+            Dispatcher.UIThread.Post(() =>
+            {
+                // External plugins are disabled; built-in features remain available.
+                Services.StartupTrace.Mark("plugins-loaded");
+            }, DispatcherPriority.Background);
+        if (Settings.IsSettingsLoaded) LoadPluginsWhenIdle();
+        else Settings.SettingsLoaded += (_, _) => LoadPluginsWhenIdle();
+        Loc.Instance.CultureChanged += (_, _) =>
+        {
+            TopBar.RefreshLocalizedTitles();
+            RefreshBackButton();
+        };
+        Sidebar.SetAudioCdSectionVisible(audioCd.HasDrive);
+        audioCd.DriveStateChanged += (_, _) => Dispatcher.UIThread.Post(() =>
+        {
+            Sidebar.SetAudioCdSectionVisible(audioCd.HasDrive);
+            if (!audioCd.HasDrive && ReferenceEquals(CurrentView, _audioCdVm))
+                Navigate("home");
+        });
+        audioCd.StartWatching();
+        _homeVm = new HomeViewModel(Player, library, Sidebar, artistImageService, playHistory, Settings);
+        _songsVm = new LibrarySongsViewModel(library, Player, Sidebar, persistence, Settings);
+        _albumsVm = new LibraryAlbumsViewModel(library, Player, Sidebar, Settings);
+        // Keep the top-bar dropdown labels in sync with the Albums grid filters/sort.
+        _albumsVm.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(LibraryAlbumsViewModel.AlbumSortLabel))
+                TopBar.AlbumSortLabel = _albumsVm.AlbumSortLabel;
+            else if (e.PropertyName == nameof(LibraryAlbumsViewModel.AlbumSortMode))
+                TopBar.AlbumSortMode = _albumsVm.AlbumSortMode;
+            else if (e.PropertyName == nameof(LibraryAlbumsViewModel.AlbumSortAscending))
+                TopBar.AlbumSortAscending = _albumsVm.AlbumSortAscending;
+            else if (e.PropertyName == nameof(LibraryAlbumsViewModel.AlbumSortNewestFirst))
+                TopBar.AlbumSortNewestFirst = _albumsVm.AlbumSortNewestFirst;
+            else if (e.PropertyName == nameof(LibraryAlbumsViewModel.ReleaseTypeFilterLabel))
+                TopBar.ReleaseTypeFilterLabel = _albumsVm.ReleaseTypeFilterLabel;
+            else if (e.PropertyName == nameof(LibraryAlbumsViewModel.QualityFilterLabel))
+                TopBar.QualityFilterLabel = _albumsVm.QualityFilterLabel;
+            else if (e.PropertyName is nameof(LibraryAlbumsViewModel.AlbumViewMode) or nameof(LibraryAlbumsViewModel.IsCarouselView))
+                TopBar.IsAlbumCarouselView = _albumsVm.IsCarouselView;
+            else if (e.PropertyName == nameof(LibraryAlbumsViewModel.CarouselStyle))
+                TopBar.AlbumCarouselStyle = _albumsVm.CarouselStyle.ToString();
+        };
+        _artistsVm = new LibraryArtistsViewModel(library);
+        _artistsVm.SetArtistImageService(artistImageService);
+        // Artists sort: mirror the grid's sort state into the top-bar chip and persist
+        // changes — same shape as the Albums sort. Settings load asynchronously, so the
+        // persisted choice is adopted when ViewStateLoaded fires, not read here.
+        var adoptingArtistSort = false;
+        _artistsVm.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(LibraryArtistsViewModel.SortMode))
+            {
+                TopBar.ArtistSortMode = _artistsVm.SortMode;
+                TopBar.ArtistSortLabel = _artistsVm.SortLabel;
+                if (!adoptingArtistSort) Settings.ArtistSortMode = _artistsVm.SortMode;
+            }
+            else if (e.PropertyName == nameof(LibraryArtistsViewModel.SortAscending))
+            {
+                TopBar.ArtistSortAscending = _artistsVm.SortAscending;
+                if (!adoptingArtistSort) Settings.ArtistSortAscending = _artistsVm.SortAscending;
+            }
+            else if (e.PropertyName == nameof(LibraryArtistsViewModel.ViewMode))
+            {
+                // Grid ↔ list (Discord, vari): mirrored and persisted like the sort.
+                TopBar.IsArtistListView = _artistsVm.IsListView;
+                if (!adoptingArtistSort) Settings.ArtistViewMode = _artistsVm.ViewMode;
+            }
+        };
+        Settings.ViewStateLoaded += (_, _) =>
+        {
+            adoptingArtistSort = true;
+            try
+            {
+                _artistsVm.SortMode = Settings.ArtistSortMode;
+                _artistsVm.SortAscending = Settings.ArtistSortAscending;
+                _artistsVm.ViewMode = Settings.ArtistViewMode;
+            }
+            finally { adoptingArtistSort = false; }
+        };
+        // Ignored leading words for the Artists name sort (GitHub #99): pushed now and on every
+        // toggle/list change, including the settings load — same shape as the Cover Flow layout.
+        _artistsVm.SetSortIgnoredWords(Settings.ActiveArtistSortIgnoredWords);
+        Settings.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(SettingsViewModel.ActiveArtistSortIgnoredWords))
+                _artistsVm.SetSortIgnoredWords(Settings.ActiveArtistSortIgnoredWords);
+        };
+        _playlistsVm = new LibraryPlaylistsViewModel(Sidebar, Player, library, persistence);
+        // Same mirroring as the Albums sort chip: the label lives on the grid view-model,
+        // the control that shows it lives in the shared top bar.
+        _playlistsVm.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(LibraryPlaylistsViewModel.SortLabel))
+                TopBar.PlaylistSortLabel = _playlistsVm.SortLabel;
+            else if (e.PropertyName == nameof(LibraryPlaylistsViewModel.SortMode))
+                TopBar.PlaylistSortMode = _playlistsVm.SortMode;
+        };
+
+        _foldersVm = new LibraryFoldersViewModel(library, Player, persistence, Sidebar);
+        _inboxVm = new InboxViewModel(library, Player, Sidebar);
+        // The Inbox entry follows Settings › Library › Inbox for New Music (and stays while
+        // songs still wait in it). Leaving it shown on a page that no longer has an entry
+        // would strand the user there.
+        void SyncInboxSection()
+        {
+            Sidebar.SetInboxEnabled(Settings.InboxEnabled);
+            if (ReferenceEquals(CurrentView, _inboxVm) && !Sidebar.IsInboxSectionVisible)
+                Navigate("home");
+        }
+        if (Settings.IsSettingsLoaded) SyncInboxSection();
+        else Settings.SettingsLoaded += (_, _) => Dispatcher.UIThread.Post(SyncInboxSection);
+        Settings.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(SettingsViewModel.InboxEnabled))
+                Dispatcher.UIThread.Post(SyncInboxSection);
+        };
+        _library.LibraryUpdated += (_, _) => Dispatcher.UIThread.Post(() =>
+        {
+            if (ReferenceEquals(CurrentView, _inboxVm) && !Sidebar.IsInboxSectionVisible)
+                Navigate("home");
+        });
+        // Built-in Features: the Visualizer entry follows the Audio Visualizer switch, and an open
+        // playlist page follows the Featured Artists & Suggestions one.
+        void SyncVisualizerSection()
+        {
+            TopBar.AlbumCarouselAvailable = Settings.AlbumCarouselEnabled;
+            Sidebar.SetVisualizerSectionVisible(Settings.VisualizerEnabled);
+            if (ReferenceEquals(CurrentView, _visualizerVm) && !Settings.VisualizerEnabled)
+                Navigate("home");
+        }
+        if (Settings.IsSettingsLoaded) SyncVisualizerSection();
+        else Settings.SettingsLoaded += (_, _) => Dispatcher.UIThread.Post(SyncVisualizerSection);
+        Settings.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(SettingsViewModel.VisualizerEnabled))
+                Dispatcher.UIThread.Post(SyncVisualizerSection);
+            else if (e.PropertyName == nameof(SettingsViewModel.AlbumCarouselEnabled))
+                TopBar.AlbumCarouselAvailable = Settings.AlbumCarouselEnabled;
+            else if (e.PropertyName == nameof(SettingsViewModel.PlaylistShowSideRail) && CurrentView is PlaylistViewModel openPlaylist)
+                openPlaylist.ShowSideRail = Settings.PlaylistShowSideRail;
+        };
+        // Folders sort (GitHub #89): mirror into the top bar and persist, adopting the
+        // saved choice once settings load — same shape as the Artists sort above.
+        var adoptingFoldersSort = false;
+        _foldersVm.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName != nameof(LibraryFoldersViewModel.SortMode)) return;
+            TopBar.FoldersSortMode = _foldersVm.SortMode;
+            TopBar.FoldersSortLabel = _foldersVm.SortLabel;
+            if (!adoptingFoldersSort) Settings.FoldersSortMode = _foldersVm.SortMode;
+        };
+        Settings.ViewStateLoaded += (_, _) =>
+        {
+            adoptingFoldersSort = true;
+            try { _foldersVm.SortMode = Settings.FoldersSortMode; }
+            finally { adoptingFoldersSort = false; }
+        };
+        _foldersVm.NavigateToSettingsRequested += (_, _) =>
+        {
+            OpenSettings();
+            Dispatcher.UIThread.Post(Settings.RequestMediaFoldersSection);
+        };
+        // Home's empty-library "Open Settings" lands on the same media-folders card.
+        _homeVm.NavigateToSettingsRequested += (_, _) =>
+        {
+            OpenSettings();
+            Dispatcher.UIThread.Post(Settings.RequestMediaFoldersSection);
+        };
+        // The Settings modal leaves the page beneath it visible around the card, yet counts
+        // it as hidden (UpdateSectionActiveFlags) so settings toggles don't rebuild it
+        // mid-animation. A scan or a folder add/remove then never reached that page until
+        // the user navigated away and back (09-23 owner report). Catch the covered page up
+        // once library updates settle, debounced so a scan's ~1.5 s progress publishes
+        // don't each rebuild it.
+        _coveredRefreshTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(700) };
+        _coveredRefreshTimer.Tick += (_, _) =>
+        {
+            _coveredRefreshTimer.Stop();
+            if (IsSettingsModalOpen) RefreshCoveredSection();
+        };
+        _library.LibraryUpdated += (_, _) => Dispatcher.UIThread.Post(() =>
+        {
+            if (!IsSettingsModalOpen) return;
+            _coveredRefreshTimer.Stop();
+            _coveredRefreshTimer.Start();
+        });
+
+        // Settings is a modal overlay and folder add/remove doesn't fire LibraryUpdated,
+        // so explicitly rebuild the Folders tree when the media-folder set changes.
+        Settings.MusicFoldersChanged += (_, _) =>
+        {
+            // Keep the filesystem watchers in sync with the media-folder set.
+            App.Services?.GetService<ILibraryWatcherService>()?.Refresh();
+            Dispatcher.UIThread.Post(() =>
+            {
+                _foldersVm.MarkDirty();
+                _foldersVm.Refresh();
+            });
+        };
+        _favoritesVm = new FavoritesViewModel(Player, library, persistence, Sidebar, Settings);
+        _queueVm = new QueueViewModel(Player);
+        _lyricsVm = new LyricsViewModel(Player, lrcLib, netEase, metadata, persistence, library);
+        _lyricsVm.PluginLyricsSources = () => Plugins.LyricsProviders;
+        // Musixmatch, lrc.red, Unison, Kugou and YouTube Music (issue #113): searched when switched
+        // on in Settings, and always offered by the lyrics page's Choose Source dialog.
+        if (App.Services?.GetService<IMusixmatchService>() is { } musixmatch
+            && App.Services.GetService<IKugouLyricsService>() is { } kugou
+            && App.Services.GetService<IYouTubeMusicLyricsService>() is { } youTubeMusic
+            && App.Services.GetService<ILrcRedLyricsService>() is { } lrcRed
+            && App.Services.GetService<IUnisonLyricsService>() is { } unison)
+        {
+            _lyricsVm.ExtraLyricsSources = Services.Lyrics.OnlineLyricsSource.BuiltIns(musixmatch, kugou, youTubeMusic, lrcRed, unison);
+            // "Word-sync with lrc.red's model" on the lyrics page and in Search Lyrics.
+            _lyricsVm.LrcRed = lrcRed;
+        }
+        _lyricsVm.ShowLyricsSearchDialog = MetadataHelper.OpenLyricsSearchDialog;
+        // Lyrics saved inside audio files (GitHub #135) wait until the song is not playing.
+        _lyricsVm.TagWriter = App.Services?.GetService<IDeferredTagWriter>();
+        // Lyrics offset nudges (Ctrl+wheel, GitHub #102) confirm in the notice pill, which
+        // shows over both the lyrics page and the side panel.
+        _lyricsVm.ShowNotice = text => TransientStatus.Show(nameof(PluginNotice), v => PluginNotice = v, text);
+        _statisticsVm = new StatisticsViewModel(library, playHistory);
+        // Top Artists / Albums rows open their pages, as on Home.
+        _statisticsVm.BackRequested += (_, _) =>
+        {
+            // Restore the pre-stats view from history, then reopen the Settings modal
+            // (on the Statistics tab "View All Stats" was launched from) in the SAME
+            // UI tick. The reopen must skip the fade/scale entrance: the backdrop
+            // starts transparent, so a fade-in shows the restored page fully undimmed
+            // for its first frames — a visible flash of "another section" before the
+            // dark backdrop covers it. History restore (not Navigate(_currentSectionKey))
+            // brings back non-section views too: from the lyrics page, Navigate landed
+            // on the underlying section instead.
+            if (_navigationHistory.Count > 0)
+                GoBackInHistory();
+            else
+                Navigate(_currentSectionKey);
+            SkipNextSettingsOpenAnimation = true;
+            OpenSettings();
+        };
+        Settings.OpenStatisticsRequested += (_, _) =>
+        {
+            // Swap the content to Statistics while the modal still covers it, then
+            // fade the modal out — closing first showed the old section mid-fade.
+            Navigate("statistics");
+            // Repurpose the sidebar Back arrow to return to Settings. Using the standard
+            // back-button path also hides the redundant "Statistics" page title.
+            TopBar.ShowBackButton("Back", _statisticsVm.GoBackCommand);
+            CloseSettings();
+        };
+        _coverFlowVm = new CoverFlowViewModel(Player);
+
+        // Default view
+        _currentView = _homeVm;
+
+        // Wire up navigation
+        Sidebar.NavigationRequested += OnNavigationRequested;
+
+        // Wire up lyrics navigation from player
+        Player.SetNavigateAction(ToggleLyrics);
+
+        // Wire up "View Album" from playback bar three-dots menu
+        Player.SetViewAlbumAction(track =>
+        {
+            OnViewAlbumFromTrack(this, track);
+            TopBar.IsPageTitleVisible = false;
+        });
+
+        // Wire up playlist access for playback bar
+        Player.SetSidebar(Sidebar);
+
+        // Wire up "View Artist" from lyrics view
+        _lyricsVm.SetViewArtistAction(ViewArtistFromLyrics);
+        _lyricsVm.SetViewAlbumAction(track => OnViewAlbumFromTrack(this, track));
+
+        // Wire up search
+        TopBar.SearchTextChanged += OnSearchTextChanged;
+        TopBar.HomeSearchRedirectRequested += OnHomeSearchRedirectRequested;
+
+        // Wire up album detail navigation from albums view
+        _albumsVm.AlbumOpened += OnAlbumOpened;
+        _albumsVm.SetViewArtistAction(ViewArtistByName);
+
+        // Entering/leaving an artist's discography toggles the title-bar filter chips.
+        _albumsVm.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(LibraryAlbumsViewModel.IsArtistFiltered))
+                UpdateReleaseTypeChips();
+        };
+
+        // Wire up album detail navigation from home view
+        _homeVm.AlbumOpened += OnHomeAlbumOpened;
+
+        // Wire up artist → album navigation
+        _artistsVm.ArtistOpened += OnArtistOpened;
+
+
+
+        // Wire up playlist detail navigation from playlists view
+        _playlistsVm.PlaylistOpened += OnPlaylistOpened;
+
+        // Wire up "View Album" from Songs tab, Favorites tab, Home tab, and Folders tab
+        _songsVm.ViewAlbumRequested += OnViewAlbumFromTrack;
+        _favoritesVm.ViewAlbumRequested += OnViewAlbumFromTrack;
+        _homeVm.ViewAlbumRequested += OnViewAlbumFromTrack;
+        _foldersVm.ViewAlbumRequested += OnViewAlbumFromTrack;
+        _favoritesVm.AlbumOpened += OnAlbumOpened;
+
+        // Wire up Search Lyrics action on ViewModels with track context menus
+        _homeVm.SetSearchLyricsAction(SearchLyricsForTrack);
+        _albumsVm.SetSearchLyricsAction(SearchLyricsForTrack);
+        _songsVm.SetSearchLyricsAction(SearchLyricsForTrack);
+        _favoritesVm.SetSearchLyricsAction(SearchLyricsForTrack);
+        _foldersVm.SetSearchLyricsAction(SearchLyricsForTrack);
+        _inboxVm.SetSearchLyricsAction(SearchLyricsForTrack);
+        Player.SetSearchLyricsAction(SearchLyricsForTrack);
+
+        // Wire up View Artist action on ViewModels that display artist names
+        _homeVm.SetViewArtistAction(ViewArtistByName);
+        _songsVm.SetViewArtistAction(ViewArtistByName);
+        _favoritesVm.SetViewArtistAction(ViewArtistByName);
+        _foldersVm.SetViewArtistAction(ViewArtistByName);
+        Player.SetViewArtistAction(ViewArtistByName);
+        _coverFlowVm.SetViewArtistAction(ViewArtistByName);
+        _coverFlowVm.SetViewAlbumAction(track => OnViewAlbumFromTrack(this, track));
+
+        // Mirror the Cover Flow layout into the top-bar pill segment, and keep it two-way
+        // with the Appearance setting: the pill segment writes the setting; the Appearance
+        // picker (and the load from disk) drives the page. Both setters no-op on equal
+        // values, so the pair cannot ping-pong.
+        _coverFlowVm.Layout = Settings.CoverFlowLayoutMode;
+        _coverFlowVm.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(CoverFlowViewModel.IsCollageMode))
+                TopBar.IsCollageMode = _coverFlowVm.IsCollageMode;
+            else if (e.PropertyName == nameof(CoverFlowViewModel.Layout))
+            {
+                Settings.CoverFlowLayoutMode = _coverFlowVm.Layout;
+                TopBar.CoverFlowLayoutLabel = _coverFlowVm.LayoutLabel;
+            }
+        };
+        TopBar.CoverFlowLayoutLabel = _coverFlowVm.LayoutLabel;
+        Settings.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(SettingsViewModel.CoverFlowLayout))
+                _coverFlowVm.Layout = Settings.CoverFlowLayoutMode;
+            else if (e.PropertyName is nameof(SettingsViewModel.AlbumPageTintWholeWindow)
+                     or nameof(SettingsViewModel.AlbumPageTintEnabled))
+                UpdateWindowTint();
+        };
+
+        // Forward Player.HasContent changes to IsPlaybackBarVisible
+        // and close lyrics panel when playback ends
+        Player.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName is nameof(PlayerViewModel.HasContent) or nameof(PlayerViewModel.ShowsMusicVideoFullSize))
+            {
+                OnPropertyChanged(nameof(IsPlaybackBarVisible));
+                OnPropertyChanged(nameof(IsPlaybackBarMounted));
+                OnPropertyChanged(nameof(PlaybackBarOpacity));
+                OnPropertyChanged(nameof(IsPlaybackBarHitTestVisible));
+                OnPropertyChanged(nameof(IsIdleIslandVisible));
+            }
+            if (e.PropertyName == nameof(PlayerViewModel.CurrentTrack) && Player.CurrentTrack == null)
+                IsLyricsPanelOpen = false;
+        };
+
+        // Wire up Discord RPC and Last.fm integrations
+        Player.TrackStarted += OnTrackStartedForIntegrations;
+        Player.PropertyChanged += OnPlayerPropertyChangedForIntegrations;
+        Player.Seeked += OnPlayerSeekedForIntegrations;
+
+        // A loon reconnect rotates the clientId and invalidates the artwork URL Discord
+        // is currently holding, so re-publish the presence with a fresh, valid URL.
+        _loon.Reconnected += OnLoonReconnected;
+
+        // And on the way down, drop the cached key: it belongs to a clientId that is gone,
+        // so re-publishing it would point Discord at a URL that now 404s.
+        _loon.Disconnected += OnLoonDisconnected;
+
+    }
+
+    /// <summary>
+    /// Initializes the application: loads settings, library, playlists, and queue.
+    /// Called from the View once the window is loaded.
+    /// </summary>
+    public async Task InitializeAsync()
+    {
+        // Load settings
+        await Settings.LoadAsync();
+
+        // Warm the play-history log off the UI thread. Every consumer (Home, Statistics,
+        // Settings, Wrap) reads it from the UI thread, and the first read otherwise
+        // blocked on a synchronous file read + deserialize of up to 10,000 events.
+        _ = _playHistory.PreloadAsync();
+
+        // Load persisted library
+        await _library.LoadAsync();
+        Services.StartupTrace.Mark("library-loaded");
+
+        // Don't refresh every content ViewModel up front — Navigate() below
+        // refreshes the destination page on its own, and the rest can warm
+        // up on background priority after the window is interactive.
+        // Refreshing all six VMs synchronously here was the main contributor
+        // to slow startup on large libraries.
+
+        // Load playlists into sidebar
+        await Sidebar.LoadPlaylistsAsync();
+        Services.StartupTrace.Mark("playlists-loaded");
+
+        // Apply saved volume
+        Player.Volume = Settings.GetSettings().Volume;
+        // ...and persist every later change (slider, wheel, keys, MPRIS, remote) through the
+        // debounced settings save. Written only on a graceful exit, a crash or kill brought
+        // back the previous session's volume — possibly louder than the user left it.
+        Player.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(PlayerViewModel.Volume))
+                Settings.PersistVolume(Player.Volume);
+        };
+
+        // Restore the previous session's queue (current track loads paused;
+        // the user presses play to resume). Gated by the Settings toggle.
+        if (Settings.GetSettings().RestoreLastTrackOnStartup)
+        {
+            try { await Player.RestoreQueueStateAsync(); }
+            catch (Exception ex) { DebugLog.Write("Queue", $"Queue restore failed: {ex}"); }
+        }
+        HandoffPrompt.Check();
+
+        // Auto-scan if enabled
+        if (Settings.GetSettings().ScanOnStartup && Settings.GetSettings().MusicFolders.Count > 0)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await _library.ScanAsync(Settings.GetSettings().MusicFolders);
+                    Services.MemoryTrim.RequestAfterIdle("startup scan");
+                }
+                catch (Exception ex)
+                {
+                    // Debug.WriteLine alone is compiled out of Release builds, so a failed
+                    // startup scan left nothing in a reporter's session log (#97).
+                    DebugLog.Write("Scan", $"Startup scan failed: {ex}");
+                    System.Diagnostics.Debug.WriteLine($"[MainWindowVM] Auto-scan failed: {ex.Message}");
+                }
+            });
+        }
+
+        // Begin continuous folder watching now that settings + library are loaded.
+        try { App.Services?.GetService<ILibraryWatcherService>()?.Refresh(); }
+        catch (Exception ex) { Debug.WriteLine($"[MainWindowVM] Watcher start failed: {ex.Message}"); }
+
+        // Freeze finished years now rather than waiting for someone to open Wrap. The
+        // play log caps at 10,000 events; a user who opens Wrap for the first time months
+        // into the new year had last year's already-trimmed numbers written to the archive
+        // as the permanent record. Archiving every launch shrinks that window to one
+        // session's worth of plays.
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                var archive = App.Services?.GetService<IWrapArchiveService>() ?? new WrapArchiveService();
+                var tracksById = _library.Tracks.ToDictionary(t => t.Id);
+                archive.EnsureArchived(_playHistory.Events, tracksById, DateTime.Now.Year);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[MainWindowVM] Wrap archive failed: {ex.Message}");
+            }
+        });
+
+        // What an auto-update did at launch ("Updated to X.") and a queued install's Ready state.
+        Settings.RestoreAutoUpdateState();
+
+        // Silently check GitHub for a newer release so the About page can surface
+        // a passive "Update available" badge without the user clicking anything.
+        // Deferred + fire-and-forget so it never blocks startup.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(5));
+                await Settings.CheckForUpdateSilentAsync();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Update] Silent check failed: {ex.Message}");
+            }
+
+            // Tray users who keep Undertone running for days still pick up a release while auto-update is on:
+            // daily, or sooner when a known release's soak or backoff ends or a check failed (GitHub #130).
+            var lastCheck = DateTimeOffset.UtcNow;
+            while (true)
+            {
+                var wait = AutoUpdatePolicy.NextCheckDue(lastCheck, Settings.AutoUpdateRetryAtUtc) - DateTimeOffset.UtcNow;
+                if (wait > TimeSpan.Zero)
+                {
+                    await Task.Delay(wait < AutoUpdatePolicy.RecheckWake ? wait : AutoUpdatePolicy.RecheckWake);
+                    continue;
+                }
+                lastCheck = DateTimeOffset.UtcNow;
+                try { if (Settings.AutoInstallUpdates) await Settings.CheckForUpdateSilentAsync(); }
+                catch (Exception ex) { Debug.WriteLine($"[Update] Periodic check failed: {ex.Message}"); }
+            }
+        });
+
+        // Loon (Discord cover-art relay) is no longer connected unconditionally
+        // here — SettingsViewModel connects/disconnects it with the Discord
+        // presence toggle, so the remote channel only exists while it's needed.
+
+        // Navigate to the user's preferred default page
+        var defaultKey = Settings.GetDefaultPageKey();
+        Navigate(defaultKey);
+        Services.StartupTrace.Mark("first-page-navigated");
+
+        // Pre-warm cached views and the non-visible content VMs on background
+        // priority. The visible page was already refreshed by Navigate(); this
+        // makes navigation to the other sections feel instant once the user
+        // gets there, without blocking first paint.
+        //
+        // Each step is posted as its own work item so the dispatcher can service
+        // input/render between them — doing all of this in one callback froze the
+        // UI for ~1–2 s right after the window appeared (building a heavy view is
+        // ~1 s on its own, plus six full list rebuilds).
+        void PostWarmup(Action step) => Dispatcher.UIThread.Post(step, DispatcherPriority.Background);
+
+        // Pre-warm only the heaviest cached views (Songs/Albums/Settings) so the
+        // first click on those is instant. Trying to pre-warm every view here
+        // saturated the dispatcher for ~10 s after launch — lighter views build
+        // fast enough on first click that the cost isn't worth eating up front.
+        // Wait ~1.5 s so the window has fully painted and the user has time to
+        // orient before we start the background templating work.
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(1500);
+            Dispatcher.UIThread.Post(() => App.CachedLocator?.Build(_songsVm), DispatcherPriority.Background);
+            Dispatcher.UIThread.Post(() => App.CachedLocator?.Build(_albumsVm), DispatcherPriority.Background);
+            Dispatcher.UIThread.Post(() => App.CachedLocator?.Build(Settings), DispatcherPriority.Background);
+            // Lyrics is one player-bar click away at any time; pre-building it makes
+            // that first click as instant as the cached reuse on later clicks.
+            Dispatcher.UIThread.Post(() => App.CachedLocator?.Build(_lyricsVm), DispatcherPriority.Background);
+        });
+
+        // The load/scan/backfill burst above leaves a lot of dead large arrays behind;
+        // hand them back once everything has gone quiet (see MemoryTrim). While music
+        // plays the trim must not block: a forced compacting GC stalls the render thread.
+        Services.MemoryTrim.IsAudioPlaying = () => Player.IsPlaying;
+        Services.MemoryTrim.RequestAfterIdle("startup");
+
+        // Refresh non-visible content VMs so their data is ready when navigated to.
+        // These are data-only refreshes (no visual tree work), so they're cheap.
+        PostWarmup(_songsVm.Refresh);
+        PostWarmup(_albumsVm.Refresh);
+        PostWarmup(_artistsVm.Refresh);
+        PostWarmup(_foldersVm.Refresh);
+        PostWarmup(_homeVm.Refresh);
+        PostWarmup(_favoritesVm.Refresh);
+
+        // Select the matching sidebar item
+        var allNavItems = Sidebar.NavItems
+            .Concat(Sidebar.FavoritesItems)
+            .Concat(Sidebar.PlaylistItems);
+        Sidebar.SelectedNavItem = allNavItems.FirstOrDefault(n => n.Key == defaultKey)
+                                  ?? Sidebar.NavItems[0];
+
+        // Play any files this launch was asked to open ("Open with Undertone"),
+        // now that the window and player are up. Background priority so first
+        // paint isn't delayed by the metadata read.
+        _pendingOpenFilesTaken = true;
+        if (App.PendingOpenFiles.Count > 0)
+        {
+            var pending = App.PendingOpenFiles;
+            App.PendingOpenFiles = Array.Empty<string>();
+            Dispatcher.UIThread.Post(() => OpenExternalFiles(pending), DispatcherPriority.Background);
+        }
+    }
+
+    /// <summary>
+    /// Plays audio files handed to the app from outside ("Open with Undertone" on
+    /// launch, or forwarded from a second launch through the single-instance
+    /// pipe). Library entries are preferred so play counts/ratings attach;
+    /// unknown files play from a direct metadata read without being imported.
+    /// </summary>
+    public void OpenExternalFiles(IReadOnlyList<string> paths)
+    {
+        _ = OpenExternalFilesAsync(paths);
+    }
+
+    /// <summary>
+    /// Files the OS opens in the running app (macOS open-documents event). Until
+    /// InitializeAsync has taken <see cref="App.PendingOpenFiles"/> they join that list:
+    /// played at once, the queue restore that follows would replace them.
+    /// </summary>
+    public void OpenExternalFilesWhenReady(IReadOnlyList<string> paths)
+    {
+        if (_pendingOpenFilesTaken)
+            OpenExternalFiles(paths);
+        else
+            App.PendingOpenFiles = App.PendingOpenFiles.Concat(paths).ToArray();
+    }
+
+    /// <summary>
+    /// Resolves incoming file paths to tracks off the UI thread, then starts playback.
+    ///
+    /// This used to run inline on the dispatcher: a File.Exists, a linear scan of the
+    /// whole library, and a TagLib open/parse per unknown file. Selecting an album's
+    /// worth of files in Explorer and choosing "Open with Undertone" froze the window for
+    /// the duration, and the per-file library lookup was O(files x library size).
+    /// </summary>
+    private async Task OpenExternalFilesAsync(IReadOnlyList<string> paths)
+    {
+        try
+        {
+            var tracks = await ResolveExternalTracksAsync(paths);
+            if (tracks.Count == 0) return;
+            Player.ReplaceQueueAndPlay(tracks, 0);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[MainWindowVM] OpenExternalFiles failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// GitHub #71: with Settings → Library → "Import dropped files" off, a drop plays or
+    /// queues the files from where they are — nothing is moved into Undertone Imports and
+    /// the library is left alone. Folders expand to their audio files in name order.
+    /// Empty player: the drop replaces the queue and starts; otherwise it appends.
+    /// </summary>
+    public async Task QueueExternalMediaAsync(IReadOnlyList<string> paths)
+    {
+        try
+        {
+            var files = await Task.Run(() => DroppedFilesService.ExpandAudioFiles(paths));
+            if (files.Count == 0) return;
+            var tracks = await ResolveExternalTracksAsync(files);
+            if (tracks.Count == 0) return;
+            if (DropStartsPlayback)
+                Player.ReplaceQueueAndPlay(tracks, 0);
+            else
+                Player.AddRangeToQueue(tracks);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[MainWindowVM] QueueExternalMedia failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>Library entries by path where known (play counts / ratings attach), else a
+    /// direct metadata read with artwork extracted the way the scanner does. Off the UI thread.</summary>
+    private async Task<List<Track>> ResolveExternalTracksAsync(IReadOnlyList<string> paths)
+    {
+        {
+            // Snapshot the path index on the UI thread — _library.Tracks is mutated there.
+            var byPath = new Dictionary<string, Track>(StringComparer.OrdinalIgnoreCase);
+            foreach (var t in _library.Tracks)
+                byPath[t.FilePath] = t;
+
+            var tracks = await Task.Run(() =>
+            {
+                var resolved = new List<Track>(paths.Count);
+                foreach (var path in paths)
+                {
+                    if (!File.Exists(path) ||
+                        !MetadataService.SupportedExtensions.Contains(Path.GetExtension(path)))
+                        continue;
+
+                    if (!byPath.TryGetValue(path, out var track))
+                        track = ExternalTrackReader.Read(_metadata, _persistence, path);
+
+                    if (track != null)
+                        resolved.Add(track);
+                }
+                return resolved;
+            });
+
+            return tracks;
+        }
+    }
+
+    /// <summary>
+    /// Saves all application state before shutdown.
+    /// </summary>
+    public async Task ShutdownAsync()
+    {
+        // Silence playback first. The saves below run for seconds after the window
+        // is already gone, and nothing else stops the audio engine before process
+        // exit — so the track audibly kept playing after the app "closed".
+        try { Player.PauseForShutdown(); }
+        catch (Exception ex) { Debug.WriteLine($"[MainWindowVM] Shutdown pause failed: {ex.Message}"); }
+
+        // The small user-state saves go first. App abandons this method after
+        // ShutdownSaveDeadline (4 s), and the server stop, scan checkpoint and scrobble
+        // flush below can take 2 + 5 + 3 s — saved after them, a quit mid-scan or with a
+        // slow scrobble lost the volume, the queue position and recent plays. Each step
+        // is guarded so one failing save can't skip the later ones (the queue snapshot
+        // below used to be silently lost this way).
+        Settings.SetVolume(Player.Volume);
+        try { await Settings.SaveAsync(); }
+        catch (Exception ex) { Debug.WriteLine($"[MainWindowVM] Settings save failed: {ex.Message}"); }
+
+        // Snapshot the queue so the next launch restores it.
+        try { await Player.SaveQueueStateAsync(); }
+        catch (Exception ex) { Debug.WriteLine($"[MainWindowVM] Queue save failed: {ex.Message}"); }
+
+        try { await _playHistory.FlushAsync(); }
+        catch (Exception ex) { Debug.WriteLine($"[MainWindowVM] Play-history flush failed: {ex.Message}"); }
+        // Play counts as journal rows only; the full library.json write waits for the
+        // scan checkpoint below (mid-scan, the library holds a partial track list).
+        try { await Player.FlushPendingPlayStateAsync(); }
+        catch (Exception ex) { Debug.WriteLine($"[MainWindowVM] Play-state flush failed: {ex.Message}"); }
+
+        // Plugins get their Shutdown() (timers, files), and the server releases its port.
+        try { Plugins.UnloadAll(); }
+        catch (Exception ex) { Debug.WriteLine($"[MainWindowVM] Plugin shutdown failed: {ex.Message}"); }
+        try { await Settings.StopUndertoneServerAsync().WaitAsync(TimeSpan.FromSeconds(2)); }
+        catch (Exception ex) { Debug.WriteLine($"[MainWindowVM] Server stop failed: {ex.Message}"); }
+        try { Settings.StopLocalApi(); } // closes event streams, marks local-api.json not running
+        catch (Exception ex) { Debug.WriteLine($"[MainWindowVM] Local API stop failed: {ex.Message}"); }
+
+        // Stop any in-flight library scan and flush its progress to disk so the next
+        // launch resumes where it left off instead of re-scanning from scratch.
+        try { await _library.PauseActiveScanForShutdownAsync(TimeSpan.FromSeconds(5)); }
+        catch (Exception ex) { Debug.WriteLine($"[MainWindowVM] Scan checkpoint failed: {ex.Message}"); }
+
+        // Scrobble the currently playing track before shutdown, and actually wait for it
+        // to leave the machine — the posts are started fire-and-forget, so without the
+        // flush below they were killed with the process every single time.
+        TryScrobblePreviousTrack();
+        await FlushPendingScrobblesAsync();
+
+        // Ratings/lyrics waiting for the quiet period (or for the playing file) go to disk now.
+        try
+        {
+            if (App.Services?.GetService<IDeferredTagWriter>() is { } tagWriter)
+                await tagWriter.FlushAsync().WaitAsync(TimeSpan.FromSeconds(3));
+        }
+        catch (Exception ex) { Debug.WriteLine($"[MainWindowVM] Tag-write flush failed: {ex.Message}"); }
+
+        // Flush the debounced per-play library save so play counts aren't lost.
+        try { await Player.FlushPendingLibrarySaveAsync(); }
+        catch (Exception ex) { Debug.WriteLine($"[MainWindowVM] Library flush failed: {ex.Message}"); }
+
+        // Cleanup integrations.
+        // DisconnectAsync clears, waits ClearFlushDelayMs, then disposes. ClearAsync
+        // followed by an immediate Dispose skipped that wait, and DiscordRPC.NET sends
+        // frames from an internal worker — so the clear never went out and quitting
+        // Undertone left the last track pinned on the user's Discord profile until Discord
+        // itself timed it out.
+        try { await _discord.DisconnectAsync(); }
+        catch (Exception ex) { Debug.WriteLine($"[MainWindowVM] Discord disconnect failed: {ex.Message}"); }
+        _loon.Dispose();
+    }
+
+    /// <summary>
+    /// Imports files/folders dropped onto the app window.
+    /// Folders are added to configured library roots and rescanned;
+    /// standalone files are moved into the managed library folder, then imported.
+    /// With <paramref name="intoPlaylist"/> (files dropped onto a sidebar playlist, #108)
+    /// the imported tracks also join that playlist, in drop order.
+    /// </summary>
+    public async Task ImportDroppedMediaAsync(IEnumerable<string> droppedPaths, CancellationToken ct = default,
+        Guid? intoPlaylist = null)
+    {
+        var input = (droppedPaths ?? Array.Empty<string>())
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .ToList();
+        if (input.Count == 0) return;
+
+        await _dropImportLock.WaitAsync(ct);
+        try
+        {
+            _dropResultVersion++; // an earlier drop's result pill must not hide this one
+            DropImportDone = false;
+            IsDropImporting = true;
+            DropImportStatus = "Preparing import…";
+
+            var folders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // Per dropped folder: its audio files (original paths) and whether any sit
+            // directly in the folder. A curated collection (downloaded playlist) has
+            // files directly inside it; a library root only contains album subfolders.
+            var folderAudioFiles = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            var folderHasTopLevelAudio = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            // Maps each original file path to its final imported path (managed-root copy
+            // or as-is), so we can resolve a folder's tracks after import.
+            var originalToFinal = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var rawPath in input)
+            {
+                var normalized = TryNormalizePath(rawPath);
+                System.Diagnostics.Debug.WriteLine($"[DropImport] rawPath={rawPath} → normalized={normalized}");
+                if (string.IsNullOrWhiteSpace(normalized)) continue;
+
+                if (Directory.Exists(normalized))
+                {
+                    System.Diagnostics.Debug.WriteLine($"[DropImport]   → is directory");
+                    folders.Add(normalized);
+                    continue;
+                }
+
+                if (!File.Exists(normalized))
+                {
+                    System.Diagnostics.Debug.WriteLine($"[DropImport]   → File.Exists=false, skipping");
+                    continue;
+                }
+                var ext = Path.GetExtension(normalized);
+                if (!MetadataService.SupportedExtensions.Contains(ext))
+                {
+                    System.Diagnostics.Debug.WriteLine($"[DropImport]   → unsupported ext '{ext}', skipping");
+                    continue;
+                }
+                System.Diagnostics.Debug.WriteLine($"[DropImport]   → accepted as file");
+                files.Add(normalized);
+            }
+
+            System.Diagnostics.Debug.WriteLine($"[DropImport] folders={folders.Count} files={files.Count}");
+            if (folders.Count == 0 && files.Count == 0) return;
+
+            // Expand dropped folders into their audio files so we can use
+            // the additive ImportFilesAsync path instead of a full library rescan.
+            // A full ScanAsync replaces the entire library with whatever is on disk
+            // across ALL configured music folders, which can resurrect deleted files
+            // or pull in unrelated media from other roots.
+            // Enumeration is file I/O; run it off the UI thread (large folder trees).
+            if (folders.Count > 0)
+                DropImportStatus = "Scanning dropped folders…";
+            await Task.Run(() =>
+            {
+            foreach (var folder in folders)
+            {
+                try
+                {
+                    var perFolder = new List<string>();
+                    foreach (var file in Directory.EnumerateFiles(folder, "*.*", SearchOption.AllDirectories))
+                    {
+                        var ext = Path.GetExtension(file);
+                        if (!MetadataService.SupportedExtensions.Contains(ext)) continue;
+                        files.Add(file);
+                        perFolder.Add(file);
+
+                        // Directly inside the dropped folder (not in a subfolder)?
+                        if (string.Equals(Path.GetDirectoryName(file), folder, StringComparison.OrdinalIgnoreCase))
+                            folderHasTopLevelAudio.Add(folder);
+                    }
+                    // Natural-ish order by file name so disc/track prefixes ("1-01", "1-02")
+                    // become the playlist order.
+                    perFolder.Sort((a, b) => string.Compare(
+                        Path.GetFileName(a), Path.GetFileName(b), StringComparison.OrdinalIgnoreCase));
+                    folderAudioFiles[folder] = perFolder;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[DropImport] Failed to enumerate folder {folder}: {ex.Message}");
+                }
+            }
+            }, ct);
+
+            if (files.Count == 0)
+            {
+                // Nothing playable in the drop (e.g. an album folder whose audio was
+                // removed earlier and only cover art / .lrc remain). Silently doing
+                // nothing here reads as a failed import — say so briefly instead.
+                DropImportStatus = "No audio files found in the dropped items";
+                try { await Task.Delay(2500, ct); } catch (OperationCanceledException) { }
+                return;
+            }
+
+            if (files.Count > 0)
+            {
+                if (App.Services?.GetService<Services.Lyrics.LyricsImportService>() is { } lyrics)
+                {
+                    DropImportStatus = "Finding lyrics in the source folder…";
+                    await lyrics.PrepareAsync(files.ToList(), ct);
+                }
+                var managedRoot = await EnsureManagedImportRootAsync(ct);
+                System.Diagnostics.Debug.WriteLine($"[DropImport] managedRoot={managedRoot}");
+
+                var libraryRoots = Settings.GetSettings().MusicFolders
+                    .Where(f => !string.IsNullOrWhiteSpace(f))
+                    .Select(TryNormalizePath)
+                    .Where(f => !string.IsNullOrWhiteSpace(f))
+                    .Select(f => f!)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                System.Diagnostics.Debug.WriteLine($"[DropImport] libraryRoots={string.Join("; ", libraryRoots)}");
+
+                if (!string.IsNullOrWhiteSpace(managedRoot) &&
+                    !libraryRoots.Contains(managedRoot, StringComparer.OrdinalIgnoreCase))
+                {
+                    libraryRoots.Add(managedRoot);
+                }
+
+                var importTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var beforeCount = _library.Tracks.Count;
+                var copyProcessed = 0;
+                foreach (var file in files)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    DropImportStatus = $"Importing files {++copyProcessed} of {files.Count}";
+
+                    // Files already inside configured library roots can be imported as-is.
+                    if (libraryRoots.Any(root => IsPathUnderRoot(file, root)))
+                    {
+                        System.Diagnostics.Debug.WriteLine($"[DropImport]   {file} → already under library root, importing as-is");
+                        importTargets.Add(file);
+                        originalToFinal[file] = file;
+                        continue;
+                    }
+
+                    // Managed import: relocate external drops into library storage first
+                    // (blocking file I/O — keep it off the UI thread).
+                    var copiedPath = string.IsNullOrWhiteSpace(managedRoot)
+                        ? file
+                        : await Task.Run(() => MoveFileIntoManagedRoot(file, managedRoot), ct);
+
+                    System.Diagnostics.Debug.WriteLine($"[DropImport]   {file} → moved to: {copiedPath}");
+                    if (!string.IsNullOrWhiteSpace(copiedPath))
+                    {
+                        importTargets.Add(copiedPath);
+                        originalToFinal[file] = copiedPath!;
+                    }
+                }
+
+                System.Diagnostics.Debug.WriteLine($"[DropImport] importTargets={importTargets.Count} beforeCount={beforeCount}");
+                if (importTargets.Count > 0)
+                {
+                    // Progress<T> posts back to the UI thread it was created on.
+                    var importTotal = importTargets.Count;
+                    var importProgress = new Progress<int>(n =>
+                        DropImportStatus = $"Adding songs {Math.Min(n, importTotal)} of {importTotal}");
+                    await _library.ImportFilesAsync(importTargets, ct, importProgress);
+                    System.Diagnostics.Debug.WriteLine($"[DropImport] afterCount={_library.Tracks.Count}");
+
+                    // If nothing new appeared (TagLib quirks, etc.), fallback to a targeted rescan.
+                    if (_library.Tracks.Count == beforeCount && libraryRoots.Count > 0)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"[DropImport] No new tracks, falling back to rescan");
+                        DropImportStatus = "Refreshing library…";
+                        await _library.ScanAsync(libraryRoots, ct);
+                        System.Diagnostics.Debug.WriteLine($"[DropImport] Rescan done, count={_library.Tracks.Count}");
+                    }
+                }
+            }
+
+            // Copied drops lose sight of artwork images next to the ORIGINAL file
+            // (cover.jpg etc.): extraction runs against the copy in the flat managed
+            // root. For albums still missing art, retry from each file's source folder.
+            // Album.ArtworkPath is only resolved during an index rebuild, and these
+            // covers land after ImportFilesAsync's rebuild — without another rebuild
+            // the album grid keeps its placeholder until the next launch.
+            if (await BackfillDroppedFolderArtAsync(originalToFinal, ct))
+                _library.NotifyMetadataChanged();
+
+            RefreshViewsAfterDropImport();
+
+            // The relocation into the managed root is otherwise invisible — the
+            // dropped file just vanishes from its source folder — so say where it
+            // went before the pill hides. Only counts real moves (source gone), not
+            // re-drops that reused an existing import.
+            var moved = originalToFinal
+                .Where(kv => !string.Equals(kv.Key, kv.Value, StringComparison.OrdinalIgnoreCase)
+                             && !File.Exists(kv.Key))
+                .ToList();
+            if (moved.Count > 0)
+            {
+                var destFolder = Path.GetFileName(Path.GetDirectoryName(moved[0].Value));
+                DropImportStatus = moved.Count == 1
+                    ? $"Moved 1 file to {destFolder}"
+                    : $"Moved {moved.Count} files to {destFolder}";
+                try { await Task.Delay(2500, ct); } catch (OperationCanceledException) { }
+            }
+
+            if (intoPlaylist is Guid playlistId)
+            {
+                // Dropped onto a sidebar playlist: the imported tracks join it in drop order
+                // (each dropped folder in the order it was imported), and no folder offer.
+                var dropOrder = new List<string>();
+                foreach (var raw in input)
+                {
+                    if (TryNormalizePath(raw) is not { } item) continue;
+                    if (folderAudioFiles.TryGetValue(item, out var inFolder)) dropOrder.AddRange(inFolder);
+                    else if (files.Contains(item)) dropOrder.Add(item);
+                }
+                var tracks = dropOrder
+                    .Select(o => originalToFinal.TryGetValue(o, out var final)
+                        ? _library.GetTrackById(LibraryService.TrackIdForPath(final)) : null)
+                    .OfType<Track>()
+                    .DistinctBy(t => t.Id)
+                    .ToList();
+                var added = await DroppedFiles.AddTracksToPlaylistAsync(playlistId, tracks);
+                DropImportDone = true;
+                DropImportStatus = tracks.Count == 0 ? Loc.T("Main.DropNoAudio") : DescribePlaylistAdd(added);
+                try { await Task.Delay(2500, ct); } catch (OperationCanceledException) { }
+                return;
+            }
+
+            // Hide the progress pill before the playlist-offer dialog can appear.
+            IsDropImporting = false;
+
+            await OfferFolderPlaylistsAsync(folderAudioFiles, folderHasTopLevelAudio, originalToFinal);
+        }
+        finally
+        {
+            IsDropImporting = false;
+            DropImportDone = false;
+            DropImportStatus = string.Empty;
+            _dropImportLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Forces the library pages to show freshly imported tracks right away. Every VM is
+    /// marked dirty first — the LibraryUpdated event may have already posted a Refresh()
+    /// that consumed the dirty flag before we get here.
+    /// </summary>
+    private void RefreshViewsAfterDropImport()
+    {
+        _songsVm.MarkDirty();
+        _albumsVm.MarkDirty();
+        _artistsVm.MarkDirty();
+        _foldersVm.MarkDirty();
+        _homeVm.MarkDirty();
+        _favoritesVm.MarkDirty();
+
+        _songsVm.Refresh();
+        _albumsVm.Refresh();
+        _artistsVm.Refresh();
+        // Folders is built from the library track list too — without this the
+        // dropped track lands in the library (Songs/Albums see it) but the folder
+        // tree keeps its stale, cached state and never shows the new file. A later
+        // Scan Library can't recover it either: the file is already imported, so
+        // the scan no-ops without firing LibraryUpdated.
+        _foldersVm.Refresh();
+
+        _homeVm.Refresh();
+        _favoritesVm.Refresh();
+        Settings.RefreshLibraryStats();
+        // Same blocking walk as the navigation path above; a drop-import already
+        // has the user waiting, so don't add the artwork stat pass to the UI thread.
+        _ = Settings.RefreshStorageInfoAsync();
+    }
+
+    // ── GitHub #108: drops added where they are ("Import dropped files" off) ──
+
+    private DroppedFilesService? _droppedFiles;
+    private DroppedFilesService DroppedFiles => _droppedFiles ??= new DroppedFilesService(_library, Sidebar,
+        (paths, ct) => App.Services?.GetService<Services.Lyrics.LyricsImportService>()?.PrepareAsync(paths, ct)
+                       ?? Task.CompletedTask);
+
+    /// <summary>Bumped by every drop; a result pill only hides itself if no newer drop took
+    /// the pill over meanwhile.</summary>
+    private int _dropResultVersion;
+
+    /// <summary>Drop zone "Add to library": the files join the library where they are.</summary>
+    public Task AddDroppedFilesToLibraryAsync(IReadOnlyList<string> paths) =>
+        RunInPlaceDropAsync(progress => DroppedFiles.AddToLibraryAsync(paths, progress), r =>
+            r.Added == 0 ? Loc.T("Main.DropAlreadyInLibrary")
+            : r.Added == 1 ? Loc.T("Main.DropAddedToLibraryOne")
+            : Loc.T("Main.DropAddedToLibraryMany", r.Added));
+
+    /// <summary>Drop zone "New playlist" (as in AIMP): a playlist named after the files'
+    /// folder, holding them in drop order, opened right away.</summary>
+    public Task CreatePlaylistFromDroppedFilesAsync(IReadOnlyList<string> paths) =>
+        RunInPlaceDropAsync(
+            progress => DroppedFiles.CreatePlaylistAsync(paths, Loc.T("Main.DropPlaylistFallbackName"), progress),
+            r =>
+            {
+                var name = r.Playlist?.Name ?? string.Empty;
+                if (r.Playlist != null
+                    && Sidebar.PlaylistItems.FirstOrDefault(i => i.PlaylistId == r.Playlist.Id) is { } row)
+                    Sidebar.SelectedNavItem = row;
+                return r.Added == 1
+                    ? Loc.T("Main.DropNewPlaylistOne", name)
+                    : Loc.T("Main.DropNewPlaylistMany", r.Added, name);
+            });
+
+    /// <summary>Files dropped onto a sidebar playlist join it — where they are, or through the
+    /// usual import when "Import dropped files" is on.</summary>
+    public Task AddDroppedFilesToPlaylistAsync(Guid playlistId, IReadOnlyList<string> paths) =>
+        Settings.ImportDroppedMedia
+            ? ImportDroppedMediaAsync(paths, default, playlistId)
+            : RunInPlaceDropAsync(progress => DroppedFiles.AddToPlaylistAsync(playlistId, paths, progress), DescribePlaylistAdd);
+
+    private static string DescribePlaylistAdd(DroppedFilesService.Result r)
+    {
+        var name = r.Playlist?.Name ?? string.Empty;
+        return r.Added == 0 ? Loc.T("Main.DropAlreadyInPlaylist", name)
+            : r.Added == 1 ? Loc.T("Main.DropAddedToPlaylistOne", name)
+            : Loc.T("Main.DropAddedToPlaylistMany", r.Added, name);
+    }
+
+    /// <summary>One in-place drop under the drop-import pill: progress while the files are
+    /// read, then what happened (<paramref name="describe"/>, or "no audio found").</summary>
+    private async Task RunInPlaceDropAsync(
+        Func<IProgress<(int Done, int Total)>, Task<DroppedFilesService.Result>> run,
+        Func<DroppedFilesService.Result, string> describe)
+    {
+        string outcome;
+        await _dropImportLock.WaitAsync();
+        try
+        {
+            _dropResultVersion++;
+            DropImportDone = false;
+            IsDropImporting = true;
+            DropImportStatus = Loc.T("Main.DropPreparing");
+            // Progress<T> posts back to the UI thread it was created on.
+            var progress = new Progress<(int Done, int Total)>(p =>
+            {
+                if (!DropImportDone) DropImportStatus = Loc.T("Main.DropAddingSongs", p.Done, p.Total);
+            });
+            var result = await run(progress);
+            RefreshViewsAfterDropImport();
+            outcome = result.Tracks.Count == 0 ? Loc.T("Main.DropNoAudio") : describe(result);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[MainWindowVM] Drop into the library failed: {ex.Message}");
+            IsDropImporting = false;
+            DropImportStatus = string.Empty;
+            return;
+        }
+        finally
+        {
+            _dropImportLock.Release();
+        }
+        await ShowDropResultAsync(outcome);
+    }
+
+    /// <summary>Shows a finished drop's outcome in the drop pill for a moment (check mark, no
+    /// spinner). Outside the drop lock, so the next drop can start right away.</summary>
+    private async Task ShowDropResultAsync(string text)
+    {
+        var version = ++_dropResultVersion;
+        DropImportStatus = text;
+        DropImportDone = true;
+        IsDropImporting = true;
+        await Task.Delay(2500);
+        if (version != _dropResultVersion) return;
+        IsDropImporting = false;
+        DropImportDone = false;
+        DropImportStatus = string.Empty;
+    }
+
+    /// <summary>
+    /// Extracts album art from the source location of relocated drops. Only albums whose
+    /// artwork is still missing after import are considered, so embedded art (already
+    /// extracted during import) always wins over a source-folder image.
+    /// Reads the source <em>folder</em>, not the source file: the file has been moved
+    /// into the managed root by now, but the cover image it sat next to has not.
+    /// Returns true when at least one artwork file was written.
+    /// </summary>
+    private async Task<bool> BackfillDroppedFolderArtAsync(
+        Dictionary<string, string> originalToFinal, CancellationToken ct)
+    {
+        var copied = originalToFinal
+            .Where(kv => !string.Equals(kv.Key, kv.Value, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (copied.Count == 0) return false;
+
+        var tracksByPath = new Dictionary<string, Track>(StringComparer.OrdinalIgnoreCase);
+        foreach (var t in _library.Tracks)
+        {
+            if (!string.IsNullOrWhiteSpace(t.FilePath))
+                tracksByPath[t.FilePath] = t;
+        }
+
+        var savedAny = false;
+        await Task.Run(() =>
+        {
+            var checkedAlbums = new HashSet<Guid>();
+            foreach (var (original, final) in copied)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (!tracksByPath.TryGetValue(final, out var track)) continue;
+                if (!checkedAlbums.Add(track.AlbumId)) continue;
+
+                try
+                {
+                    if (File.Exists(_persistence.GetArtworkPath(track.AlbumId))) continue;
+                    // A track without a real album name belongs to the library-wide
+                    // "Unknown Album" bucket shared by every such file, so a folder
+                    // cover can't be attributed to it — see MetadataService.ExtractAlbumArt.
+                    if (!Track.IsRealAlbumName(track.Album))
+                        continue;
+                    var artBytes = MetadataService.TryReadFolderArt(Path.GetDirectoryName(original));
+                    if (artBytes != null)
+                    {
+                        _persistence.SaveArtwork(track.AlbumId, artBytes);
+                        savedAny = true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[DropImport] Source-folder art backfill failed for {original}: {ex.Message}");
+                }
+            }
+        }, ct);
+        return savedAny;
+    }
+
+    /// <summary>
+    /// After a folder drop, offers to keep a curated collection together as a playlist.
+    /// Only triggers for a folder that directly contains audio files spanning two or
+    /// more distinct albums (a downloaded playlist), not a single album or a library
+    /// root made of album subfolders.
+    /// </summary>
+    private async Task OfferFolderPlaylistsAsync(
+        Dictionary<string, List<string>> folderAudioFiles,
+        HashSet<string> folderHasTopLevelAudio,
+        Dictionary<string, string> originalToFinal)
+    {
+        if (folderAudioFiles.Count == 0) return;
+
+        // Resolve imported tracks by their final file path.
+        var tracksByPath = new Dictionary<string, Track>(StringComparer.OrdinalIgnoreCase);
+        foreach (var t in _library.Tracks)
+        {
+            if (!string.IsNullOrWhiteSpace(t.FilePath))
+                tracksByPath[t.FilePath] = t;
+        }
+
+        foreach (var (folder, originalFiles) in folderAudioFiles)
+        {
+            if (!folderHasTopLevelAudio.Contains(folder)) continue;
+
+            // Map this folder's files (in name order) to imported tracks.
+            var tracks = new List<Track>(originalFiles.Count);
+            foreach (var original in originalFiles)
+            {
+                if (originalToFinal.TryGetValue(original, out var final) &&
+                    tracksByPath.TryGetValue(final, out var track))
+                {
+                    tracks.Add(track);
+                }
+            }
+
+            if (tracks.Count < 2) continue;
+
+            // A single-album folder is a normal album — leave it alone.
+            var distinctAlbums = tracks.Select(t => t.AlbumId).Distinct().Count();
+            if (distinctAlbums < 2) continue;
+
+            var name = Path.GetFileName(folder.TrimEnd(
+                Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            if (string.IsNullOrWhiteSpace(name)) continue;
+
+            // Don't re-prompt if a playlist with this name already exists (e.g. re-drop).
+            if (Sidebar.ManualPlaylistExists(name)) continue;
+
+            var confirmed = await Views.ConfirmationDialog.ShowAsync(
+                $"\"{name}\" contains {tracks.Count} tracks from {distinctAlbums} different albums.\n\n" +
+                $"Create a playlist named \"{name}\" with these tracks?");
+            if (!confirmed) continue;
+
+            await Sidebar.CreatePlaylistFromTracksAsync(name, tracks);
+        }
+    }
+
+    partial void OnCurrentViewChanged(ViewModelBase? oldValue, ViewModelBase newValue)
+    {
+        UpdateSectionActiveFlags();
+        UpdateWindowTint();
+        // Artist pages kept in history stay subscribed to LibraryUpdated; only the shown
+        // one rebuilds, the rest catch up when navigated back to.
+        if (oldValue is ArtistDetailViewModel leftArtistPage) leftArtistPage.IsActive = false;
+        // Settings left: its Connect a phone panel folds, so no sign-in QR stays live off screen.
+        if (ReferenceEquals(oldValue, Settings) && !ReferenceEquals(newValue, Settings)) Settings.OnSettingsLeft();
+        if (newValue is ArtistDetailViewModel artistPage) artistPage.IsActive = true;
+
+        var enteringLyrics = ReferenceEquals(newValue, _lyricsVm);
+        var leavingLyrics = ReferenceEquals(oldValue, _lyricsVm) && !enteringLyrics;
+
+        if (enteringLyrics)
+        {
+            // The full-page lyrics view supersedes the side panel.
+            IsLyricsPanelOpen = false;
+            NotifyPlaybackBarPresentationChanged();
+            WireLyricsPageToPlayer();
+        }
+
+        // Keep Player.IsLyricsPageActive in sync with the actual view so the inline
+        // playback bar's TrackInfoPanel hides/shows correctly across all nav paths.
+        if (leavingLyrics)
+        {
+            UnwireLyricsPageFromPlayer();
+            NotifyPlaybackBarPresentationChanged();
+        }
+        else if (!enteringLyrics)
+        {
+            NotifyPlaybackBarPresentationChanged();
+        }
+
+        if (newValue is not AlbumDetailViewModel)
+            _albumDetailBackButtonText = null;
+
+        RefreshBackButton();
+        UpdateReleaseTypeChips();
+
+        // Dispose transient ViewModels (e.g., AlbumDetailViewModel) to release
+        // event handlers on singleton services and unmanaged resources like Bitmaps.
+        // BUT: skip disposal if the old view is being kept in navigation history
+        // for back-navigation (e.g., album detail → artist discography → back).
+        // Also skip cached singletons — disposing them kills long-lived event
+        // subscriptions (e.g., Songs VM stops receiving LibraryUpdated).
+        DisposeViewIfTransient(oldValue);
+    }
+
+    private void NotifyPlaybackBarPresentationChanged()
+    {
+        OnPropertyChanged(nameof(IsLyricsViewActive));
+        OnPropertyChanged(nameof(IsPlaybackBarVisible));
+        OnPropertyChanged(nameof(IsPlaybackBarMounted));
+        OnPropertyChanged(nameof(PlaybackBarOpacity));
+        OnPropertyChanged(nameof(IsPlaybackBarHitTestVisible));
+        OnPropertyChanged(nameof(IsIdleIslandVisible));
+    }
+
+    private void RefreshBackButton()
+    {
+        TopBar.SearchWatermark = CurrentView switch
+        {
+            PlaylistFeaturedArtistsViewModel => Loc.T("TopBar.SearchIn", Loc.T("TopBar.FeaturedArtists")),
+            MoreByArtistViewModel => Loc.T("TopBar.SearchIn", Loc.T("Nav.Albums")),
+            ArtistDetailViewModel artistPage => Loc.T("TopBar.SearchIn", artistPage.ArtistName),
+            _ => Loc.T("TopBar.SearchIn", TopBar.CurrentTabTitle)
+        };
+
+        // Search visibility follows the tab name (hidden on Home/Settings/Lyrics and
+        // in Cover Flow), except the More By and Artist pages which are searchable
+        // regardless of the tab they were opened from (the tab name doesn't change on
+        // detail pages).
+        TopBar.IsSearchVisible = CurrentView is MoreByArtistViewModel or ArtistDetailViewModel
+            || (!_isCoverFlowMode && TopBar.CurrentTabName is not ("Home" or "Settings" or "Lyrics" or "Visualizer" or "Lyrics Studio"));
+
+        // Cover Flow is an overlay on the current section, so Back leaves it (the only
+        // exit used to be the "Library" segment in the top bar, which read as a trap).
+        if (_isCoverFlowMode && ReferenceEquals(CurrentView, _coverFlowVm))
+        {
+            TopBar.ShowBackButton("Back", new RelayCommand(ExitCoverFlowMode));
+            return;
+        }
+
+        if (CurrentView is MoreByArtistViewModel mbaVm)
+        {
+            TopBar.ShowBackButton("Back", GoBackInHistoryCommand, mbaVm.Title);
+            return;
+        }
+
+        if (CurrentView is ArtistDetailViewModel)
+        {
+            // No context title: the hero already carries the artist's name.
+            TopBar.ShowBackButton("Back", GoBackInHistoryCommand);
+            return;
+        }
+
+        if (CurrentView is PlaylistFeaturedArtistsViewModel featuredArtistsVm)
+        {
+            TopBar.ShowBackButton("Back", GoBackInHistoryCommand, featuredArtistsVm.Title);
+            return;
+        }
+
+        if (CurrentView is AlbumDetailViewModel)
+        {
+            TopBar.ShowAlbumDetailBackButton(GetCurrentAlbumDetailBackButtonText(), GoBackInHistoryCommand);
+            return;
+        }
+
+        if (ReferenceEquals(CurrentView, _albumsVm) && _albumsVm.IsArtistFiltered)
+        {
+            TopBar.ShowBackButton("Back", GoBackInHistoryCommand, _albumsVm.HeaderText);
+            return;
+        }
+
+        if (ReferenceEquals(CurrentView, _lyricsVm))
+        {
+            // The top bar is hidden on the lyrics page, so this only arms the
+            // sidebar's back chevron — same exit path as the playbar's lyrics toggle
+            // (history pop, or the pre-lyrics section when history is empty).
+            TopBar.ShowBackButton("Back", ToggleLyricsCommand);
+            return;
+        }
+
+        if (_navigationHistory.Count > 0 && ShouldShowTopBarBackButton(CurrentView))
+        {
+            var backButtonText = _navigationHistory.Peek().BackButtonText;
+            if (string.IsNullOrWhiteSpace(backButtonText))
+                backButtonText = GetRootBackButtonText(CurrentView);
+
+            TopBar.ShowBackButton(backButtonText, GoBackInHistoryCommand);
+            return;
+        }
+
+        if (CurrentView is PlaylistViewModel)
+        {
+            TopBar.ShowBackButton("Back", new RelayCommand(() => Navigate("playlists")));
+            return;
+        }
+
+        TopBar.HideBackButton();
+    }
+
+    private bool ShouldShowTopBarBackButton(ViewModelBase? view)
+    {
+        return view is AlbumDetailViewModel
+
+               || (ReferenceEquals(view, _albumsVm) && _albumsVm.IsArtistFiltered)
+               || (_navigationHistory.Count > 0 && view is ISearchable && !string.IsNullOrWhiteSpace(TopBar.SearchText));
+    }
+
+    private void DisposeViewIfTransient(ViewModelBase? view)
+    {
+        if (view is not IDisposable disposable
+            || IsLongLivedView(view)
+            || ReferenceEquals(view, CurrentView)
+            || IsViewInHistory(view))
+        {
+            return;
+        }
+
+        disposable.Dispose();
+    }
+
+    private bool IsViewInHistory(ViewModelBase? view)
+    {
+        if (view == null)
+            return false;
+
+        return _navigationHistory.Any(entry => ReferenceEquals(entry.View, view))
+               || _forwardHistory.Any(entry => ReferenceEquals(entry.View, view));
+    }
+
+    private void ClearForwardHistory()
+    {
+        while (_forwardHistory.Count > 0)
+        {
+            var entry = _forwardHistory.Pop();
+            DisposeViewIfTransient(entry.View);
+        }
+    }
+
+    private NavigationEntry CaptureCurrentNavigationEntry()
+    {
+        var view = CurrentView;
+        var tabName = TopBar.CurrentTabName;
+        var backButtonText = GetNavigationEntryBackButtonText(view);
+        var restoreState = CaptureRestoreState(view);
+        var sectionKey = GetNavigationEntrySectionKey(view);
+
+        return new NavigationEntry
+        {
+            View = view,
+            BackButtonText = backButtonText,
+            TabName = tabName,
+            RestoreState = restoreState,
+            SearchText = TopBar.SearchText,
+            SectionKey = sectionKey
+        };
+    }
+
+    private bool IsAlbumsRootSnapshot()
+    {
+        return (ReferenceEquals(CurrentView, _albumsVm) || ReferenceEquals(CurrentView, _coverFlowVm))
+               && !_albumsVm.IsArtistFiltered
+               && string.IsNullOrWhiteSpace(TopBar.SearchText);
+    }
+
+    private Action CaptureRestoreState(ViewModelBase view)
+    {
+        if (ReferenceEquals(view, _coverFlowVm))
+        {
+            return () =>
+            {
+                _isCoverFlowMode = true;
+                TopBar.IsCoverFlowMode = true;
+                TopBar.IsSearchVisible = false;
+            };
+        }
+
+        if (view is MoreByArtistViewModel mba)
+        {
+            return () =>
+            {
+                TopBar.ShowArtistActions(mba.ShuffleAllCommand, mba.PlayAllCommand);
+            };
+        }
+
+        if (ReferenceEquals(view, _albumsVm))
+        {
+            var artistFilterName = _albumsVm.ArtistFilterName;
+            var searchQuery = TopBar.SearchText;
+            // Read lazily because the view saves its physical scroll offset after
+            // this entry is pushed, when it detaches from the visual tree.
+
+            return () =>
+            {
+                var scrollOffset = string.IsNullOrWhiteSpace(artistFilterName)
+                    ? (_albumsVm.SavedUnfilteredScrollOffset > 0
+                        ? _albumsVm.SavedUnfilteredScrollOffset
+                        : _albumsVm.SavedScrollOffset)
+                    : _albumsVm.SavedScrollOffset;
+
+                if (string.IsNullOrWhiteSpace(artistFilterName))
+                {
+                    _albumsVm.ClearArtistFilter();
+                    _albumsVm.ApplyFilterImmediate(searchQuery ?? string.Empty);
+                }
+                else
+                {
+                    _albumsVm.SetArtistFilter(artistFilterName);
+                    TopBar.ShowArtistActions(
+                        _albumsVm.ShuffleAllArtistTracksCommand,
+                        _albumsVm.PlayAllArtistTracksCommand);
+                }
+
+                _albumsVm.SavedScrollOffset = scrollOffset;
+            };
+        }
+
+        return () => { };
+    }
+
+    private void PushCurrentViewToHistory()
+    {
+        PushHistoryEntry(CaptureCurrentNavigationEntry());
+        // Navigating to a new branch invalidates any forward history.
+        ClearForwardHistory();
+    }
+
+    /// <summary>Every navigation (including sidebar section switches) is history-eligible,
+    /// so the stack is capped to keep transient detail VMs from accumulating forever.</summary>
+    private const int MaxNavigationHistory = 30;
+
+    private void PushHistoryEntry(NavigationEntry entry)
+    {
+        _navigationHistory.Push(entry);
+        if (_navigationHistory.Count <= MaxNavigationHistory)
+            return;
+
+        var kept = _navigationHistory.Take(MaxNavigationHistory).ToList();
+        var dropped = _navigationHistory.Skip(MaxNavigationHistory).ToList();
+        _navigationHistory.Clear();
+        for (var i = kept.Count - 1; i >= 0; i--)
+            _navigationHistory.Push(kept[i]);
+        foreach (var old in dropped)
+            DisposeViewIfTransient(old.View);
+    }
+
+    public bool CanGoBack => _navigationHistory.Count > 0;
+    public bool CanGoForward => _forwardHistory.Count > 0;
+
+    [RelayCommand]
+    private void GoBackInHistory()
+    {
+        if (_navigationHistory.Count == 0)
+            return;
+
+        // Preserve the current view so forward navigation can return to it.
+        _forwardHistory.Push(CaptureCurrentNavigationEntry());
+        RestoreNavigationEntry(_navigationHistory.Pop());
+    }
+
+    [RelayCommand]
+    private void GoForwardInHistory()
+    {
+        if (_forwardHistory.Count == 0)
+            return;
+
+        // Mirror of GoBack: stash current onto the back stack, then restore the
+        // forward entry. Forward stack is intentionally left intact here.
+        // Via PushHistoryEntry, not a raw Push: the direct push skipped the
+        // MaxNavigationHistory trim, so a long back/forward run retained transient
+        // AlbumDetail/Playlist view-models past the intended window without disposing them.
+        PushHistoryEntry(CaptureCurrentNavigationEntry());
+        RestoreNavigationEntry(_forwardHistory.Pop());
+    }
+
+    private void RestoreNavigationEntry(NavigationEntry target)
+    {
+        ClearAllTopBarActions();
+        target.RestoreState();
+        TopBar.CurrentTabName = target.TabName;
+        TopBar.SearchText = target.SearchText;
+        _currentSectionKey = target.SectionKey;
+        _albumDetailBackButtonText = target.View is AlbumDetailViewModel
+            ? NormalizeAlbumDetailBackButtonText(target.BackButtonText)
+            : null;
+
+        if (!ReferenceEquals(CurrentView, target.View))
+            CurrentView = target.View;
+
+        // Restore page-specific top bar actions for the target view
+        RestoreTopBarActionsForView(target.View);
+        RefreshBackButton();
+        SyncSidebarSelectionToHistoryEntry(target);
+    }
+
+    /// <summary>Keeps the sidebar highlight in sync when Back/Forward restores a view —
+    /// the sidebar only updates its own selection on direct clicks.</summary>
+    private void SyncSidebarSelectionToHistoryEntry(NavigationEntry target)
+    {
+        // Detail views map to their conceptual section, not the section the user came
+        // from — an album page restored via Forward highlights Albums, mirroring
+        // HighlightSidebarSection in the direct-open paths.
+        NavItem? item = target.View switch
+        {
+            PlaylistViewModel playlistView => Sidebar.PlaylistItems.FirstOrDefault(n => n.PlaylistId == playlistView.PlaylistId),
+            AlbumDetailViewModel => Sidebar.NavItems.FirstOrDefault(n => n.Key == "albums"),
+            MoreByArtistViewModel => Sidebar.NavItems.FirstOrDefault(n => n.Key == "artists"),
+            _ when ReferenceEquals(target.View, _albumsVm) => Sidebar.NavItems.FirstOrDefault(n => n.Key == "albums"),
+            _ => Sidebar.NavItems.FirstOrDefault(n => n.Key == target.SectionKey)
+                 ?? Sidebar.FavoritesItems.FirstOrDefault(n => n.Key == target.SectionKey)
+        };
+
+        // Views without a sidebar entry (queue, lyrics, …) keep the current highlight.
+        if (item != null)
+            Sidebar.SetSelectedNavItemSilently(item);
+    }
+
+    /// <summary>Moves the sidebar highlight to a section without navigating. Detail pages
+    /// (album detail, artist discography) conceptually live under Albums/Artists; leaving
+    /// the highlight on the origin section made the sidebar lie — and made escaping the
+    /// detail page via that section a dead same-item click (GitHub issue by Luwi).</summary>
+    private void HighlightSidebarSection(string key)
+    {
+        var item = Sidebar.NavItems.FirstOrDefault(n => n.Key == key)
+                ?? Sidebar.FavoritesItems.FirstOrDefault(n => n.Key == key);
+        if (item != null)
+            Sidebar.SetSelectedNavItemSilently(item);
+    }
+
+    private string GetRootBackButtonText(ViewModelBase view)
+    {
+        if (ReferenceEquals(view, _homeVm))
+            return GetSectionBackButtonText("home");
+        if (ReferenceEquals(view, _albumsVm) || ReferenceEquals(view, _coverFlowVm))
+            return _albumsVm.IsArtistFiltered ? "Back" : GetSectionBackButtonText("albums");
+        if (ReferenceEquals(view, _songsVm))
+            return GetSectionBackButtonText("songs");
+        if (ReferenceEquals(view, _artistsVm))
+            return GetSectionBackButtonText("artists");
+        if (ReferenceEquals(view, _foldersVm))
+            return GetSectionBackButtonText("folders");
+        if (ReferenceEquals(view, _playlistsVm))
+            return GetSectionBackButtonText("playlists");
+        if (ReferenceEquals(view, _favoritesVm))
+            return GetSectionBackButtonText("favorites");
+        if (ReferenceEquals(view, _queueVm))
+            return GetSectionBackButtonText("queue");
+        if (ReferenceEquals(view, _lyricsVm))
+            return GetSectionBackButtonText("lyrics");
+        if (ReferenceEquals(view, _statisticsVm))
+            return GetSectionBackButtonText("statistics");
+        if (ReferenceEquals(view, _serverVm))
+            return GetSectionBackButtonText("server");
+        if (ReferenceEquals(view, _audioCdVm))
+            return GetSectionBackButtonText("cd");
+        if (ReferenceEquals(view, _inboxVm))
+            return GetSectionBackButtonText("inbox");
+        if (ReferenceEquals(view, _visualizerVm))
+            return GetSectionBackButtonText("visualizer");
+        if (ReferenceEquals(view, _lyricsStudioPageVm))
+            return GetSectionBackButtonText("lyricsstudio");
+        if (ReferenceEquals(view, Settings))
+            return GetSectionBackButtonText("settings");
+        if (view is AlbumDetailViewModel)
+            return "Back";
+        if (view is PlaylistViewModel)
+            return "Back";
+        return "Back";
+    }
+
+    private string GetCurrentSectionBackButtonText()
+    {
+        return GetSectionBackButtonText(GetCurrentSectionKey());
+    }
+
+    private string GetCurrentSectionKey()
+    {
+        return _currentSectionKey;
+    }
+
+    private static string GetSectionBackButtonText(string? key)
+    {
+        _ = key;
+        return "Back";
+    }
+
+    private string GetNavigationEntryBackButtonText(ViewModelBase view)
+    {
+        return view is AlbumDetailViewModel
+            ? GetCurrentAlbumDetailBackButtonText()
+            : GetRootBackButtonText(view);
+    }
+
+    private string GetNavigationEntrySectionKey(ViewModelBase view)
+    {
+        if (ReferenceEquals(view, _homeVm))
+            return "home";
+        if (ReferenceEquals(view, _songsVm))
+            return "songs";
+        if (ReferenceEquals(view, _albumsVm) || ReferenceEquals(view, _coverFlowVm))
+            return "albums";
+        if (ReferenceEquals(view, _artistsVm))
+            return "artists";
+        if (ReferenceEquals(view, _foldersVm))
+            return "folders";
+        if (ReferenceEquals(view, _playlistsVm))
+            return "playlists";
+        if (ReferenceEquals(view, _favoritesVm))
+            return "favorites";
+        if (ReferenceEquals(view, _queueVm))
+            return "queue";
+        if (ReferenceEquals(view, _lyricsVm))
+            return "lyrics";
+        if (ReferenceEquals(view, _statisticsVm))
+            return "statistics";
+        if (ReferenceEquals(view, _serverVm))
+            return "server";
+        if (ReferenceEquals(view, _audioCdVm))
+            return "cd";
+        if (ReferenceEquals(view, _inboxVm))
+            return "inbox";
+        if (ReferenceEquals(view, _visualizerVm))
+            return "visualizer";
+        if (ReferenceEquals(view, _lyricsStudioPageVm))
+            return "lyricsstudio";
+        if (ReferenceEquals(view, Settings))
+            return "settings";
+
+        return _currentSectionKey;
+    }
+
+    private string GetCurrentAlbumDetailBackButtonText()
+    {
+        return NormalizeAlbumDetailBackButtonText(_albumDetailBackButtonText ?? GetAlbumDetailBackButtonText());
+    }
+
+    private string GetAlbumDetailBackButtonText()
+    {
+        if (_navigationHistory.Count == 0)
+            return GetCurrentSectionBackButtonText();
+
+        var entry = _navigationHistory.Peek();
+        var text = entry.BackButtonText;
+
+        if (string.IsNullOrWhiteSpace(text) || text == "Back")
+            text = GetRootBackButtonText(entry.View);
+
+        var sourceSectionKey = entry.SectionKey;
+
+        if (string.IsNullOrWhiteSpace(text)
+            && !ReferenceEquals(entry.View, _albumsVm)
+            && !ReferenceEquals(entry.View, _coverFlowVm)
+            && entry.View is not AlbumDetailViewModel)
+        {
+            text = GetSectionBackButtonText(sourceSectionKey);
+        }
+
+        return NormalizeAlbumDetailBackButtonText(text);
+    }
+
+    private static string NormalizeAlbumDetailBackButtonText(string? text)
+    {
+        return string.IsNullOrWhiteSpace(text) ? "Back" : text;
+    }
+
+    private bool IsLongLivedView(ViewModelBase? view)
+    {
+        return ReferenceEquals(view, _homeVm)
+               || ReferenceEquals(view, _songsVm)
+               || ReferenceEquals(view, _albumsVm)
+               || ReferenceEquals(view, _artistsVm)
+               || ReferenceEquals(view, _foldersVm)
+               || ReferenceEquals(view, _playlistsVm)
+               || ReferenceEquals(view, _favoritesVm)
+               || ReferenceEquals(view, _inboxVm)
+
+               || ReferenceEquals(view, _queueVm)
+               || ReferenceEquals(view, _lyricsVm)
+               || ReferenceEquals(view, _statisticsVm)
+               || ReferenceEquals(view, _coverFlowVm)
+               || ReferenceEquals(view, _serverVm)
+               || ReferenceEquals(view, Settings);
+    }
+
+    // ── Navigation ───────────────────────────────────────────
+
+    private void OnNavigationRequested(object? sender, string key)
+    {
+        // Settings is a modal popup rather than a page — intercept and open the overlay,
+        // then restore the sidebar selection to the actual current section so the highlight
+        // doesn't lie about where the user is. Use Post so the click's selection has settled.
+        // A plugin's screen (sidebar Plugins section) opens in Settings in place of its page;
+        // like Settings, the row never takes the selection (SidebarView handles OpensSheet).
+        if (key.StartsWith(PluginNavItem.KeyPrefix, StringComparison.Ordinal))
+        {
+            if (Sidebar.PluginItems.FirstOrDefault(i => i.Key == key) is { } pluginItem
+                && Settings.ShowPluginViewFromSidebar(pluginItem.View))
+                OpenSettings();
+            return;
+        }
+        if (key == "settings")
+        {
+            OpenSettings();
+            var currentKey = GetCurrentViewKey();
+            Dispatcher.UIThread.Post(() =>
+            {
+                var item = Sidebar.NavItems.FirstOrDefault(n => n.Key == currentKey)
+                        ?? Sidebar.FavoritesItems.FirstOrDefault(n => n.Key == currentKey);
+                Sidebar.SetSelectedNavItemSilently(item);
+            });
+            return;
+        }
+        Navigate(key);
+    }
+
+    [RelayCommand]
+    private void Navigate(string key)
+    {
+        // Audio Visualizer switched off (Built-in Features): its page is gone with its entry.
+        if (key == "visualizer" && !Settings.VisualizerEnabled) key = "home";
+        var navigateStart = Stopwatch.GetTimestamp();
+        DebugLogger.Info(DebugLogger.Category.UI, "Navigate", $"key={key}, from={GetCurrentViewKey()}, coverFlow={_isCoverFlowMode}");
+        // Section switches join the browser-style history (instead of clearing it)
+        // so Back/Forward work across top-level views, e.g. Songs → Album → Artists.
+        // Captured before any state mutation below; pushed only if the view changes.
+        var previousEntry = CurrentView != null ? CaptureCurrentNavigationEntry() : null;
+
+        var goingToEligibleSection = ToggleEligibleSections.Contains(key);
+
+        // Any sidebar navigation leaves Cover Flow. It used to stay "sticky" across the
+        // seven toggle-eligible sections (click Songs while in Cover Flow and the carousel
+        // stayed up with Songs merely selected underneath), which read as being trapped —
+        // the sidebar highlight moved but the screen never changed. Cover Flow is now a
+        // mode of the section you are on; picking a section shows that section.
+        if (_isCoverFlowMode)
+        {
+            _isCoverFlowMode = false;
+            TopBar.IsCoverFlowMode = false;
+            TopBar.IsSearchVisible = _currentSectionKey != "home";
+            _preCoverFlowView = null;
+        }
+
+        // Track which top-level section the user is conceptually on. While in
+        // Cover Flow this is the section "underneath" the overlay.
+        if (goingToEligibleSection)
+            _currentSectionKey = key;
+
+        // Resolve the destination view (Cover Flow was left above, so this always shows
+        // the section itself).
+        {
+            CurrentView = key switch
+            {
+                "home" => RefreshAndReturn(_homeVm),
+                "songs" => RefreshAndReturnSongs(_songsVm),
+                "albums" => ResetFilterAndReturnAlbums(),
+                "artists" => ResetAndReturnArtists(),
+                "folders" => RefreshAndReturnFolders(_foldersVm),
+                "playlists" => RefreshAndReturnPlaylists(_playlistsVm),
+                "favorites" => RefreshAndReturnFavorites(_favoritesVm),
+                "statistics" => RefreshAndReturnStatistics(_statisticsVm),
+                "queue" => _queueVm,
+                "lyrics" => EnsureLyricsAndReturn(_lyricsVm),
+                "server" => RefreshAndReturnServer(_serverVm),
+                "cd" => RefreshAndReturnAudioCd(_audioCdVm),
+                "inbox" => RefreshAndReturnInbox(),
+                "visualizer" => _visualizerVm,
+                "lyricsstudio" => RefreshAndReturnLyricsStudio(),
+                "settings" => RefreshAndReturnSettings(),
+                _ when key.StartsWith("playlist:") => CreatePlaylistView(key),
+                _ => _homeVm
+            };
+        }
+
+        // Shortcuts (Ctrl/⌘+1…4) and the command palette navigate here without touching the
+        // sidebar, which kept highlighting the section you came from. Sidebar clicks already
+        // selected this item; keys without a sidebar row leave the highlight alone.
+        HighlightSidebarSection(key);
+
+        if (previousEntry != null && !ReferenceEquals(CurrentView, previousEntry.View))
+        {
+            PushHistoryEntry(previousEntry);
+            ClearForwardHistory();
+        }
+
+        // Clear search when switching views — including the pill itself: a section
+        // switch is a fresh context, so an open (now empty) search box shouldn't
+        // follow the user to the new page. Queue popup stays open across navigation —
+        // it's only dismissed by toggling the Queue button itself or by Escape.
+        TopBar.IsSearchOpen = false;
+        TopBar.SearchText = string.Empty;
+        // Assigning SearchText only dispatches ApplyFilter when the box value actually
+        // changes (and via a debounce). If the box was already empty from a prior visit,
+        // the destination view keeps whatever filter it was last given — so it can show
+        // nothing even though the search box looks empty. Clear it directly here.
+        ClearStaleSearch(CurrentView);
+
+        TopBar.CurrentTabName = key switch
+        {
+            "home" => "Home",
+            "songs" => "Songs",
+            "albums" => "Albums",
+            "artists" => "Artists",
+            "folders" => "Folders",
+            "playlists" => "Playlists",
+            "favorites" => "Favorites",
+            "statistics" => "Statistics",
+            "queue" => "Queue",
+            "lyrics" => "Lyrics",
+            "server" => "Server",
+            "cd" => "Audio CD",
+            "inbox" => "Inbox",
+            "visualizer" => "Visualizer",
+            "lyricsstudio" => "Lyrics Studio",
+            "settings" => "Settings",
+            _ when key.StartsWith("playlist:") => "Playlist",
+            _ => "Library"
+        };
+
+        // Clear all top bar actions, then set up the correct ones for the destination
+        ClearAllTopBarActions();
+        if (key == "lyrics") WireLyricsPageToPlayer();
+        if (goingToEligibleSection)
+            SetupGlobalViewModeToggle();
+        if (key == "songs")
+            SetupSongsTopBarActions();
+        else if (key == "playlists")
+            TopBar.ShowPlaylistActions(Sidebar.CreatePlaylistCommand, _playlistsVm.CreateSmartPlaylistCommand,
+                _playlistsVm.ImportPlaylistCommand, _playlistsVm.SetSortCommand, _playlistsVm.SortLabel,
+                _playlistsVm.QuickPlaylistCommand);
+        else if (key == "favorites")
+            TopBar.ShowFavoritesActions(_favoritesVm.ShuffleAllCommand, _favoritesVm.PlayAllCommand);
+        else if (key == "folders")
+            TopBar.ShowFoldersActions(_foldersVm.PlayFolderCommand, _foldersVm.ShuffleFolderCommand, _foldersVm.OpenMediaFolderSettingsCommand, _foldersVm.SetSortCommand);
+        else if (key == "artists")
+            TopBar.ShowArtistSort(_artistsVm.SetSortCommand, _artistsVm.SortLabel, _artistsVm.SortMode, _artistsVm.SortAscending,
+                _artistsVm.ToggleViewModeCommand, _artistsVm.IsListView);
+
+        RefreshBackButton();
+        UiStallWatchdog.ReportIfSlow("Navigate", navigateStart, $"key={key}");
+    }
+
+    /// <summary>Clears a filter the destination view still holds from a prior visit. Skipped
+    /// when there is none: ApplyFilter("") rebuilt the Songs/Albums/Artists rows off-thread
+    /// and Reset them just after the page appeared, so every row and cover was re-created on
+    /// each sidebar click, and on Albums it also superseded Refresh's pending library reload.</summary>
+    internal static void ClearStaleSearch(ViewModelBase? view)
+    {
+        if (view is ISearchable { IsSearchCleared: false } searchable)
+            searchable.ApplyFilter(string.Empty);
+    }
+
+    /// <summary>Sidebar Lyrics Studio: re-scans the library for songs missing the chosen format
+    /// unless a run or a review is in progress (then the page keeps its work).</summary>
+    private LyricsStudioPageViewModel RefreshAndReturnLyricsStudio()
+    {
+        _ = _lyricsStudioPageVm.RefreshAsync();
+        return _lyricsStudioPageVm;
+    }
+
+    private LyricsViewModel EnsureLyricsAndReturn(LyricsViewModel vm)
+    {
+        vm.EnsureLyricsForCurrentTrack();
+        return vm;
+    }
+
+    private HomeViewModel RefreshAndReturn(HomeViewModel vm)
+    {
+        vm.Refresh();
+        return vm;
+    }
+
+    private LibraryArtistsViewModel ResetAndReturnArtists()
+    {
+        _artistsVm.SearchText = string.Empty;
+        _artistsVm.IsSearchVisible = false;
+        _artistsVm.Refresh();
+        return _artistsVm;
+    }
+
+    private LibraryAlbumsViewModel ResetFilterAndReturnAlbums()
+    {
+        // Clear any stale artist filter from OnArtistOpened so the user
+        // sees the full album grid when navigating via the sidebar.
+        _albumsVm.ClearArtistFilter();
+        _albumsVm.Refresh();
+        return _albumsVm;
+    }
+
+    private LibraryFoldersViewModel RefreshAndReturnFolders(LibraryFoldersViewModel vm)
+    {
+        vm.Refresh();
+        return vm;
+    }
+
+    private ServerViewModel RefreshAndReturnServer(ServerViewModel vm)
+    {
+        vm.OnNavigatedTo();
+        return vm;
+    }
+
+    private AudioCdViewModel RefreshAndReturnAudioCd(AudioCdViewModel vm)
+    {
+        vm.OnNavigatedTo();
+        return vm;
+    }
+
+    private LibrarySongsViewModel RefreshAndReturnSongs(LibrarySongsViewModel vm)
+    {
+        vm.Refresh();
+        return vm;
+    }
+
+
+    private LibraryPlaylistsViewModel RefreshAndReturnPlaylists(LibraryPlaylistsViewModel vm)
+    {
+        vm.Refresh();
+        return vm;
+    }
+
+    private FavoritesViewModel RefreshAndReturnFavorites(FavoritesViewModel vm)
+    {
+        vm.Refresh();
+        return vm;
+    }
+
+    private InboxViewModel RefreshAndReturnInbox()
+    {
+        _inboxVm.Refresh();
+        return _inboxVm;
+    }
+
+    private StatisticsViewModel RefreshAndReturnStatistics(StatisticsViewModel vm)
+    {
+        vm.Refresh();
+        return vm;
+    }
+
+    private SettingsViewModel RefreshAndReturnSettings()
+    {
+        // Same as OpenSettings: only the shown tab's figures, off the UI thread (the
+        // storage walk inline stalled this navigation, issue #31).
+        Settings.RefreshShownTabData();
+        return Settings;
+    }
+
+    /// <summary>Opens the Ctrl+K command palette over the current window.</summary>
+    public async Task OpenCommandPaletteAsync()
+    {
+        var vm = new CommandPaletteViewModel(this, _library);
+        await Views.CommandPaletteDialog.ShowAsync(vm);
+    }
+
+    private void OnAlbumOpened(object? sender, Album album)
+    {
+        OpenAlbumDetail(album);
+    }
+
+    private void OnHomeAlbumOpened(object? sender, Album album)
+    {
+        OpenAlbumDetail(album);
+    }
+
+    private void OnArtistOpened(object? sender, Artist artist)
+    {
+        OpenArtistDiscography(artist.Name);
+    }
+
+    /// <summary>Opens the artist's discography grid from any artist credit string.</summary>
+    public void OpenArtistByName(string artistName)
+    {
+        OpenArtistDiscography(Track.GetPrimaryArtist(artistName));
+    }
+
+
+    /// <summary>Makes a playlist of <paramref name="tracks"/> and opens it (quick playlists and mixes).</summary>
+    public async Task CreatePlaylistAndOpenAsync(string name, IReadOnlyList<Track> tracks)
+    {
+        if (tracks.Count == 0) return;
+        var playlist = await Sidebar.CreatePlaylistFromTracksAsync(name, tracks);
+        Navigate($"playlist:{playlist.Id}");
+    }
+
+    /// <summary>
+    /// Song menu ▸ Create Mix from This Song (Discord, Cosmo 11-02): about 50 songs like it from
+    /// the library, built offline (<see cref="MixPlaylistBuilder"/>), saved as a playlist and opened.
+    /// </summary>
+    [RelayCommand]
+    private Task CreateMixFromSong(Track? song)
+    {
+        if (song is null) return Task.CompletedTask;
+        var seed = MixSeed.FromSong(song);
+        return CreatePlaylistAndOpenAsync(seed.PlaylistName, MixPlaylistBuilder.Build(seed, _library.Tracks));
+    }
+
+    private void OnPlaylistOpened(object? sender, Playlist playlist)
+    {
+        PushCurrentViewToHistory();
+        ClearAllTopBarActions();
+
+        // Re-scope the top-bar search to the detail view (the history entry above
+        // captured the grid's query, so Back restores it). Without this the grid's
+        // stale query lingers in the box and the watermark stays "Search in Playlists".
+        TopBar.SearchText = string.Empty;
+        TopBar.CurrentTabName = "Playlist";
+
+        var detail = new PlaylistViewModel(playlist, Player, _library, _persistence, Sidebar, _artistImageService,
+            Settings.PlaylistShowSideRail);
+        detail.SetSideRailAction(show => Settings.PlaylistShowSideRail = show);
+        detail.BackRequested += (_, _) => GoBackInHistory();
+        detail.ViewAlbumRequested += OnViewAlbumFromTrack;
+        detail.SetSearchLyricsAction(SearchLyricsForTrack);
+        detail.SetViewArtistAction(ViewArtistByName);
+        detail.SetOpenFeaturedArtistsAction(OpenPlaylistFeaturedArtistsPage);
+        CurrentView = detail;
+
+        // Highlight the playlist's own sidebar row (if it has one) so the origin
+        // section doesn't stay lit — same-item clicks there would be dead.
+        var row = Sidebar.PlaylistItems.FirstOrDefault(n => n.PlaylistId == playlist.Id);
+        if (row != null)
+            Sidebar.SetSelectedNavItemSilently(row);
+    }
+
+    private void OnViewAlbumFromTrack(object? sender, Track track)
+    {
+        // Find the album that contains this track
+        var album = _library.Albums.FirstOrDefault(a => a.Id == track.AlbumId);
+        if (album == null) return;
+
+        OpenAlbumDetail(album);
+    }
+
+    public void OpenAlbumDetail(Album album, bool pushHistory = true, string? backButtonText = null)
+    {
+        if (pushHistory)
+            PushCurrentViewToHistory();
+        _albumDetailBackButtonText = NormalizeAlbumDetailBackButtonText(backButtonText ?? GetAlbumDetailBackButtonText());
+        ClearAllTopBarActions();
+        IsLyricsPanelOpen = false;
+        _isCoverFlowMode = false;
+        TopBar.IsCoverFlowMode = false;
+        _preCoverFlowView = null;
+
+        var detail = new AlbumDetailViewModel(album, Player, _persistence, _library, Sidebar, _lastFm, Settings);
+        // Only the page the user is actually looking at may navigate. Album-detail
+        // view-models kept for back-navigation are deliberately left undisposed
+        // (DisposeViewIfTransient skips anything still in history), so they stay
+        // subscribed to LibraryUpdated — and RefreshFromLibrary raises BackRequested
+        // when its album no longer exists. Removing a track anywhere therefore made an
+        // off-screen album page pop the history stack, yanking the user to whatever sat
+        // on top of it (usually the artist discography they had browsed through).
+        detail.BackRequested += (_, _) =>
+        {
+            if (ReferenceEquals(CurrentView, detail))
+                GoBackInHistory();
+        };
+        detail.ViewAlbumRequested += OnViewAlbumFromTrack;
+        detail.SetViewArtistAction(ViewArtistFromAlbumDetail);
+        detail.SetSearchLyricsAction(SearchLyricsForTrack);
+        detail.SetOpenMoreByArtistAction(OpenMoreByArtistPage);
+        CurrentView = detail;
+        HighlightSidebarSection("albums");
+        TopBar.ShowAlbumDetailBackButton(GetCurrentAlbumDetailBackButtonText(), GoBackInHistoryCommand);
+    }
+
+    private void OpenMoreByArtistPage(string artistName, System.Collections.Generic.IEnumerable<Album> albums)
+    {
+        PushCurrentViewToHistory();
+        ClearAllTopBarActions();
+        // The originating page's query is captured in history for back-restore;
+        // the More By grid starts unfiltered.
+        TopBar.SearchText = string.Empty;
+
+        var page = new MoreByArtistViewModel(artistName, albums, Player, _albumsVm);
+        page.BackRequested += (_, _) => GoBackInHistory();
+        page.AlbumOpened += (_, album) => OpenAlbumDetail(album);
+        CurrentView = page;
+        HighlightSidebarSection("artists");
+        TopBar.ShowArtistActions(page.ShuffleAllCommand, page.PlayAllCommand);
+        RefreshBackButton();
+    }
+
+    private void OpenArtistDiscography(string artistName)
+    {
+        // Dedicated artist page (hero, Popular, Releases, Appears On) — replaces the
+        // artist-filtered Albums grid. Long-lived per visit; disposed when it leaves
+        // history (DisposeViewIfTransient).
+        PushCurrentViewToHistory();
+        ClearAllTopBarActions();
+        IsLyricsPanelOpen = false;
+        _isCoverFlowMode = false;
+        TopBar.IsCoverFlowMode = false;
+        _preCoverFlowView = null;
+        // The originating page's query is captured in history for back-restore.
+        TopBar.SearchText = string.Empty;
+
+        // About-the-artist facts (MusicBrainz + Wikipedia); resolved lazily so the
+        // long-lived shell constructor doesn't grow another parameter.
+        var artistInfo = App.Services?.GetService(typeof(ArtistInfoService)) as ArtistInfoService;
+        var similarArtists = App.Services?.GetService(typeof(SimilarArtistsService)) as SimilarArtistsService;
+        var page = new ArtistDetailViewModel(artistName, _library, Player, _albumsVm, _artistsVm, _artistImageService, Sidebar, artistInfo, similarArtists, Settings);
+        page.BackRequested += (_, _) =>
+        {
+            if (ReferenceEquals(CurrentView, page))
+                GoBackInHistory();
+        };
+        page.AlbumOpened += (_, album) => OpenAlbumDetail(album, backButtonText: page.ArtistName);
+        // Similar Artists tile for an artist in the library: their page, this one in history.
+        page.ArtistOpened += (_, name) => OpenArtistDiscography(name);
+        page.SearchLyricsRequested += (_, track) => SearchLyricsForTrack(track);
+        CurrentView = page;
+        HighlightSidebarSection("artists");
+        // No top-bar Play/Shuffle pills: the page's own hero carries them.
+        RefreshBackButton();
+    }
+
+    private ViewModelBase CreatePlaylistView(string key)
+    {
+        // key format: "playlist:{guid}"
+        var idStr = key.Replace("playlist:", "");
+        if (!Guid.TryParse(idStr, out var id)) return _homeVm;
+
+        var playlist = Sidebar.GetPlaylist(id);
+        if (playlist == null) return _homeVm;
+
+        var playlistVm = new PlaylistViewModel(playlist, Player, _library, _persistence, Sidebar, _artistImageService,
+            Settings.PlaylistShowSideRail);
+        playlistVm.SetSideRailAction(show => Settings.PlaylistShowSideRail = show);
+        playlistVm.ViewAlbumRequested += OnViewAlbumFromTrack;
+        playlistVm.BackRequested += (_, _) => Navigate("playlists");
+        playlistVm.SetSearchLyricsAction(SearchLyricsForTrack);
+        playlistVm.SetViewArtistAction(ViewArtistByName);
+        playlistVm.SetOpenFeaturedArtistsAction(OpenPlaylistFeaturedArtistsPage);
+        return playlistVm;
+    }
+
+    private void OpenPlaylistFeaturedArtistsPage(IReadOnlyList<PlaylistFeaturedArtist> artists)
+    {
+        if (artists.Count == 0) return;
+
+        PushCurrentViewToHistory();
+        ClearAllTopBarActions();
+        // The originating page's query is captured in history for back-restore;
+        // the featured-artists grid starts unfiltered.
+        TopBar.SearchText = string.Empty;
+
+        var page = new PlaylistFeaturedArtistsViewModel(artists);
+        page.SetViewArtistAction(ViewArtistByName);
+        CurrentView = page;
+        RefreshBackButton();
+    }
+
+    // ── Search ───────────────────────────────────────────────
+
+    private void OnSearchTextChanged(object? sender, string query)
+    {
+        DebugLogger.Info(DebugLogger.Category.Search, "ApplyFilter", $"query=\"{query}\", target={CurrentView?.GetType().Name}");
+        if (CurrentView is ISearchable searchable)
+        {
+            searchable.ApplyFilter(query);
+        }
+    }
+
+    private void OnHomeSearchRedirectRequested(object? sender, EventArgs e)
+    {
+        // Home has nothing to filter, so the search gesture lands on Songs instead.
+        // Drive the jump through the sidebar selection — the same path as clicking
+        // the Songs item — so history and top-bar state behave like a real
+        // navigation. Navigate closes and clears the search pill as part of the
+        // section switch, so it may only be reopened once navigation is done.
+        var songs = Sidebar.NavItems.FirstOrDefault(n => n.Key == "songs");
+        if (songs == null) return;
+        Sidebar.SelectedNavItem = songs;
+        if (TopBar.IsSearchVisible)
+            TopBar.OpenSearchCommand.Execute(null);
+    }
+
+    private void SetupSongsTopBarActions()
+    {
+        ClearTopBarPageActions();
+        TopBar.ShowPageActions(
+            _songsVm.ShuffleAllCommand,
+            new RelayCommand(() => Player.IsQueuePopupOpen = !Player.IsQueuePopupOpen),
+            _songsVm.ShowOnlyFavorites,
+            _songsVm.SortAscending,
+            _songsVm.SortColumn,
+            _songsVm.SetShowAllItemsCommand,
+            _songsVm.SetShowOnlyFavoritesCommand,
+            // SelectSortCommand, not SortCommand: menu entries show the field and the
+            // direction as separate checked items, so picking the active field must not
+            // flip the direction the way a repeated column-header click does.
+            _songsVm.SelectSortCommand,
+            new AsyncRelayCommand(async () =>
+            {
+                // Disposed on close: the dialog view model listens to the Songs view
+                // model, which outlives it by the whole session.
+                using var optionsVm = new SongsViewOptionsViewModel(_songsVm, Settings);
+                try
+                {
+                    await Views.SongsViewOptionsDialog.ShowAsync(optionsVm);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[MainVM] View Options dialog failed: {ex.Message}");
+                }
+            }));
+        TopBar.ShowSongsFilters(_songsVm.SummaryText, _songsVm.QualityFilter, _songsVm.SetQualityFilterCommand);
+        _songsVmTopBarHandler = (_, e) =>
+        {
+            if (e.PropertyName == nameof(LibrarySongsViewModel.ShowOnlyFavorites))
+                TopBar.PageShowOnlyFavorites = _songsVm.ShowOnlyFavorites;
+            else if (e.PropertyName == nameof(LibrarySongsViewModel.SortAscending))
+                TopBar.PageSortAscending = _songsVm.SortAscending;
+            else if (e.PropertyName == nameof(LibrarySongsViewModel.SortColumn))
+                TopBar.PageSortColumn = _songsVm.SortColumn;
+            else if (e.PropertyName == nameof(LibrarySongsViewModel.SummaryText))
+                TopBar.SongsSummaryText = _songsVm.SummaryText;
+            else if (e.PropertyName == nameof(LibrarySongsViewModel.QualityFilter))
+                TopBar.SongsQualityFilter = _songsVm.QualityFilter;
+        };
+        _songsVm.PropertyChanged += _songsVmTopBarHandler;
+    }
+
+    private void ClearTopBarPageActions()
+    {
+        if (_songsVmTopBarHandler != null)
+        {
+            _songsVm.PropertyChanged -= _songsVmTopBarHandler;
+            _songsVmTopBarHandler = null;
+        }
+        TopBar.HidePageActions();
+        TopBar.HideSongsFilters();
+    }
+
+    /// <summary>Clears all page-specific, playlist, artist, and view-mode top bar actions.</summary>
+    private void ClearAllTopBarActions()
+    {
+        UnwireLyricsPageFromPlayer();
+        ClearTopBarPageActions();
+        TopBar.HidePlaylistActions();
+        TopBar.HideArtistActions();
+        TopBar.HideFavoritesActions();
+        TopBar.HideFoldersActions();
+        TopBar.HideArtistSort();
+        TopBar.HideViewModeToggle();
+    }
+
+    private void WireLyricsPageToPlayer()
+    {
+        Player.SetLyricsPageActions(
+            selectSynced: () => _lyricsVm.SelectSyncedLyricsCommand.Execute(null),
+            selectPlain: () => _lyricsVm.SelectPlainLyricsCommand.Execute(null),
+            openBackgroundColor: () => _lyricsVm.OpenBackgroundColorPickerCommand.Execute(null),
+            removeLyrics: () => _lyricsVm.RemoveLyricsCommand.Execute(null),
+            shareLyrics: () => _lyricsVm.ShareLyricsCommand.Execute(null),
+            isSyncedActive: _lyricsVm.IsSyncTabSelected,
+            isPlainActive: _lyricsVm.IsUnsyncTabSelected,
+            isSyncedAvailable: _lyricsVm.HasSyncedLyricsAvailable,
+            canShare: _lyricsVm.ShareAvailable,
+            saveLyrics: () => _lyricsVm.SaveLyricsToFileCommand.Execute(null),
+            canSaveLyrics: _lyricsVm.CanSaveToFile,
+            saveLyricsTtml: () => _lyricsVm.SaveLyricsAsTtmlCommand.Execute(null),
+            canSaveLyricsTtml: _lyricsVm.CanSaveTtmlToFile,
+            setNoLyrics: marked =>
+            {
+                if (marked) _ = _lyricsVm.MarkNoLyricsCommand.ExecuteAsync(null);
+                else _lyricsVm.UnmarkNoLyricsCommand.Execute(null);
+            },
+            isMarkedNoLyrics: _lyricsVm.IsMarkedNoLyrics);
+
+        _lyricsVm.PropertyChanged -= OnLyricsVmPropertyChanged;
+        _lyricsVm.PropertyChanged += OnLyricsVmPropertyChanged;
+    }
+
+    private void UnwireLyricsPageFromPlayer()
+    {
+        _lyricsVm.PropertyChanged -= OnLyricsVmPropertyChanged;
+        Player.ClearLyricsPageActions();
+    }
+
+    private void OnLyricsVmPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(LyricsViewModel.IsSyncTabSelected)
+            || e.PropertyName == nameof(LyricsViewModel.IsUnsyncTabSelected)
+            || e.PropertyName == nameof(LyricsViewModel.HasSyncedLyricsAvailable)
+            || e.PropertyName == nameof(LyricsViewModel.ShareAvailable)
+            || e.PropertyName == nameof(LyricsViewModel.CanSaveToFile)
+            || e.PropertyName == nameof(LyricsViewModel.CanSaveTtmlToFile)
+            || e.PropertyName == nameof(LyricsViewModel.IsMarkedNoLyrics))
+        {
+            Player.UpdateLyricsPageState(
+                isSyncedActive: _lyricsVm.IsSyncTabSelected,
+                isPlainActive: _lyricsVm.IsUnsyncTabSelected,
+                isSyncedAvailable: _lyricsVm.HasSyncedLyricsAvailable,
+                canShare: _lyricsVm.ShareAvailable,
+                canSaveLyrics: _lyricsVm.CanSaveToFile,
+                canSaveLyricsTtml: _lyricsVm.CanSaveTtmlToFile,
+                isMarkedNoLyrics: _lyricsVm.IsMarkedNoLyrics);
+        }
+    }
+
+    /// <summary>
+    /// Shows the global Library/Cover Flow toggle in the top bar and reflects the current mode.
+    /// Call after navigating to a toggle-eligible section.
+    /// </summary>
+    private void SetupGlobalViewModeToggle()
+    {
+        TopBar.ShowViewModeToggle(
+            new RelayCommand(ExitCoverFlowMode),
+            new RelayCommand(EnterCoverFlowMode),
+            _isCoverFlowMode,
+            _coverFlowVm.ToggleCollageModeCommand,
+            _coverFlowVm.IsCollageMode,
+            _coverFlowVm.SetLayoutCommand,
+            _coverFlowVm.LayoutLabel);
+
+        // Home and Cover Flow do not use the top-bar search field.
+        if (_isCoverFlowMode || _currentSectionKey == "home")
+            TopBar.IsSearchVisible = false;
+    }
+
+    /// <summary>
+    /// Shows the release-type filter chips on the Albums grid (Library mode),
+    /// including the artist discography page. Cover Flow hides them.
+    /// </summary>
+    private void UpdateReleaseTypeChips()
+    {
+        var show = ReferenceEquals(CurrentView, _albumsVm)
+                   && !_isCoverFlowMode;
+        if (show)
+        {
+            TopBar.ShowReleaseTypeChips(_albumsVm.ReleaseTypeChips, _albumsVm.SelectReleaseTypeChipCommand,
+                _albumsVm.QualityChips, _albumsVm.SelectQualityChipCommand, _albumsVm.SetAlbumSortCommand,
+                _albumsVm.SetReleaseTypeFilterCommand, _albumsVm.SetQualityFilterCommand);
+            TopBar.AlbumSortLabel = _albumsVm.AlbumSortLabel;
+            TopBar.AlbumSortMode = _albumsVm.AlbumSortMode;
+            TopBar.AlbumSortAscending = _albumsVm.AlbumSortAscending;
+            TopBar.AlbumSortNewestFirst = _albumsVm.AlbumSortNewestFirst;
+            TopBar.ReleaseTypeFilterLabel = _albumsVm.ReleaseTypeFilterLabel;
+            TopBar.QualityFilterLabel = _albumsVm.QualityFilterLabel;
+            TopBar.AlbumViewCommand = _albumsVm.SetAlbumViewCommand;
+            TopBar.AlbumCarouselStyleCommand = _albumsVm.SetCarouselStyleCommand;
+            TopBar.AlbumViewToggleCommand = _albumsVm.ToggleAlbumViewCommand;
+            TopBar.IsAlbumCarouselView = _albumsVm.IsCarouselView;
+            TopBar.AlbumCarouselStyle = _albumsVm.CarouselStyle.ToString();
+        }
+        else
+        {
+            TopBar.HideReleaseTypeChips();
+        }
+    }
+
+    private void EnterCoverFlowMode()
+    {
+        if (_isCoverFlowMode) return;
+        // Remember non-section views (e.g. a playlist detail) so exit returns to them
+        // instead of dumping the user back to the section list.
+        _preCoverFlowView = CurrentView is PlaylistViewModel ? CurrentView : null;
+        _isCoverFlowMode = true;
+        TopBar.IsCoverFlowMode = true;
+        TopBar.IsSearchVisible = false;
+        CurrentView = _coverFlowVm;
+        // Arms the sidebar Back chevron as "leave Cover Flow" (see RefreshBackButton).
+        RefreshBackButton();
+    }
+
+    private void ExitCoverFlowMode()
+    {
+        if (!_isCoverFlowMode) return;
+        _isCoverFlowMode = false;
+        TopBar.IsCoverFlowMode = false;
+        TopBar.IsSearchVisible = _currentSectionKey != "home";
+        if (_preCoverFlowView != null)
+        {
+            CurrentView = _preCoverFlowView;
+            RestoreTopBarActionsForView(_preCoverFlowView);
+            _preCoverFlowView = null;
+        }
+        else
+        {
+            // Return to the section that was selected underneath
+            CurrentView = ResolveSectionView(_currentSectionKey);
+            RestoreTopBarActionsForView(CurrentView);
+        }
+        RefreshBackButton();
+    }
+
+    /// <summary>Resolves a sidebar section key to the cached long-lived ViewModel for that section. Refreshes content as needed (mirrors Navigate's switch).</summary>
+    private ViewModelBase ResolveSectionView(string key) => key switch
+    {
+        "home"      => RefreshAndReturn(_homeVm),
+        "songs"     => RefreshAndReturnSongs(_songsVm),
+        "albums"    => ResetFilterAndReturnAlbums(),
+        "artists"   => ResetAndReturnArtists(),
+        "folders"   => RefreshAndReturnFolders(_foldersVm),
+        "playlists" => RefreshAndReturnPlaylists(_playlistsVm),
+        "favorites" => RefreshAndReturnFavorites(_favoritesVm),
+        _           => RefreshAndReturn(_homeVm)
+    };
+
+    /// <summary>Restores the correct top bar actions when navigating back to a view.</summary>
+    private void RestoreTopBarActionsForView(ViewModelBase view)
+    {
+        // The toggle is shown for any of the 7 long-lived section views or while in Cover Flow.
+        if (ReferenceEquals(view, _homeVm)
+            || ReferenceEquals(view, _songsVm)
+            || ReferenceEquals(view, _albumsVm)
+            || ReferenceEquals(view, _artistsVm)
+            || ReferenceEquals(view, _foldersVm)
+            || ReferenceEquals(view, _playlistsVm)
+            || ReferenceEquals(view, _favoritesVm)
+            || ReferenceEquals(view, _coverFlowVm))
+        {
+            SetupGlobalViewModeToggle();
+        }
+
+        if (ReferenceEquals(view, _songsVm))
+            SetupSongsTopBarActions();
+        else if (ReferenceEquals(view, _playlistsVm))
+            TopBar.ShowPlaylistActions(Sidebar.CreatePlaylistCommand, _playlistsVm.CreateSmartPlaylistCommand,
+                _playlistsVm.ImportPlaylistCommand, _playlistsVm.SetSortCommand, _playlistsVm.SortLabel,
+                _playlistsVm.QuickPlaylistCommand);
+        else if (ReferenceEquals(view, _favoritesVm))
+            TopBar.ShowFavoritesActions(_favoritesVm.ShuffleAllCommand, _favoritesVm.PlayAllCommand);
+        else if (ReferenceEquals(view, _lyricsVm))
+            WireLyricsPageToPlayer();
+        else if (ReferenceEquals(view, _foldersVm))
+            TopBar.ShowFoldersActions(_foldersVm.PlayFolderCommand, _foldersVm.ShuffleFolderCommand, _foldersVm.OpenMediaFolderSettingsCommand, _foldersVm.SetSortCommand);
+        else if (ReferenceEquals(view, _artistsVm))
+            TopBar.ShowArtistSort(_artistsVm.SetSortCommand, _artistsVm.SortLabel, _artistsVm.SortMode, _artistsVm.SortAscending,
+                _artistsVm.ToggleViewModeCommand, _artistsVm.IsListView);
+        // Artist actions for _albumsVm are restored in CaptureRestoreState's lambda
+    }
+
+    private string GetCurrentViewKey()
+    {
+        if (CurrentView == _homeVm) return "home";
+        if (CurrentView == _songsVm) return "songs";
+        if (CurrentView == _albumsVm || CurrentView == _coverFlowVm) return "albums";
+        if (CurrentView == _artistsVm) return "artists";
+        if (CurrentView == _foldersVm) return "folders";
+
+        if (CurrentView == _playlistsVm) return "playlists";
+        if (CurrentView == _favoritesVm) return "favorites";
+        if (CurrentView == _queueVm) return "queue";
+        if (CurrentView == _lyricsVm) return "lyrics";
+        if (CurrentView == _statisticsVm) return "statistics";
+        if (CurrentView == _serverVm) return "server";
+        if (CurrentView == _audioCdVm) return "cd";
+        if (CurrentView == _inboxVm) return "inbox";
+        if (CurrentView == _visualizerVm) return "visualizer";
+        if (CurrentView == _lyricsStudioPageVm) return "lyricsstudio";
+        if (CurrentView == Settings) return "settings";
+        if (CurrentView is AlbumDetailViewModel) return "albums";
+        if (CurrentView is MoreByArtistViewModel) return "artists";
+        if (CurrentView is PlaylistViewModel) return "playlists";
+        return "home";
+    }
+
+    /// <summary>Leaf name of the app-managed folder loose drops are relocated into.</summary>
+    internal const string ManagedImportFolderName = "Undertone Imports";
+
+    /// <summary>
+    /// Picks the configured root that IS a managed-imports folder (leaf name match),
+    /// or null when none is configured.
+    /// <para>
+    /// This used to be "first configured folder that exists on disk" — but any
+    /// configured root can be a real album folder (added via the Settings picker or
+    /// promoted to first place after the original managed root was scrubbed from the
+    /// list), and loose drops were then MOVED flat into that album folder. Sitting
+    /// next to its cover art, an untagged drop even wore that album's cover. Only a
+    /// folder we manage may receive relocated drops.
+    /// </para>
+    /// </summary>
+    /// <remarks>Internal for tests (InternalsVisibleTo Undertone.Tests).</remarks>
+    internal static string? SelectManagedImportRoot(IEnumerable<string> configuredRoots) =>
+        configuredRoots.FirstOrDefault(r =>
+            string.Equals(
+                Path.GetFileName(Path.TrimEndingDirectorySeparator(r)),
+                ManagedImportFolderName,
+                StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>The managed imports folder (created, and added to the music folders, when
+    /// missing); null when it cannot be made. Drops are moved here, and songs a phone sends
+    /// (the Undertone server's undertoneUploadTrack) land under it too.</summary>
+    internal async Task<string?> EnsureManagedImportRootAsync(CancellationToken ct)
+    {
+        try
+        {
+            var normalizedRoots = Settings.GetSettings().MusicFolders
+                .Where(f => !string.IsNullOrWhiteSpace(f))
+                .Select(TryNormalizePath)
+                .Where(f => !string.IsNullOrWhiteSpace(f))
+                .Select(f => f!)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            // Only an app-managed imports folder may receive drops (see
+            // SelectManagedImportRoot); otherwise create the default one.
+            var managedRoot = SelectManagedImportRoot(normalizedRoots);
+            var musicFolder = Environment.GetFolderPath(Environment.SpecialFolder.MyMusic);
+            if (string.IsNullOrEmpty(musicFolder))
+                musicFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Music");
+            var fallbackRoot = Path.Combine(musicFolder, ManagedImportFolderName);
+
+            var targetRoot = managedRoot ?? fallbackRoot;
+            var normalizedTarget = TryNormalizePath(targetRoot) ?? targetRoot;
+
+            Directory.CreateDirectory(normalizedTarget);
+
+            var alreadyConfigured = normalizedRoots.Contains(normalizedTarget, StringComparer.OrdinalIgnoreCase);
+            if (!alreadyConfigured)
+            {
+                // autoScan: false — AddFolderPath's fire-and-forget scan enumerated this
+                // root while it was still empty and then replaced the whole track list,
+                // wiping the tracks ImportFilesAsync published moments later. The drop
+                // silently vanished on any machine with no usable configured folder yet
+                // (fresh install), while machines that already had one never reached this
+                // branch at all. The caller imports the dropped files itself below.
+                await Settings.AddFolderPath(normalizedTarget, autoScan: false);
+            }
+
+            ct.ThrowIfCancellationRequested();
+            return normalizedTarget;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[MainWindowVM] Failed to prepare managed import root: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Relocates an external drop into the managed library root and returns its new path.
+    /// <para>
+    /// This used to copy, which left the dropped file behind as a hidden duplicate: the
+    /// library track pointed at the copy, so "Remove from library → Move to Recycle Bin"
+    /// trashed the copy and left the file the user had actually dropped sitting on disk,
+    /// reading as a Recycle Bin that did nothing. Moving keeps exactly one file, so
+    /// removing the track removes the file the user dropped.
+    /// </para>
+    /// Falls back to copying when the move can't be done (read-only source volume, the
+    /// file locked by another app) — a leftover original beats a failed import.
+    /// </summary>
+    /// <remarks>Internal for tests (InternalsVisibleTo Undertone.Tests).</remarks>
+    internal static string? MoveFileIntoManagedRoot(string sourceFile, string managedRoot)
+    {
+        try
+        {
+            var sourcePath = TryNormalizePath(sourceFile);
+            if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
+                return null;
+
+            var rootPath = TryNormalizePath(managedRoot) ?? managedRoot;
+            Directory.CreateDirectory(rootPath);
+
+            var fileName = Path.GetFileName(sourcePath);
+            var destinationPath = Path.Combine(rootPath, fileName);
+            destinationPath = TryNormalizePath(destinationPath) ?? destinationPath;
+
+            // Prevent path traversal: ensure destination stays within managed root
+            var fullDestination = Path.GetFullPath(destinationPath);
+            var fullRoot = Path.GetFullPath(rootPath);
+            if (!fullDestination.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                System.Diagnostics.Debug.WriteLine($"[DropImport] Path traversal blocked: {destinationPath}");
+                return null;
+            }
+
+            // Already in the managed root.
+            if (string.Equals(sourcePath, destinationPath, StringComparison.OrdinalIgnoreCase))
+                return sourcePath;
+
+            if (File.Exists(destinationPath))
+            {
+                var sourceInfo = new FileInfo(sourcePath);
+                var destinationInfo = new FileInfo(destinationPath);
+
+                // Same payload already in the library — re-dropping a file that is
+                // already imported. Deliberately does NOT delete the source: size +
+                // timestamp is too weak an identity check to destroy a file over.
+                if (sourceInfo.Length == destinationInfo.Length &&
+                    sourceInfo.LastWriteTimeUtc == destinationInfo.LastWriteTimeUtc)
+                {
+                    CopyLyricsSidecars(sourcePath, destinationPath);
+                    return destinationPath;
+                }
+
+                var baseName = Path.GetFileNameWithoutExtension(fileName);
+                var extension = Path.GetExtension(fileName);
+                var suffix = 2;
+
+                do
+                {
+                    destinationPath = Path.Combine(rootPath, $"{baseName} ({suffix}){extension}");
+                    suffix++;
+                } while (File.Exists(destinationPath));
+            }
+
+            var lastWriteUtc = File.GetLastWriteTimeUtc(sourcePath);
+            try
+            {
+                // Handles the cross-volume case too (MOVEFILE_COPY_ALLOWED on Windows,
+                // copy-then-delete on the EXDEV path elsewhere).
+                File.Move(sourcePath, destinationPath);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"[DropImport] Move failed ({ex.Message}); copying instead: {sourcePath}");
+                File.Copy(sourcePath, destinationPath, overwrite: false);
+            }
+            File.SetLastWriteTimeUtc(destinationPath, lastWriteUtc);
+            CopyLyricsSidecars(sourcePath, destinationPath);
+            return destinationPath;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[MainWindowVM] Managed import failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    private static void CopyLyricsSidecars(string sourcePath, string destinationPath)
+    {
+        foreach (var extension in new[] { ".elrc", ".lrc", ".ttml", ".lyricsfile" })
+        {
+            var source = Path.ChangeExtension(sourcePath, extension);
+            var destination = Path.ChangeExtension(destinationPath, extension);
+            try
+            {
+                if (File.Exists(source) && !File.Exists(destination))
+                    File.Copy(source, destination, overwrite: false);
+            }
+            catch (IOException ex) { Debug.WriteLine($"[DropImport] Lyrics sidecar not copied: {ex.Message}"); }
+            catch (UnauthorizedAccessException ex) { Debug.WriteLine($"[DropImport] Lyrics sidecar not copied: {ex.Message}"); }
+        }
+    }
+
+    private static bool IsPathUnderRoot(string path, string root)
+    {
+        var normalizedPath = path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var normalizedRoot = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+        return normalizedPath.Equals(normalizedRoot, StringComparison.OrdinalIgnoreCase) ||
+               normalizedPath.StartsWith(normalizedRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ||
+               normalizedPath.StartsWith(normalizedRoot + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? TryNormalizePath(string path)
+    {
+        try
+        {
+            return Path.GetFullPath(path)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private void ViewArtistFromLyrics(string artistName)
+    {
+        OpenArtistByName(artistName);
+    }
+
+    private void ViewArtistFromAlbumDetail(string artistName)
+    {
+        OpenArtistByName(artistName);
+    }
+
+    /// <summary>Navigates to the artist discography page from any track/artist link click.</summary>
+    private void ViewArtistByName(string artistName)
+    {
+        OpenArtistByName(artistName);
+    }
+
+    /// <summary>Toggles between lyrics view and previous view.</summary>
+    [RelayCommand]
+    private void ToggleLyrics(string? key)
+    {
+        if (CurrentView == _lyricsVm)
+        {
+            // Return to the view that was active before lyrics
+            if (_navigationHistory.Count > 0)
+                GoBackInHistory();
+            else
+                Navigate(_preLyricsViewKey ?? "home");
+        }
+        else
+        {
+            OpenLyricsView();
+        }
+    }
+
+    /// <summary>Shared open path for the lyrics view: records the view to return to,
+    /// then swaps <see cref="CurrentView"/> and re-points the top bar at the page.</summary>
+    private void OpenLyricsView()
+    {
+        _preLyricsViewKey = GetCurrentViewKey();
+        // Push current view to history so we can restore it (including detail views)
+        PushCurrentViewToHistory();
+        // Set lyrics directly — Navigate() would clear the search/tab state we
+        // want restored when toggling back out of lyrics.
+        EnsureLyricsAndReturn(_lyricsVm);
+        CurrentView = _lyricsVm;
+        Player.IsQueuePopupOpen = false;
+        TopBar.SearchText = string.Empty;
+        TopBar.CurrentTabName = "Lyrics";
+        ClearAllTopBarActions();
+        WireLyricsPageToPlayer();
+    }
+
+    /// <summary>Navigates to lyrics view and searches for lyrics for the given track.</summary>
+    private void SearchLyricsForTrack(Track track)
+    {
+        OpenLyricsView();
+        _lyricsVm.SearchLyricsForTrack(track);
+    }
+
+    /// <summary>Opens the lyrics page, or stays on it when it is already up (unlike
+    /// <see cref="ToggleLyricsCommand"/>). Used by Lyrics Studio's preview.</summary>
+    public void ShowLyricsPage()
+    {
+        if (CurrentView != _lyricsVm)
+            OpenLyricsView();
+    }
+
+    // ── Discord RPC / Last.fm integration ─────────────────────
+
+    private void OnTrackStartedForIntegrations(object? sender, Track track)
+    {
+        // Scrobble the *previous* track if it was played long enough
+        TryScrobblePreviousTrack();
+
+        // Record new track start for scrobble tracking
+        _scrobbleTrack = track;
+        _scrobbleClock.Start(DateTime.UtcNow);
+
+        // Update Discord presence
+        if (_discord.IsConnected)
+        {
+            _ = UpdateDiscordPresenceAsync(track, TimeSpan.Zero, true);
+        }
+
+        // A song, album or artist set to not scrobble doesn't show as Now Playing either.
+        var excluded = Settings.IsScrobbleExcluded(track);
+
+        // Update Last.fm Now Playing
+        if (!excluded && _lastFm.IsAuthenticated && Settings.LastFmScrobblingEnabled)
+            _ = _lastFm.UpdateNowPlayingAsync(track);
+
+        // Update ListenBrainz Now Playing (independent of Last.fm)
+        if (!excluded && _listenBrainz.IsAuthenticated && Settings.ListenBrainzScrobblingEnabled)
+            _ = _listenBrainz.UpdateNowPlayingAsync(track);
+
+        // Queue play-state sync for enabled server-backed connections.
+        _ = _syncService.PushPlayStateAsync(track);
+    }
+
+    private void OnPlayerPropertyChangedForIntegrations(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(Player.State))
+        {
+            // Update Discord presence for state changes.
+            // ClearAsync must be checked BEFORE the CurrentTrack null guard because
+            // AdvanceQueueCore nulls CurrentTrack before setting State=Stopped.
+            if (_discord.IsConnected)
+            {
+                if (Player.State == PlaybackState.Stopped || Player.State == PlaybackState.Paused)
+                {
+                    _ = _discord.ClearAsync();
+                }
+                else if (Player.State == PlaybackState.Playing && Player.CurrentTrack != null)
+                {
+                    _ = UpdateDiscordPresenceAsync(Player.CurrentTrack, Player.Position, true);
+                }
+            }
+
+            // Paused time is not listening time for the scrobble rule.
+            if (Player.State == PlaybackState.Paused)
+                _scrobbleClock.Pause(DateTime.UtcNow);
+            else if (Player.State == PlaybackState.Playing)
+                _scrobbleClock.Resume(DateTime.UtcNow);
+
+            // If stopped, try to scrobble the track that just ended
+            if (Player.State == PlaybackState.Stopped)
+                TryScrobblePreviousTrack();
+        }
+        // A music video's audio turned out longer or shorter than the song: re-send the
+        // presence once the engine knows, so Discord's bar runs to the clip's end.
+        else if (e.PropertyName == nameof(Player.MusicVideoAudioLengthDiffers) && Player.MusicVideoAudioLengthDiffers &&
+                 _discord.IsConnected && Player.State == PlaybackState.Playing && Player.CurrentTrack is { } clipTrack)
+        {
+            _ = UpdateDiscordPresenceAsync(clipTrack, Player.Position, true);
+        }
+    }
+
+    private void OnPlayerSeekedForIntegrations(object? sender, TimeSpan newPosition)
+    {
+        if (!_discord.IsConnected || Player.CurrentTrack == null) return;
+
+        var now = DateTime.UtcNow;
+        if (now - _lastDiscordSeekUpdate < DiscordSeekThrottle) return;
+        _lastDiscordSeekUpdate = now;
+
+        _ = UpdateDiscordPresenceAsync(Player.CurrentTrack, newPosition, Player.State == PlaybackState.Playing);
+    }
+
+    private void OnLoonDisconnected() => _discord.InvalidateArtworkCache();
+
+    private void OnLoonReconnected()
+    {
+        // Refresh the presence so Discord re-fetches the cover through the new clientId.
+        if (!_discord.IsConnected) return;
+
+        // Any state except Stopped has a published presence whose artwork URL just became
+        // invalid (or has been missing since the relay was still connecting). This used to
+        // require Playing, so a relay reconnect while paused — and the relay's very first
+        // connect, which also raises this — left the presence pinned to an unreachable URL
+        // for the rest of the track with no other path back to the real cover.
+        var track = Player.CurrentTrack;
+        if (track == null || Player.State == PlaybackState.Stopped) return;
+
+        _ = UpdateDiscordPresenceAsync(track, Player.Position, Player.State == PlaybackState.Playing);
+    }
+
+    private async Task UpdateDiscordPresenceAsync(Track track, TimeSpan position, bool isPlaying)
+    {
+        try
+        {
+            var artworkUrl = _loon.GetArtworkUrl(track.AlbumArtworkPath);
+
+            var dto = new DiscordPresenceTrack(
+                track.Title ?? "Unknown",
+                track.Artist ?? "Unknown Artist",
+                track.Album,
+                artworkUrl,
+                ShowAlbum: Settings.DiscordShowAlbum,
+                StatusDisplay: DiscordPresenceOptions.ParseStatusDisplay(Settings.DiscordStatusDisplay));
+            // Music video audio: the clip's length, as the engine reports it, not the song file's.
+            var duration = Player.IsPlayingMusicVideoAudio ? Player.Duration : track.Duration;
+            await _discord.UpdateAsync(dto, position, duration, isPlaying);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[Discord] Presence update failed: {ex.Message}");
+        }
+    }
+
+    private void TryScrobblePreviousTrack()
+    {
+        if (_scrobbleTrack == null)
+            return;
+
+        var lastFmActive = _lastFm.IsAuthenticated && Settings.LastFmScrobblingEnabled;
+        var listenBrainzActive = _listenBrainz.IsAuthenticated && Settings.ListenBrainzScrobblingEnabled;
+        // Plugins' OnTrackScrobbled fires on the same rule, with or without a scrobbling service.
+        var pluginsListening = Plugins.HasScrobbleListeners;
+        if (!lastFmActive && !listenBrainzActive && !pluginsListening)
+        {
+            _scrobbleTrack = null;
+            return;
+        }
+
+        // Re-read here, not only at track start: "don't scrobble" picked mid-song still applies.
+        if (Settings.IsScrobbleExcluded(_scrobbleTrack))
+        {
+            _scrobbleTrack = null;
+            return;
+        }
+
+        // Last.fm scrobble rules (ListenBrainz mirrors them), on time actually played.
+        bool shouldScrobble = ScrobblePlayClock.ShouldScrobble(
+            _scrobbleTrack.Duration, _scrobbleClock.Played(DateTime.UtcNow));
+
+        if (shouldScrobble)
+        {
+            var track = _scrobbleTrack;
+            var startedAt = _scrobbleClock.StartedAt;
+            var pending = new List<Task>(2);
+            if (lastFmActive)
+                pending.Add(_lastFm.ScrobbleAsync(track, startedAt));
+            if (listenBrainzActive)
+                pending.Add(_listenBrainz.ScrobbleAsync(track, startedAt));
+
+            // Exposed so shutdown can await it. Fire-and-forget here meant the outbound
+            // HTTP request was killed with the process — the last track of every session
+            // silently failed to scrobble, because App.OnFrameworkInitializationCompleted
+            // calls desktop.Shutdown() as soon as ShutdownAsync returns.
+            _pendingScrobbles = pending.Count > 0 ? Task.WhenAll(pending) : Task.CompletedTask;
+
+            if (pluginsListening)
+            {
+                try { Plugins.RaiseTrackScrobbled(track, startedAt); }
+                catch (Exception ex) { DebugLogger.Error(DebugLogger.Category.State, "Plugins", $"scrobble hook: {ex.Message}"); }
+            }
+        }
+
+        _scrobbleTrack = null;
+    }
+
+    /// <summary>Whether a phone's plays go on to Last.fm and ListenBrainz from here (signed in and
+    /// turned on), for the phone's Scrobbling page.</summary>
+    public (bool LastFm, bool ListenBrainz) PhoneScrobbleServices =>
+        (_lastFm.IsAuthenticated && Settings.LastFmScrobblingEnabled, _listenBrainz.IsAuthenticated && Settings.ListenBrainzScrobblingEnabled);
+
+    /// <summary>
+    /// A play from a phone in Through Computer mode (the server's scrobble call): the phone already
+    /// applied the scrobble rule on its played time, and marks the plays it sent itself so they never
+    /// come here. This computer's own choices still decide: each service signed in and on, and its
+    /// "don't scrobble" songs, albums and artists. Sent with the phone's start time, as a desktop
+    /// play is. Plugins' OnTrackScrobbled is for this computer's own playback and is not raised.
+    /// </summary>
+    public Task ForwardPhoneScrobbleAsync(Track track, DateTime startedAtUtc)
+    {
+        if (Settings.IsScrobbleExcluded(track)) return Task.CompletedTask;
+        var (lastFmActive, listenBrainzActive) = PhoneScrobbleServices;
+        var pending = new List<Task>(2);
+        if (lastFmActive) pending.Add(_lastFm.ScrobbleAsync(track, startedAtUtc));
+        if (listenBrainzActive) pending.Add(_listenBrainz.ScrobbleAsync(track, startedAtUtc));
+        return pending.Count > 0 ? Task.WhenAll(pending) : Task.CompletedTask;
+    }
+
+    /// <summary>In-flight scrobble posts from the most recent track transition.</summary>
+    private Task _pendingScrobbles = Task.CompletedTask;
+
+    /// <summary>
+    /// Waits (briefly) for the final scrobble to reach the network. Never throws.
+    /// </summary>
+    private async Task FlushPendingScrobblesAsync()
+    {
+        try { await _pendingScrobbles.WaitAsync(TimeSpan.FromSeconds(3)); }
+        catch (Exception ex) { Debug.WriteLine($"[MainWindowVM] Final scrobble flush: {ex.Message}"); }
+    }
+
+}
+
+

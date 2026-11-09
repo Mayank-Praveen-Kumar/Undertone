@@ -1,0 +1,378 @@
+using System.Collections.ObjectModel;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Controls.ApplicationLifetimes;
+using Avalonia.Platform.Storage;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using Microsoft.Extensions.DependencyInjection;
+using Undertone.Models;
+using Undertone.Services;
+
+namespace Undertone.ViewModels;
+
+/// <summary>
+/// ViewModel for the playlists library view.
+/// Displays all user-created playlists in a grid similar to albums.
+/// </summary>
+public partial class LibraryPlaylistsViewModel : ViewModelBase, ISearchable
+{
+    private readonly SidebarViewModel _sidebar;
+    private readonly PlayerViewModel _player;
+    private readonly ILibraryService _library;
+    private readonly IPersistenceService _persistence;
+
+    private string _currentFilter = string.Empty;
+    private bool _isDirty = true;
+
+    [ObservableProperty] private string _searchText = string.Empty;
+
+    /// <summary>True when no playlists exist at all (shows the onboarding hint).</summary>
+    [ObservableProperty] private bool _showNoPlaylists;
+
+    /// <summary>True when playlists exist but the active search matched none of them.</summary>
+    [ObservableProperty] private bool _showNoResults;
+
+    /// <summary>Saved scroll offset for restoring position after navigation.</summary>
+    public double SavedScrollOffset { get; set; }
+
+    /// <summary>All user-created playlists displayed in the grid.</summary>
+    public ObservableCollection<Playlist> Playlists => _sidebar.Playlists;
+
+    /// <summary>All playlist nav items with computed artwork (source of truth for display).</summary>
+    public ObservableCollection<PlaylistNavItem> PlaylistItems => _sidebar.PlaylistItems;
+
+    /// <summary>Filtered playlists for display (uses PlaylistNavItem for artwork sync with sidebar).</summary>
+    public ObservableCollection<PlaylistNavItem> FilteredPlaylists { get; } = new();
+
+    /// <summary>Fires when the user wants to open a playlist's detail view.</summary>
+    public event EventHandler<Playlist>? PlaylistOpened;
+
+    public LibraryPlaylistsViewModel(SidebarViewModel sidebar, PlayerViewModel player, ILibraryService library, IPersistenceService persistence)
+    {
+        _sidebar = sidebar;
+        _player = player;
+        _library = library;
+        _persistence = persistence;
+
+        // Re-filter when the source playlists change
+        _sidebar.Playlists.CollectionChanged += (_, _) => { _isDirty = true; ApplyFilter(_currentFilter); };
+        _sidebar.PlaylistItems.CollectionChanged += (_, _) => { _isDirty = true; ApplyFilter(_currentFilter); };
+    }
+
+    public void Refresh()
+    {
+        if (!_isDirty && FilteredPlaylists.Count > 0)
+            return;
+        _isDirty = false;
+
+        OnPropertyChanged(nameof(Playlists));
+        ApplyFilter(_currentFilter);
+    }
+
+    // ── Sort ────────────────────────────────────────────────────────────────
+    // Playlist carries CreatedAt, ModifiedAt and TrackIds.Count, and every sibling grid
+    // has sorting, but this tab only ever showed whatever order the sidebar happened to
+    // build.
+
+    /// <summary>"default" (sidebar order), "name", "created", "modified" or "tracks".</summary>
+    [ObservableProperty] private string _sortMode = "default";
+
+    public string SortLabel => SortMode switch
+    {
+        "name" => "Name",
+        "created" => "Recently created",
+        "modified" => "Recently modified",
+        "tracks" => "Track count",
+        _ => "Default",
+    };
+
+    partial void OnSortModeChanged(string value)
+    {
+        OnPropertyChanged(nameof(SortLabel));
+        ApplyFilter(_currentFilter);
+    }
+
+    [RelayCommand]
+    private void SetSort(string mode) => SortMode = mode;
+
+    public void ApplyFilter(string query)
+    {
+        if (SearchText != query)
+            SearchText = query;
+
+        _currentFilter = query;
+
+        var filtered = PlaylistItems.AsEnumerable();
+        if (!string.IsNullOrWhiteSpace(query))
+        {
+            filtered = filtered.Where(p =>
+                p.Label.Contains(query, StringComparison.OrdinalIgnoreCase));
+        }
+
+        filtered = SortMode switch
+        {
+            "name" => filtered.OrderBy(p => p.Label, StringComparer.OrdinalIgnoreCase),
+            "created" => filtered.OrderByDescending(p => ResolvePlaylist(p)?.CreatedAt ?? DateTime.MinValue),
+            "modified" => filtered.OrderByDescending(p => ResolvePlaylist(p)?.ModifiedAt ?? DateTime.MinValue),
+            "tracks" => filtered.OrderByDescending(p => ResolvePlaylist(p)?.TrackIds.Count ?? 0),
+            _ => filtered,
+        };
+
+        // Sync the collection in place instead of Clear+refill — the same reason
+        // RebuildSidebarRows does. Navigating to the Playlists section calls
+        // ApplyFilter("") directly (MainWindowViewModel, "Clear it directly here"), and a
+        // Clear raises a Reset that drops EVERY tile's container. The rebuilt CachedImages
+        // start at Source = null and only repaint once the cache hit lands, so the whole
+        // grid of artwork blinked on every click of the section. When the result is
+        // unchanged this loop mutates nothing at all, so the containers — and their
+        // already-decoded covers — survive untouched.
+        var desired = filtered.ToList();
+        for (int i = 0; i < desired.Count; i++)
+        {
+            var at = FilteredPlaylists.IndexOf(desired[i]);
+            if (at == i) continue;
+            if (at > i) FilteredPlaylists.Move(at, i);
+            else FilteredPlaylists.Insert(i, desired[i]);
+        }
+        while (FilteredPlaylists.Count > desired.Count)
+            FilteredPlaylists.RemoveAt(FilteredPlaylists.Count - 1);
+
+        ShowNoPlaylists = PlaylistItems.Count == 0;
+        ShowNoResults = PlaylistItems.Count > 0 && FilteredPlaylists.Count == 0;
+    }
+
+    private Playlist? ResolvePlaylist(PlaylistNavItem item)
+        => Playlists.FirstOrDefault(p => p.Id == item.PlaylistId);
+
+    /// <summary>Pins/unpins the playlist at the top of the sidebar.</summary>
+    [RelayCommand]
+    private async Task TogglePin(PlaylistNavItem item)
+    {
+        if (item.PlaylistId is not Guid id) return;
+        await _sidebar.TogglePinAsync(id);
+    }
+
+    [RelayCommand]
+    private void OpenPlaylist(PlaylistNavItem item)
+    {
+        var playlist = ResolvePlaylist(item);
+        if (playlist != null) PlaylistOpened?.Invoke(this, playlist);
+    }
+
+    private List<Track> ResolvePlaylistTracks(Playlist playlist)
+    {
+        if (playlist.IsSmartPlaylist)
+            return SmartPlaylistEvaluator.Evaluate(playlist, _library.Tracks);
+
+        return playlist.TrackIds
+            .Select(id => _library.GetTrackById(id))
+            .Where(t => t != null)
+            .Cast<Track>()
+            .ToList();
+    }
+
+    [RelayCommand]
+    private void PlayPlaylist(PlaylistNavItem item)
+    {
+        var playlist = ResolvePlaylist(item);
+        if (playlist == null) return;
+        var tracks = ResolvePlaylistTracks(playlist);
+        if (tracks.Count == 0) return;
+        _player.ReplaceQueueAndPlay(tracks, 0);
+    }
+
+    [RelayCommand]
+    private void ShufflePlaylist(PlaylistNavItem item)
+    {
+        var playlist = ResolvePlaylist(item);
+        if (playlist == null) return;
+        var tracks = ResolvePlaylistTracks(playlist);
+        if (tracks.Count == 0) return;
+        _player.PlayShuffled(tracks);
+    }
+
+    [RelayCommand]
+    private void PlayNextPlaylist(PlaylistNavItem item)
+    {
+        var playlist = ResolvePlaylist(item);
+        if (playlist == null) return;
+        var tracks = ResolvePlaylistTracks(playlist);
+        if (tracks.Count == 0) return;
+        _player.AddNextRange(tracks, playlist.Name);
+    }
+
+    [RelayCommand]
+    private void AddPlaylistToQueue(PlaylistNavItem item)
+    {
+        var playlist = ResolvePlaylist(item);
+        if (playlist == null) return;
+        var tracks = ResolvePlaylistTracks(playlist);
+        _player.AddRangeToQueue(tracks, playlist.Name);
+    }
+
+    [RelayCommand]
+    private async Task EditPlaylist(PlaylistNavItem item)
+    {
+        var playlist = ResolvePlaylist(item);
+        if (playlist == null) return;
+        await _sidebar.EditPlaylistAsync(playlist);
+        ApplyFilter(_currentFilter);
+    }
+
+    [RelayCommand]
+    private async Task CreateSmartPlaylist()
+    {
+        await _sidebar.CreateSmartPlaylistAsync();
+    }
+
+    [RelayCommand]
+    private async Task ImportPlaylist()
+    {
+        await MetadataHelper.OpenPlaylistImportDialog();
+    }
+
+    /// <summary>New ▸ Playlist from a Genre or Artist: all its songs, or a mix.</summary>
+    [RelayCommand]
+    private Task QuickPlaylist() => MetadataHelper.OpenQuickPlaylistDialog();
+
+    [RelayCommand]
+    private async Task ExportPlaylist(PlaylistNavItem item)
+    {
+        var playlist = ResolvePlaylist(item);
+        if (playlist == null) return;
+        var tracks = ResolvePlaylistTracks(playlist);
+        if (tracks.Count == 0) return;
+
+        if (Application.Current?.ApplicationLifetime is not IClassicDesktopStyleApplicationLifetime desktop
+            || desktop.MainWindow == null) return;
+        var topLevel = TopLevel.GetTopLevel(desktop.MainWindow);
+        if (topLevel == null) return;
+
+        var file = await topLevel.StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
+        {
+            Title = "Export Playlist",
+            SuggestedFileName = SanitizeFileName(playlist.Name),
+            DefaultExtension = "m3u8",
+            FileTypeChoices = new[]
+            {
+                new FilePickerFileType("M3U playlist") { Patterns = new[] { "*.m3u8", "*.m3u" } }
+            }
+        });
+        if (file == null) return;
+
+        var path = file.TryGetLocalPath();
+        if (string.IsNullOrEmpty(path)) return;
+
+        var interop = App.Services!.GetRequiredService<IPlaylistInteropService>();
+        try
+        {
+            await interop.ExportM3uAsync(path, tracks);
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.Error(DebugLogger.Category.State, "Playlist.Export", ex.Message);
+        }
+    }
+
+    private static string SanitizeFileName(string name)
+    {
+        foreach (var c in Path.GetInvalidFileNameChars())
+            name = name.Replace(c, '_');
+        return string.IsNullOrWhiteSpace(name) ? "Playlist" : name.Trim();
+    }
+
+    [RelayCommand]
+    private async Task DeletePlaylist(PlaylistNavItem item)
+    {
+        if (item.PlaylistId == null) return;
+        var confirmed = await Views.ConfirmationDialog.ShowAsync($"Are you sure you want to delete \"{item.Label}\"? This cannot be undone.");
+        if (!confirmed) return;
+        await _sidebar.DeletePlaylistAsync(item.PlaylistId.Value);
+        OnPropertyChanged(nameof(Playlists));
+        ApplyFilter(_currentFilter);
+    }
+
+    [RelayCommand]
+    private async Task SetCoverArt(PlaylistNavItem item)
+    {
+        var playlist = ResolvePlaylist(item);
+        if (playlist == null) return;
+
+        if (Application.Current?.ApplicationLifetime is not IClassicDesktopStyleApplicationLifetime desktop
+            || desktop.MainWindow == null) return;
+
+        var topLevel = TopLevel.GetTopLevel(desktop.MainWindow);
+        if (topLevel == null) return;
+
+        var files = await topLevel.StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
+        {
+            Title = "Select Cover Art",
+            AllowMultiple = false,
+            FileTypeFilter = new[]
+            {
+                new FilePickerFileType("Images") { Patterns = new[] { "*.jpg", "*.jpeg", "*.png" } }
+            }
+        });
+
+        if (files.Count == 0) return;
+
+        // Wrapped: this is an [RelayCommand] async Task, so the generated
+        // AsyncRelayCommand rethrows on the sync context — a locked or read-only
+        // destination, a full disk, or a source on a disconnected network share
+        // terminated the app. (The sibling ExportPlaylist already guards its IO.)
+        try
+        {
+            // Copy to app data covers directory
+            var coversDir = Path.Combine(Helpers.AppPaths.DataRoot, "playlist_covers");
+            Directory.CreateDirectory(coversDir);
+
+            var ext = Path.GetExtension(files[0].Name);
+            var destPath = Path.Combine(coversDir, $"{playlist.Id}{ext}");
+
+            // Drop any previous cover with a different extension — replacing a .png with
+            // a .jpg wrote the new file and orphaned the old one forever, since
+            // RemoveCoverArt only deletes the path currently recorded.
+            foreach (var stale in Directory.EnumerateFiles(coversDir, $"{playlist.Id}.*"))
+            {
+                if (!string.Equals(stale, destPath, StringComparison.OrdinalIgnoreCase))
+                    try { File.Delete(stale); } catch { }
+            }
+
+            await using (var srcStream = await files[0].OpenReadAsync())
+            await using (var destStream = File.Create(destPath))
+            {
+                await srcStream.CopyToAsync(destStream);
+            }
+
+            playlist.CoverArtPath = destPath;
+            playlist.ModifiedAt = DateTime.UtcNow;
+            await _persistence.SavePlaylistsAsync(_sidebar.Playlists.ToList());
+            ApplyFilter(_currentFilter);
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.Error(DebugLogger.Category.UI, "Playlist.SetCoverArt", ex.Message);
+            DebugLog.Write("Playlists", $"Could not set cover art: {ex.Message}");
+        }
+    }
+
+    [RelayCommand]
+    private async Task RemoveCoverArt(PlaylistNavItem item)
+    {
+        var playlist = ResolvePlaylist(item);
+        if (playlist == null) return;
+        if (string.IsNullOrEmpty(playlist.CoverArtPath)) return;
+
+        // Delete the file if it exists in our covers directory
+        if (File.Exists(playlist.CoverArtPath))
+        {
+            try { File.Delete(playlist.CoverArtPath); } catch { /* non-fatal */ }
+        }
+
+        playlist.CoverArtPath = null;
+        playlist.ModifiedAt = DateTime.UtcNow;
+        await _persistence.SavePlaylistsAsync(_sidebar.Playlists.ToList());
+        ApplyFilter(_currentFilter);
+    }
+}

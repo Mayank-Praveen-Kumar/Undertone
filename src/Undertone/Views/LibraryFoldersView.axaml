@@ -1,0 +1,275 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:loc="using:Undertone.Localization"
+             xmlns:vm="using:Undertone.ViewModels"
+             xmlns:m="using:Undertone.Models"
+             xmlns:controls="using:Undertone.Controls"
+             xmlns:helpers="using:Undertone.Helpers"
+             x:Class="Undertone.Views.LibraryFoldersView"
+             x:DataType="vm:LibraryFoldersViewModel"
+             Background="{DynamicResource AppMainBackground}">
+
+    <UserControl.Styles>
+        <!-- Pill-shaped selection/hover highlight on folder tree rows, matching the
+             rounded highlights used in the Songs options menus. -->
+        <Style Selector="TreeViewItem">
+            <Setter Property="CornerRadius" Value="999" />
+        </Style>
+        <Style Selector="TreeViewItem /template/ Border#PART_LayoutRoot">
+            <Setter Property="CornerRadius" Value="999" />
+        </Style>
+        <!-- Expansion lives on the FolderNode model so it survives navigating
+             away and back (TreeViewItem containers are recreated each visit). -->
+        <Style Selector="TreeViewItem" x:DataType="m:FolderNode">
+            <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+            <!-- Screen readers read the row as "Bruno Mars, 172 songs" (empty otherwise). -->
+            <Setter Property="AutomationProperties.Name" Value="{Binding Converter={x:Static helpers:AccessibleNames.ItemName}}" />
+        </Style>
+        <!-- Expand/collapse chevron: the sidebar folders' stroked arrow, one right-pointing
+             glyph that FoldingTreeViewItem turns 0-90deg with the fold (Fluent swaps two
+             filled glyphs, which can't turn). Drawn symmetric about the 12px box's centre
+             (x 3.5-8.5, y 1-11), so it sits on the row's centre line and turns in place. -->
+        <Style Selector="TreeViewItem /template/ ToggleButton#PART_ExpandCollapseChevron">
+            <Setter Property="Template">
+                <ControlTemplate>
+                    <Border Background="Transparent">
+                        <Path Data="M 3.5,1 L 8.5,6 L 3.5,11"
+                              Stroke="{TemplateBinding Foreground}"
+                              StrokeThickness="1.8"
+                              StrokeLineCap="Round"
+                              StrokeJoin="Round"
+                              Opacity="0.8" />
+                    </Border>
+                </ControlTemplate>
+            </Setter>
+        </Style>
+        <Style Selector="StackPanel.hidden-folder">
+            <Setter Property="Opacity" Value="0.45" />
+        </Style>
+        <!-- Row background moves off the ListBoxItem onto the inner row-body Border so
+             the hover box and the now-playing box are one element and cannot drift apart.
+             The ListBoxItem keeps its hit-testing and layout role but paints nothing. Same
+             pattern as AlbumDetailView / PlaylistView. This view has no ctrl-select, so it
+             needs no ctrl-selected neutralisers. -->
+        <Style Selector="ListBox.track-list ListBoxItem">
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem:nth-child(2n)">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem:pointerover">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem:nth-child(2n):pointerover">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem:selected">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem:nth-child(2n):selected">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+
+        <!-- Row body: carries stripe, hover and the now-playing fill on one rectangle.
+             CornerRadius 10 keeps this view's rows as pills (not the track-list's default
+             4px). -->
+        <Style Selector="Border.row-body">
+            <Setter Property="Padding" Value="0,8,8,8" />
+            <Setter Property="CornerRadius" Value="10" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Transitions">
+                <Transitions>
+                    <BrushTransition Property="Background" Duration="0:0:0.04" />
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem:nth-child(2n) Border.row-body">
+            <Setter Property="Background" Value="{DynamicResource TrackListStripeBrush}" />
+        </Style>
+        <Style Selector="Border.row-body:pointerover">
+            <Setter Property="Background" Value="{DynamicResource TrackListHoverBrush}" />
+        </Style>
+        <!-- MUST stay last: equal-origin Avalonia styles resolve by declaration order, so
+             this is what makes the box win on striped and hovered rows alike. -->
+        <!-- Snap onto/off the fill; see AlbumDetailView (white flicker on dark accents).
+             Transitions must stay the first setter. -->
+        <Style Selector="Border.row-body.now-playing">
+            <Setter Property="Transitions">
+                <Transitions />
+            </Setter>
+            <Setter Property="Background" Value="{DynamicResource NowPlayingRowBrush}" />
+        </Style>
+    </UserControl.Styles>
+
+    <!-- Right margin trimmed to 2 so the content list's vertical scrollbar sits at the window edge. -->
+    <Grid ColumnDefinitions="280,*" Margin="16,8,2,16">
+
+        <!-- Folder tree -->
+        <Border Grid.Column="0"
+                Padding="8"
+                Background="{DynamicResource AppSidebarBackground}"
+                CornerRadius="8">
+            <!-- AutoScrollToSelectedItem off: rows are wider than the pane (long folder
+                 names), so the default scroll-into-view on click yanked the horizontal
+                 scrollbar to the right. The clicked row is already visible anyway. -->
+            <!-- FoldingTreeView: folders fold open and shut like the sidebar's playlist
+                 folders instead of snapping. -->
+            <controls:FoldingTreeView x:Name="FolderTree"
+                      ItemsSource="{Binding RootNodes}"
+                      SelectedItem="{Binding SelectedNode, Mode=TwoWay}"
+                      AutoScrollToSelectedItem="False">
+                <TreeView.ItemTemplate>
+                    <TreeDataTemplate x:DataType="m:FolderNode" ItemsSource="{Binding Children}">
+                        <!-- Hidden from Library (right-click menu): dimmed, and the folder the
+                             user hid carries a "Hidden" tag so it is easy to find again. -->
+                        <StackPanel Orientation="Horizontal" Spacing="6"
+                                    Classes.hidden-folder="{Binding IsInHiddenFolder}">
+                            <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" />
+                            <TextBlock Text="{Binding TotalTrackCount, StringFormat='({0})'}" Opacity="0.6" />
+                            <TextBlock Text="{loc:T LibraryFolders.HiddenTag}"
+                                       FontSize="11"
+                                       Opacity="0.8"
+                                       VerticalAlignment="Center"
+                                       IsVisible="{Binding IsHiddenFromLibrary}" />
+                        </StackPanel>
+                    </TreeDataTemplate>
+                </TreeView.ItemTemplate>
+            </controls:FoldingTreeView>
+        </Border>
+
+        <!-- Right pane: header + track list -->
+        <DockPanel Grid.Column="1" Margin="16,0,0,0">
+            <!-- Header: selected folder name + items/size summary. The Play / Shuffle /
+                 Manage Folders actions live in the top bar's right cluster. -->
+            <StackPanel DockPanel.Dock="Top"
+                        Orientation="Horizontal"
+                        Spacing="8"
+                        Margin="4,0,0,10">
+                <TextBlock Text="{Binding SelectedNode.DisplayName, FallbackValue='Select a folder'}"
+                           VerticalAlignment="Center"
+                           TextTrimming="CharacterEllipsis"
+                           MaxWidth="480"
+                           FontSize="14"
+                           FontWeight="SemiBold" />
+                <TextBlock Text="·"
+                           VerticalAlignment="Center"
+                           Opacity="0.4"
+                           IsVisible="{Binding FolderSummaryText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                <TextBlock Text="{Binding FolderSummaryText}"
+                           VerticalAlignment="Center"
+                           FontSize="12"
+                           Opacity="0.55"
+                           IsVisible="{Binding FolderSummaryText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                <TextBlock Text="{loc:T LibraryFolders.HiddenFolderNote}"
+                           VerticalAlignment="Center"
+                           FontSize="12"
+                           Opacity="0.55"
+                           IsVisible="{Binding SelectedNode.IsInHiddenFolder, FallbackValue=False}" />
+            </StackPanel>
+
+            <ListBox x:Name="TrackList"
+                     Classes="track-list"
+                     ItemsSource="{Binding SelectedFolderTracks}"
+                     SelectionMode="Multiple"
+                     Padding="0,0,0,115">
+                <ListBox.ItemTemplate>
+                    <DataTemplate x:DataType="m:Track">
+                        <Border Classes="row-body" Classes.now-playing="{Binding IsNowPlaying}">
+                            <!-- Number column is wide enough for 4-digit row numbers;
+                                 a large folder (100s–1000s of tracks) previously clipped them. -->
+                            <!-- Same drag start as the Songs page, so a row can be dropped on a
+                                 sidebar playlist (Discord, Luwi 09-21: "Drag & Drop doesn't work
+                                 from within Folder view"). Transparent background = hit-testable. -->
+                            <Grid ColumnDefinitions="48,*,Auto,64"
+                                  Background="Transparent"
+                                  helpers:DragFileBehavior.EnableFileDrag="True">
+
+                                <!-- Row number, swapped for the animated EQ on the playing track.
+                                     EQ is centered over the digit column; numbers use tabular
+                                     figures so every digit has equal width and stays in line. -->
+                                <Panel Grid.Column="0"
+                                       VerticalAlignment="Center">
+                                    <!-- Only visible on the now-playing row, so the bars take the row
+                                         foreground from Styles.axaml. No local Foreground here: a
+                                         local value beats every style setter and would pin the bars
+                                         to one colour regardless of the accent. -->
+                                    <controls:EqVisualizer Width="34" Height="22"
+                                                           HorizontalAlignment="Center"
+                                                           VerticalAlignment="Center"
+                                                           IsVisible="{Binding IsNowPlaying}"
+                                                           IsPlaying="{Binding $parent[UserControl].((vm:LibraryFoldersViewModel)DataContext).Player.IsPlaying, Mode=OneWay}" />
+                                    <TextBlock Text="{Binding RowNumber}"
+                                               Opacity="0.5"
+                                               FontSize="14"
+                                               FontFeatures="+tnum"
+                                               HorizontalAlignment="Right"
+                                               VerticalAlignment="Center"
+                                               Margin="0,0,10,0"
+                                               IsVisible="{Binding !IsNowPlaying}" />
+                                </Panel>
+
+                                <!-- Title + explicit badge (title truncates; full text on hover).
+                                     Title is a link — clicking it opens the track's album detail page. -->
+                                <Grid Grid.Column="1"
+                                      ColumnDefinitions="Auto,Auto"
+                                      ClipToBounds="True"
+                                      HorizontalAlignment="Left"
+                                      VerticalAlignment="Center">
+                                    <Button Grid.Column="0"
+                                            Background="Transparent" BorderThickness="0" Padding="0" MinHeight="0"
+                                            Cursor="Hand" HorizontalAlignment="Left" VerticalAlignment="Center"
+                                            Command="{Binding $parent[UserControl].((vm:LibraryFoldersViewModel)DataContext).ViewAlbumCommand}"
+                                            CommandParameter="{Binding}">
+                                        <TextBlock Classes="one-line-explicit-title"
+                                                   Text="{Binding TitleDisplay}"
+                                                   TextTrimming="CharacterEllipsis"
+                                                   MaxWidth="520"
+                                                   VerticalAlignment="Center"
+                                                   ToolTip.Tip="{Binding TitleDisplay}" />
+                                    </Button>
+                                    <Border Grid.Column="1"
+                                            Classes="explicit-badge compact"
+                                            Margin="6,0,0,0"
+                                            VerticalAlignment="Center"
+                                            IsVisible="{Binding IsExplicit}"
+                                            ToolTip.Tip="{loc:T LibraryFolders.ExplicitTip}">
+                                        <TextBlock Text="E"
+                                                   Classes="explicit-badge-text compact"
+                                                   FontSize="8"
+                                                   Opacity="0.9" />
+                                    </Border>
+                                </Grid>
+
+                                <!-- Artist is a link — clicking it opens the artist's discography page.
+                                     Right-aligned with the dim duration at the row's far edge. -->
+                                <Button Grid.Column="2"
+                                        Background="Transparent" BorderThickness="0" Padding="0" MinHeight="0"
+                                        Cursor="Hand" HorizontalAlignment="Right" VerticalAlignment="Center"
+                                        Margin="16,0,0,0"
+                                        helpers:ArtistCreditLink.IsEnabled="True"
+                                        Command="{Binding $parent[UserControl].((vm:LibraryFoldersViewModel)DataContext).ViewArtistCommand}"
+                                        CommandParameter="{Binding Artist}">
+                                    <TextBlock Text="{Binding ArtistDisplay}"
+                                               VerticalAlignment="Center"
+                                               Opacity="0.7"
+                                               TextTrimming="CharacterEllipsis"
+                                               MaxLines="1"
+                                               MaxWidth="440"
+                                               ToolTip.Tip="{Binding ArtistDisplay}" />
+                                </Button>
+                                <TextBlock Grid.Column="3"
+                                           Text="{Binding DurationFormatted}"
+                                           VerticalAlignment="Center"
+                                           HorizontalAlignment="Right"
+                                           FontFeatures="+tnum"
+                                           Opacity="0.5"
+                                           Margin="0,0,10,0" />
+                            </Grid>
+                        </Border>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+        </DockPanel>
+    </Grid>
+</UserControl>

@@ -1,0 +1,2102 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:loc="using:Undertone.Localization"
+        xmlns:vm="using:Undertone.ViewModels"
+        xmlns:m="using:Undertone.Models"
+        xmlns:views="using:Undertone.Views"
+        xmlns:controls="using:Undertone.Controls"
+        xmlns:conv="using:Undertone.Converters"
+        xmlns:helpers="using:Undertone.Helpers"
+        x:Class="Undertone.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Title="{loc:T Main.Undertone}"
+        Icon="avares://Undertone.UI/Assets/Icons/Undertone.ico"
+        Width="1280" Height="800"
+        MinWidth="780" MinHeight="500"
+        WindowStartupLocation="CenterScreen"
+        Background="{DynamicResource AppWindowBackgroundBrush}"
+        DragDrop.AllowDrop="True">
+
+    <Window.Resources>
+        <!-- Ticks the active entry in the Songs sort menu: one bound field
+             (PageSortColumn) decides which of a dozen items shows its checkmark. -->
+        <conv:StringEqualsConverter x:Key="StringEquals" />
+        <!-- The Settings card growing to fit a plugin's own view and back: the Plugins page's
+             motion (SettingsView PluginPageEase, its 0.28 s slide). -->
+        <helpers:CubicBezierEase x:Key="SettingsCardResizeEase">
+            <x:Arguments>
+                <x:Double>0.2</x:Double>
+                <x:Double>0.9</x:Double>
+                <x:Double>0.3</x:Double>
+                <x:Double>1</x:Double>
+            </x:Arguments>
+        </helpers:CubicBezierEase>
+    </Window.Resources>
+
+    <!-- Keyboard shortcuts are dispatched in code-behind through ShortcutService
+         (Settings › Shortcuts makes them rebindable); nothing is hardcoded here. -->
+
+    <Window.Styles>
+        <!-- Ghost buttons inside the translucent page-actions pill (Songs top bar):
+             muted icons that brighten with a chip-hover highlight on pointerover. -->
+        <Style Selector="Button.ghost-btn">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Foreground" Value="{DynamicResource SystemControlForegroundBaseHighBrush}"/>
+            <Setter Property="Opacity" Value="0.65"/>
+            <Setter Property="Transitions">
+                <Transitions>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.12"/>
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Button.ghost-btn:pointerover">
+            <Setter Property="Opacity" Value="1"/>
+        </Style>
+        <Style Selector="Button.ghost-btn:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="{DynamicResource ChipHoverBackground}"/>
+            <Setter Property="Foreground" Value="{DynamicResource SystemControlForegroundBaseHighBrush}"/>
+        </Style>
+        <Style Selector="Button.ghost-btn:pressed /template/ ContentPresenter">
+            <Setter Property="Background" Value="{DynamicResource ChipHoverBackground}"/>
+            <Setter Property="Foreground" Value="{DynamicResource SystemControlForegroundBaseHighBrush}"/>
+        </Style>
+
+        <!-- Top-right corner (09-13): round 34px icon buttons for filter / sort / view
+             options / view mode, an accent dot on one that is away from its default, and
+             the section's one primary action as a red pill with its word. -->
+        <Style Selector="Button.corner-icon">
+            <Setter Property="Width" Value="34"/>
+            <Setter Property="Height" Value="34"/>
+            <Setter Property="CornerRadius" Value="17"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Background" Value="{DynamicResource ChipBackground}"/>
+            <Setter Property="Foreground" Value="{DynamicResource SystemControlForegroundBaseHighBrush}"/>
+            <Setter Property="HorizontalContentAlignment" Value="Center"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+            <Setter Property="Cursor" Value="Hand"/>
+        </Style>
+        <Style Selector="Button.corner-icon > PathIcon">
+            <Setter Property="Width" Value="15"/>
+            <Setter Property="Height" Value="15"/>
+            <Setter Property="Opacity" Value="0.85"/>
+        </Style>
+        <Style Selector="Button.corner-icon:pointerover > PathIcon">
+            <Setter Property="Opacity" Value="1"/>
+        </Style>
+        <Style Selector="Button.corner-icon:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="{DynamicResource ChipHoverBackground}"/>
+        </Style>
+        <Style Selector="Button.corner-icon:pressed /template/ ContentPresenter">
+            <Setter Property="Background" Value="{DynamicResource ChipHoverBackground}"/>
+        </Style>
+        <Style Selector="Border.corner-dot">
+            <Setter Property="Width" Value="9"/>
+            <Setter Property="Height" Value="9"/>
+            <Setter Property="CornerRadius" Value="4.5"/>
+            <Setter Property="Background" Value="{DynamicResource AccentColorBrush}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource AppMainBackground}"/>
+            <Setter Property="BorderThickness" Value="1.5"/>
+            <Setter Property="HorizontalAlignment" Value="Right"/>
+            <Setter Property="VerticalAlignment" Value="Top"/>
+            <Setter Property="Margin" Value="0,-1,-1,0"/>
+            <Setter Property="IsHitTestVisible" Value="False"/>
+        </Style>
+        <Style Selector="Button.corner-primary">
+            <Setter Property="Padding" Value="14,7"/>
+            <Setter Property="CornerRadius" Value="999"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+            <Setter Property="Cursor" Value="Hand"/>
+        </Style>
+
+        <!-- Queue drawer fill. A style rather than a Background attribute so Liquid Glass can
+             clear it: with glass on the QueueGlass frost under the drawer carries the fill
+             (QueueDrawerGlass adds the "glass" class). -->
+        <Style Selector="Border#QueuePopupPanel">
+            <Setter Property="Background" Value="{DynamicResource QueueDrawerBackground}"/>
+        </Style>
+        <Style Selector="Border#QueuePopupPanel.glass">
+            <Setter Property="Background" Value="Transparent"/>
+        </Style>
+    </Window.Styles>
+
+
+    <Panel Background="Transparent">
+    <!-- Everything the Settings sheet sits over. Its own layer so SettingsScrim can snapshot
+         it (BlurredBackdrop.Target) without catching the scrim or the sheet, also while the
+         sheet is up. Every child keeps its ZIndex order inside it, all under the scrim (99). -->
+    <Panel x:Name="AppContentLayer">
+    <!-- Liquid Glass backdrop (Appearance toggle). Hidden by default so rendering is
+         untouched while the setting is off. When active, code-behind (ApplyLiquidGlass)
+         shows it, sets the window's TransparencyLevelHint and re-tints the material to
+         the active theme's surface color; FallbackColor keeps the window solid on
+         platforms with no compositor/transparency. Sits under all content. -->
+    <ExperimentalAcrylicBorder x:Name="LiquidGlassAcrylic" IsVisible="False" IsHitTestVisible="False">
+        <ExperimentalAcrylicBorder.Material>
+            <ExperimentalAcrylicMaterial BackgroundSource="Digger"
+                                         TintColor="#252525"
+                                         TintOpacity="0.65"
+                                         MaterialOpacity="0.35"
+                                         FallbackColor="#2A2A2A" />
+        </ExperimentalAcrylicBorder.Material>
+    </ExperimentalAcrylicBorder>
+    <!-- Tint Whole Window (Discord 1v1ctus): while a tinted album page is shown, the
+         window around the sidebar and player islands takes the page's colour. A layer, not
+         a swap of AppWindowBackgroundBrush, so the Settings sheet and menus keep theirs. -->
+    <Border x:Name="WindowTintLayer"
+            Background="{Binding WindowTintBrush}"
+            IsVisible="{Binding IsWindowTinted}"
+            IsHitTestVisible="False" />
+    <DockPanel x:Name="RootPanel" Focusable="True" Background="Transparent" Margin="76,0,0,0">
+        <DockPanel.RenderTransform>
+            <TranslateTransform X="0">
+                <TranslateTransform.Transitions>
+                    <Transitions>
+                        <DoubleTransition Property="X" Duration="0:0:0.2">
+                            <DoubleTransition.Easing>
+                                <CubicEaseOut/>
+                            </DoubleTransition.Easing>
+                        </DoubleTransition>
+                    </Transitions>
+                </TranslateTransform.Transitions>
+            </TranslateTransform>
+        </DockPanel.RenderTransform>
+
+        <Grid RowDefinitions="Auto,*">
+            <!-- Zone A: Top bar left | centered playback island | right actions.
+                 Auto-height: collapses on pages where the bar renders nothing
+                 (e.g. Album Detail, whose Back/Search live in the sidebar rail). -->
+            <Grid Grid.Row="0" ColumnDefinitions="*,Auto" ZIndex="20"
+                  IsHitTestVisible="{Binding IsLyricsViewActive, Converter={x:Static BoolConverters.Not}, FallbackValue=True}">
+                <!-- Keeps the former fixed 58px bar height while the lyrics page is
+                     active (its layout predates the collapsing bar). -->
+                <Border Width="0" MinHeight="58" IsVisible="{Binding IsLyricsViewActive}" />
+                <!-- Full-width bottom separator line -->
+                <Border Grid.ColumnSpan="2" VerticalAlignment="Bottom"
+                        Height="1" Background="{DynamicResource SystemControlForegroundBaseHighBrush}"
+                        Opacity="0.08">
+                    <Border.IsVisible>
+                        <MultiBinding Converter="{x:Static BoolConverters.And}">
+                            <Binding Path="!IsLyricsViewActive" />
+                            <Binding Path="TopBar.HasBarContent" />
+                        </MultiBinding>
+                    </Border.IsVisible>
+                </Border>
+                <!-- Left: page title / back button — confined to column 0 so a long title never renders under the right action buttons -->
+                <views:TopBarView Grid.Column="0"
+                                  DataContext="{Binding TopBar}">
+                    <views:TopBarView.IsVisible>
+                        <MultiBinding Converter="{x:Static BoolConverters.And}">
+                            <Binding Path="!$parent[Window].((vm:MainWindowViewModel)DataContext).IsLyricsViewActive" FallbackValue="True" />
+                            <Binding Path="HasBarContent" />
+                        </MultiBinding>
+                    </views:TopBarView.IsVisible>
+                </views:TopBarView>
+
+                <!-- Right: the page's corner controls. One rule for every section (09-13
+                     "icons + popovers" design): filter / sort / view options are round icon
+                     buttons whose popovers hold the same items the labelled pills used to,
+                     an accent dot on an icon means the control is away from its default,
+                     the section's single primary action keeps its words as a red pill, and
+                     the Library / Cover Flow segment is one icon showing the mode you would
+                     switch TO. Order, left to right (11-02, every section): page option
+                     (Folders: Manage Folders) · filter (FilterIcon) · sort (SortIcon) · view
+                     (ViewIcon menu or View Options) · shuffle icon + primary pill · Cover Flow.
+                     Corner width is now the same band on every section. -->
+                <StackPanel x:Name="CornerActions"
+                            Grid.Column="1"
+                            x:DataType="vm:TopBarViewModel"
+                            DataContext="{Binding TopBar}"
+                            Orientation="Horizontal"
+                            Spacing="8"
+                            VerticalAlignment="Center"
+                            Margin="0,0,12,0"
+                            IsVisible="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).IsLyricsViewActive, Converter={x:Static BoolConverters.Not}, FallbackValue=True}">
+
+                    <!-- Artist discography: release-type filter (the grid's own Type dropdown
+                         lives on the Albums section below, gated on the page title). -->
+                    <Panel VerticalAlignment="Center">
+                        <Panel.IsVisible>
+                            <MultiBinding Converter="{x:Static BoolConverters.And}">
+                                <Binding Path="HasReleaseTypeChips"/>
+                                <Binding Path="!IsPageTitleVisible"/>
+                            </MultiBinding>
+                        </Panel.IsVisible>
+                        <Button Classes="corner-icon" AutomationProperties.Name="{loc:T Main.FilterTip}">
+                            <ToolTip.Tip>
+                                <TextBlock><Run Text="{loc:T Main.FilterTip}"/><Run Text=" · "/><Run Text="{Binding ReleaseTypeFilterLabel}"/></TextBlock>
+                            </ToolTip.Tip>
+                            <PathIcon Data="{StaticResource FilterIcon}"/>
+                            <Button.Flyout>
+                                <MenuFlyout Placement="BottomEdgeAlignedRight"
+                                            helpers:MenuOpenAnimation.EnableFlyoutClose="True">
+                                    <MenuItem Header="{loc:T Main.All}" Command="{Binding ReleaseTypeFilterCommand}" CommandParameter="all">
+                                        <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ReleaseTypeFilterLabel, Converter={StaticResource StringEquals}, ConverterParameter=All}"/></MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T Main.Albums}" Command="{Binding ReleaseTypeFilterCommand}" CommandParameter="album">
+                                        <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ReleaseTypeFilterLabel, Converter={StaticResource StringEquals}, ConverterParameter=Albums}"/></MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T Main.Singles}" Command="{Binding ReleaseTypeFilterCommand}" CommandParameter="single">
+                                        <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ReleaseTypeFilterLabel, Converter={StaticResource StringEquals}, ConverterParameter=Singles}"/></MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T Main.EPs}" Command="{Binding ReleaseTypeFilterCommand}" CommandParameter="ep">
+                                        <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ReleaseTypeFilterLabel, Converter={StaticResource StringEquals}, ConverterParameter=EPs}"/></MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T Main.LiveAlbums}" Command="{Binding ReleaseTypeFilterCommand}" CommandParameter="live">
+                                        <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ReleaseTypeFilterLabel, Converter={StaticResource StringEquals}, ConverterParameter='Live Albums'}"/></MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T Main.Compilations}" Command="{Binding ReleaseTypeFilterCommand}" CommandParameter="compilation">
+                                        <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ReleaseTypeFilterLabel, Converter={StaticResource StringEquals}, ConverterParameter=Compilations}"/></MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T Main.Other}" Command="{Binding ReleaseTypeFilterCommand}" CommandParameter="other">
+                                        <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ReleaseTypeFilterLabel, Converter={StaticResource StringEquals}, ConverterParameter=Other}"/></MenuItem.Icon>
+                                    </MenuItem>
+                                </MenuFlyout>
+                            </Button.Flyout>
+                        </Button>
+                        <Border Classes="corner-dot" IsVisible="{Binding IsReleaseTypeFiltered}"/>
+                    </Panel>
+
+                    <!-- Albums grid: one filter popover (type + quality) and one sort popover. -->
+                    <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                        <StackPanel.IsVisible>
+                            <MultiBinding Converter="{x:Static BoolConverters.And}">
+                                <Binding Path="HasReleaseTypeChips"/>
+                                <Binding Path="IsPageTitleVisible"/>
+                            </MultiBinding>
+                        </StackPanel.IsVisible>
+
+                        <Panel VerticalAlignment="Center">
+                            <Button Classes="corner-icon" AutomationProperties.Name="{loc:T Main.FilterTip}">
+                                <ToolTip.Tip>
+                                    <TextBlock><Run Text="{loc:T Main.FilterTip}"/><Run Text=" · "/><Run Text="{Binding ReleaseTypeFilterLabel}"/><Run Text=" · "/><Run Text="{Binding QualityFilterLabel}"/></TextBlock>
+                                </ToolTip.Tip>
+                                <PathIcon Data="{StaticResource FilterIcon}"/>
+                                <Button.Flyout>
+                                    <MenuFlyout Placement="BottomEdgeAlignedRight"
+                                                helpers:MenuOpenAnimation.EnableFlyoutClose="True">
+                                        <MenuItem Header="{loc:T Main.All}" Command="{Binding ReleaseTypeFilterCommand}" CommandParameter="all">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ReleaseTypeFilterLabel, Converter={StaticResource StringEquals}, ConverterParameter=All}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Albums}" Command="{Binding ReleaseTypeFilterCommand}" CommandParameter="album">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ReleaseTypeFilterLabel, Converter={StaticResource StringEquals}, ConverterParameter=Albums}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Singles}" Command="{Binding ReleaseTypeFilterCommand}" CommandParameter="single">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ReleaseTypeFilterLabel, Converter={StaticResource StringEquals}, ConverterParameter=Singles}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.EPs}" Command="{Binding ReleaseTypeFilterCommand}" CommandParameter="ep">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ReleaseTypeFilterLabel, Converter={StaticResource StringEquals}, ConverterParameter=EPs}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.LiveAlbums}" Command="{Binding ReleaseTypeFilterCommand}" CommandParameter="live">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ReleaseTypeFilterLabel, Converter={StaticResource StringEquals}, ConverterParameter='Live Albums'}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Compilations}" Command="{Binding ReleaseTypeFilterCommand}" CommandParameter="compilation">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ReleaseTypeFilterLabel, Converter={StaticResource StringEquals}, ConverterParameter=Compilations}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Other}" Command="{Binding ReleaseTypeFilterCommand}" CommandParameter="other">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ReleaseTypeFilterLabel, Converter={StaticResource StringEquals}, ConverterParameter=Other}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <Separator/>
+                                        <MenuItem Header="{loc:T Main.All}" Command="{Binding QualityFilterCommand}" CommandParameter="all">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding AlbumQualityAll}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Lossless}" Command="{Binding QualityFilterCommand}" CommandParameter="lossless">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding AlbumQualityLossless}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.HiRes}" Command="{Binding QualityFilterCommand}" CommandParameter="hires">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding AlbumQualityHiRes}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                    </MenuFlyout>
+                                </Button.Flyout>
+                            </Button>
+                            <Border Classes="corner-dot" IsVisible="{Binding IsAlbumFilterActive}"/>
+                        </Panel>
+
+                        <Panel VerticalAlignment="Center">
+                            <Button Classes="corner-icon" AutomationProperties.Name="{loc:T Main.Sort}">
+                                <ToolTip.Tip>
+                                    <TextBlock><Run Text="{loc:T Main.Sort}"/><Run Text=" "/><Run Text="{Binding AlbumSortLabel}"/></TextBlock>
+                                </ToolTip.Tip>
+                                <PathIcon Data="{StaticResource SortIcon}"/>
+                                <Button.Flyout>
+                                    <MenuFlyout Placement="BottomEdgeAlignedRight"
+                                                helpers:MenuOpenAnimation.EnableFlyoutClose="True">
+                                        <MenuItem Header="{loc:T Main.Default}" Command="{Binding AlbumSortCommand}" CommandParameter="default">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding AlbumSortMode, Converter={StaticResource StringEquals}, ConverterParameter=default}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.TitleZ}" Command="{Binding AlbumSortCommand}" CommandParameter="title">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding AlbumSortMode, Converter={StaticResource StringEquals}, ConverterParameter=title}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.AlbumArtist}" Command="{Binding AlbumSortCommand}" CommandParameter="albumartist">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding AlbumSortMode, Converter={StaticResource StringEquals}, ConverterParameter=albumartist}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Year}" Command="{Binding AlbumSortCommand}" CommandParameter="year">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding AlbumSortMode, Converter={StaticResource StringEquals}, ConverterParameter=year}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.RecentlyAdded}" Command="{Binding AlbumSortCommand}" CommandParameter="dateadded">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding AlbumSortMode, Converter={StaticResource StringEquals}, ConverterParameter=dateadded}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.DateModified}" Command="{Binding AlbumSortCommand}" CommandParameter="datemodified">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding AlbumSortMode, Converter={StaticResource StringEquals}, ConverterParameter=datemodified}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.MostPlayed}" Command="{Binding AlbumSortCommand}" CommandParameter="mostplayed">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding AlbumSortMode, Converter={StaticResource StringEquals}, ConverterParameter=mostplayed}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <!-- Re-picking Random deals a new shuffle (issue #45). -->
+                                        <MenuItem Header="{loc:T Main.Random}" Command="{Binding AlbumSortCommand}" CommandParameter="random">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding AlbumSortMode, Converter={StaticResource StringEquals}, ConverterParameter=random}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <Separator />
+                                        <!-- Direction is meaningless for "Default", which floats
+                                             recent imports rather than ordering by one key. -->
+                                        <MenuItem Header="{loc:T Main.Ascending}" Command="{Binding AlbumSortCommand}" CommandParameter="ascending" IsEnabled="{Binding AlbumSortDirectionEnabled}">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding AlbumSortAscending}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Descending}" Command="{Binding AlbumSortCommand}" CommandParameter="descending" IsEnabled="{Binding AlbumSortDirectionEnabled}">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding AlbumSortDescending}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <Separator />
+                                        <!-- GitHub #106: each artist's releases newest first under Album Artist. -->
+                                        <MenuItem Header="{loc:T Main.NewestAlbumsFirst}" Command="{Binding AlbumSortCommand}" CommandParameter="newestfirst" IsEnabled="{Binding AlbumSortNewestFirstEnabled}">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding AlbumSortNewestFirst}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                    </MenuFlyout>
+                                </Button.Flyout>
+                            </Button>
+                            <Border Classes="corner-dot" IsVisible="{Binding IsAlbumSortActive}"/>
+                        </Panel>
+
+                        <!-- View (GitHub #149): grid or album carousel, and the carousel's case
+                             style. The shared View glyph, like every page's view control. Gone with the Album
+                             Carousel built-in feature: the grid is then the only layout. -->
+                        <Button Classes="corner-icon" AutomationProperties.Name="{loc:T Main.AlbumView}"
+                                ToolTip.Tip="{loc:T Main.AlbumView}"
+                                IsVisible="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Settings.AlbumCarouselEnabled, FallbackValue=True}">
+                            <PathIcon Data="{StaticResource ViewIcon}"/>
+                            <Button.Flyout>
+                                <MenuFlyout Placement="BottomEdgeAlignedRight"
+                                            helpers:MenuOpenAnimation.EnableFlyoutClose="True">
+                                    <MenuItem Header="{loc:T Main.AlbumGrid}" Command="{Binding AlbumViewCommand}" CommandParameter="grid">
+                                        <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding !IsAlbumCarouselView}"/></MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T Main.AlbumCarousel}" Command="{Binding AlbumViewCommand}" CommandParameter="carousel">
+                                        <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding IsAlbumCarouselView}"/></MenuItem.Icon>
+                                    </MenuItem>
+                                    <Separator/>
+                                    <MenuItem Header="{loc:T Main.CarouselCover}" Command="{Binding AlbumCarouselStyleCommand}" CommandParameter="Cover">
+                                        <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding AlbumCarouselStyle, Converter={StaticResource StringEquals}, ConverterParameter=Cover}"/></MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T Main.CarouselJewelCase}" Command="{Binding AlbumCarouselStyleCommand}" CommandParameter="JewelCase">
+                                        <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding AlbumCarouselStyle, Converter={StaticResource StringEquals}, ConverterParameter=JewelCase}"/></MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T Main.CarouselVinyl}" Command="{Binding AlbumCarouselStyleCommand}" CommandParameter="Vinyl">
+                                        <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding AlbumCarouselStyle, Converter={StaticResource StringEquals}, ConverterParameter=Vinyl}"/></MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T Main.CarouselCassette}" Command="{Binding AlbumCarouselStyleCommand}" CommandParameter="Cassette">
+                                        <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding AlbumCarouselStyle, Converter={StaticResource StringEquals}, ConverterParameter=Cassette}"/></MenuItem.Icon>
+                                    </MenuItem>
+                                    <!-- GitHub #164: the top-right icon is the album carousel here, so the
+                                         queue's Cover Flow is reached from this menu on Albums. -->
+                                    <Separator/>
+                                    <MenuItem Header="{loc:T Main.NowPlayingCoverFlow}" Command="{Binding SetCoverFlowModeCommand}"/>
+                                </MenuFlyout>
+                            </Button.Flyout>
+                        </Button>
+                    </StackPanel>
+
+                    <!-- Songs (and any page with page actions): filter · sort · view options ·
+                         Shuffle. The quality items only appear on the Songs page itself. -->
+                    <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center"
+                                IsVisible="{Binding PageActionsVisible}">
+                        <Panel VerticalAlignment="Center">
+                            <Button Classes="corner-icon" AutomationProperties.Name="{loc:T Main.FilterTip}" ToolTip.Tip="{loc:T Main.FilterTip}">
+                                <PathIcon Data="{StaticResource FilterIcon}"/>
+                                <Button.Flyout>
+                                    <MenuFlyout Placement="BottomEdgeAlignedRight"
+                                                PlacementConstraintAdjustment="None"
+                                                helpers:MenuOpenAnimation.EnableFlyoutClose="True">
+                                        <MenuItem Header="{loc:T Main.AllSongs}" Command="{Binding PageSetShowAllItemsCommand}">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageShowAllItems}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.OnlyFavorites}" Command="{Binding PageSetShowOnlyFavoritesCommand}">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageShowOnlyFavorites}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <Separator IsVisible="{Binding SongsFiltersVisible}"/>
+                                        <MenuItem Header="{loc:T Main.All}" Command="{Binding SongsQualityCommand}" CommandParameter="All" IsVisible="{Binding SongsFiltersVisible}">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding SongsQualityAll}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Lossless}" Command="{Binding SongsQualityCommand}" CommandParameter="Lossless" IsVisible="{Binding SongsFiltersVisible}">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding SongsQualityLossless}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.HiRes}" Command="{Binding SongsQualityCommand}" CommandParameter="HiRes" IsVisible="{Binding SongsFiltersVisible}">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding SongsQualityHiRes}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                    </MenuFlyout>
+                                </Button.Flyout>
+                            </Button>
+                            <Border Classes="corner-dot" IsVisible="{Binding IsSongsFilterActive}"/>
+                        </Panel>
+
+                        <Panel VerticalAlignment="Center">
+                            <Button Classes="corner-icon" AutomationProperties.Name="{loc:T Main.Sort}">
+                                <ToolTip.Tip>
+                                    <TextBlock><Run Text="{loc:T Main.Sort}"/><Run Text=" "/><Run Text="{Binding PageSortColumn}"/></TextBlock>
+                                </ToolTip.Tip>
+                                <PathIcon Data="{StaticResource SortIcon}"/>
+                                <Button.Flyout>
+                                    <MenuFlyout Placement="BottomEdgeAlignedRight"
+                                                PlacementConstraintAdjustment="None"
+                                                helpers:MenuOpenAnimation.EnableFlyoutClose="True">
+                                        <!-- Checkmarks compare each item's key against PageSortColumn,
+                                             so a sort chosen from a column header shows here too. -->
+                                        <MenuItem Header="{loc:T Main.Title}" Command="{Binding PageSortCommand}" CommandParameter="Title">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageSortColumn, Converter={StaticResource StringEquals}, ConverterParameter=Title}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Artist}" Command="{Binding PageSortCommand}" CommandParameter="Artist">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageSortColumn, Converter={StaticResource StringEquals}, ConverterParameter=Artist}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Album}" Command="{Binding PageSortCommand}" CommandParameter="Album">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageSortColumn, Converter={StaticResource StringEquals}, ConverterParameter=Album}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.AlbumByArtist}" Command="{Binding PageSortCommand}" CommandParameter="Album Artist">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageSortColumn, Converter={StaticResource StringEquals}, ConverterParameter='Album Artist'}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Genre}" Command="{Binding PageSortCommand}" CommandParameter="Genre">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageSortColumn, Converter={StaticResource StringEquals}, ConverterParameter=Genre}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Time}" Command="{Binding PageSortCommand}" CommandParameter="Time">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageSortColumn, Converter={StaticResource StringEquals}, ConverterParameter=Time}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Plays}" Command="{Binding PageSortCommand}" CommandParameter="Plays">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageSortColumn, Converter={StaticResource StringEquals}, ConverterParameter=Plays}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Favorite}" Command="{Binding PageSortCommand}" CommandParameter="IsFavorite">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageSortColumn, Converter={StaticResource StringEquals}, ConverterParameter=IsFavorite}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Rating}" Command="{Binding PageSortCommand}" CommandParameter="Rating">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageSortColumn, Converter={StaticResource StringEquals}, ConverterParameter=Rating}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Year}" Command="{Binding PageSortCommand}" CommandParameter="Year">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageSortColumn, Converter={StaticResource StringEquals}, ConverterParameter=Year}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.BPM}" Command="{Binding PageSortCommand}" CommandParameter="Bpm">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageSortColumn, Converter={StaticResource StringEquals}, ConverterParameter=Bpm}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Bitrate}" Command="{Binding PageSortCommand}" CommandParameter="Bitrate">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageSortColumn, Converter={StaticResource StringEquals}, ConverterParameter=Bitrate}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.SampleRate}" Command="{Binding PageSortCommand}" CommandParameter="SampleRate">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageSortColumn, Converter={StaticResource StringEquals}, ConverterParameter=SampleRate}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T LibrarySongs.ReplayGain}" Command="{Binding PageSortCommand}" CommandParameter="ReplayGain">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageSortColumn, Converter={StaticResource StringEquals}, ConverterParameter=ReplayGain}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.DateAdded}" Command="{Binding PageSortCommand}" CommandParameter="Date Added">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageSortColumn, Converter={StaticResource StringEquals}, ConverterParameter='Date Added'}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.DateModified}" Command="{Binding PageSortCommand}" CommandParameter="Date Modified">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageSortColumn, Converter={StaticResource StringEquals}, ConverterParameter='Date Modified'}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <Separator />
+                                        <MenuItem Header="{loc:T Main.Ascending}" Command="{Binding PageSortCommand}" CommandParameter="Ascending">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageSortAscending}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Descending}" Command="{Binding PageSortCommand}" CommandParameter="Descending">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PageSortDescending}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <!-- GitHub #156: shown exactly while the corner dot is, so the dot
+                                             always has a visible way back to the default order. -->
+                                        <Separator IsVisible="{Binding IsSongsSortActive}" />
+                                        <MenuItem Header="{loc:T Main.ResetSortToDateAdded}" Command="{Binding PageSortCommand}" CommandParameter="Reset"
+                                                  IsVisible="{Binding IsSongsSortActive}">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineHistory}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                    </MenuFlyout>
+                                </Button.Flyout>
+                            </Button>
+                            <Border Classes="corner-dot" IsVisible="{Binding IsSongsSortActive}"/>
+                        </Panel>
+
+                        <Button Classes="corner-icon"
+                                Command="{Binding PageViewOptionsCommand}"
+                                AutomationProperties.Name="{loc:T Main.ShowViewOptions}"
+                                ToolTip.Tip="{loc:T Main.ShowViewOptions}">
+                            <PathIcon Data="{StaticResource ViewIcon}"/>
+                        </Button>
+
+                        <Button Classes="accent-btn corner-primary" Background="{DynamicResource AccentButtonBackground}"
+                                Command="{Binding PageShuffleCommand}"
+                                ToolTip.Tip="{loc:T Main.ShuffleTip}">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <PathIcon Data="{StaticResource ShuffleIcon}" Width="13" Height="13"
+                                          Foreground="{DynamicResource AccentForegroundBrush}" VerticalAlignment="Center"/>
+                                <TextBlock Text="{loc:T Main.ShuffleTip}" FontSize="12" FontWeight="SemiBold"
+                                           Foreground="{DynamicResource AccentForegroundBrush}" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
+                    </StackPanel>
+
+                    <!-- Playlists: sort popover + New (primary). -->
+                    <StackPanel Orientation="Horizontal" Spacing="8" IsVisible="{Binding PlaylistActionsVisible}">
+                        <Panel VerticalAlignment="Center">
+                            <Button Classes="corner-icon" AutomationProperties.Name="{loc:T Main.Sort}">
+                                <ToolTip.Tip>
+                                    <TextBlock><Run Text="{loc:T Main.Sort}"/><Run Text=" "/><Run Text="{Binding PlaylistSortLabel}"/></TextBlock>
+                                </ToolTip.Tip>
+                                <PathIcon Data="{StaticResource SortIcon}"/>
+                                <Button.Flyout>
+                                    <MenuFlyout Placement="BottomEdgeAlignedRight"
+                                                helpers:MenuOpenAnimation.EnableFlyoutClose="True">
+                                        <MenuItem Header="{loc:T Main.Default}" Command="{Binding PlaylistSortCommand}" CommandParameter="default">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PlaylistSortMode, Converter={StaticResource StringEquals}, ConverterParameter=default}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Name}" Command="{Binding PlaylistSortCommand}" CommandParameter="name">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PlaylistSortMode, Converter={StaticResource StringEquals}, ConverterParameter=name}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.RecentlyCreated}" Command="{Binding PlaylistSortCommand}" CommandParameter="created">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PlaylistSortMode, Converter={StaticResource StringEquals}, ConverterParameter=created}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.RecentlyModified}" Command="{Binding PlaylistSortCommand}" CommandParameter="modified">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PlaylistSortMode, Converter={StaticResource StringEquals}, ConverterParameter=modified}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.TrackCount}" Command="{Binding PlaylistSortCommand}" CommandParameter="tracks">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PlaylistSortMode, Converter={StaticResource StringEquals}, ConverterParameter=tracks}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                    </MenuFlyout>
+                                </Button.Flyout>
+                            </Button>
+                            <Border Classes="corner-dot" IsVisible="{Binding IsPlaylistSortActive}"/>
+                        </Panel>
+                        <Button Classes="accent-btn corner-primary" Background="{DynamicResource AccentButtonBackground}"
+                                ToolTip.Tip="{loc:T Main.NewPlaylistTip}" VerticalAlignment="Center">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <PathIcon Data="{StaticResource AddIcon}" Width="12" Height="12"
+                                          Foreground="{DynamicResource AccentForegroundBrush}" VerticalAlignment="Center"/>
+                                <TextBlock Text="{loc:T Main.New}" FontSize="12" FontWeight="SemiBold"
+                                           Foreground="{DynamicResource AccentForegroundBrush}"
+                                           VerticalAlignment="Center" />
+                            </StackPanel>
+                            <Button.Flyout>
+                                <MenuFlyout Placement="BottomEdgeAlignedRight"
+                                            helpers:MenuOpenAnimation.EnableFlyoutClose="True">
+                                    <MenuItem Command="{Binding PageCreatePlaylistCommand}">
+                                        <!-- v2 line icons (10-09); New Playlist shares the Create Playlist dialog header's glyph. -->
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon" Data="{DynamicResource LineCreatePlaylist}"/>
+                                        </MenuItem.Icon>
+                                        <MenuItem.Header>
+                                            <StackPanel Margin="0,5" Spacing="2">
+                                                <TextBlock Text="{loc:T Main.NewPlaylistTip}" FontSize="13" FontWeight="SemiBold" />
+                                                <TextBlock Text="{loc:T Main.PickTracksYourself}" FontSize="11" Opacity="0.55" />
+                                            </StackPanel>
+                                        </MenuItem.Header>
+                                    </MenuItem>
+                                    <MenuItem Command="{Binding PageCreateSmartPlaylistCommand}">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineSmartPlaylist}"/>
+                                        </MenuItem.Icon>
+                                        <MenuItem.Header>
+                                            <StackPanel Margin="0,5" Spacing="2">
+                                                <TextBlock Text="{loc:T Main.NewSmartPlaylist}" FontSize="13" FontWeight="SemiBold" />
+                                                <TextBlock Text="{loc:T Main.FillsItselfFromRules}" FontSize="11" Opacity="0.55" />
+                                            </StackPanel>
+                                        </MenuItem.Header>
+                                    </MenuItem>
+                                    <MenuItem Command="{Binding PageQuickPlaylistCommand}">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineRadio}"/>
+                                        </MenuItem.Icon>
+                                        <MenuItem.Header>
+                                            <StackPanel Margin="0,5" Spacing="2">
+                                                <TextBlock Text="{loc:T Main.QuickPlaylist}" FontSize="13" FontWeight="SemiBold" />
+                                                <TextBlock Text="{loc:T Main.QuickPlaylistSub}" FontSize="11" Opacity="0.55" />
+                                            </StackPanel>
+                                        </MenuItem.Header>
+                                    </MenuItem>
+                                    <Separator />
+                                    <MenuItem Command="{Binding PageImportPlaylistCommand}">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineImport}"/>
+                                        </MenuItem.Icon>
+                                        <MenuItem.Header>
+                                            <StackPanel Margin="0,5" Spacing="2">
+                                                <TextBlock Text="{loc:T Main.ImportPlaylist}" FontSize="13" FontWeight="SemiBold" />
+                                                <TextBlock Text="{loc:T Main.FromM3uM3u8File}" FontSize="11" Opacity="0.55" />
+                                            </StackPanel>
+                                        </MenuItem.Header>
+                                    </MenuItem>
+                                </MenuFlyout>
+                            </Button.Flyout>
+                        </Button>
+                    </StackPanel>
+
+                    <!-- Artist discography: shuffle icon + Play (primary). -->
+                    <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center"
+                                IsVisible="{Binding HasArtistActions}">
+                        <Button Classes="corner-icon" Command="{Binding PageShuffleArtistCommand}" ToolTip.Tip="{loc:T Main.ShuffleAllTip}">
+                            <PathIcon Data="{StaticResource ShuffleIcon}"/>
+                        </Button>
+                        <Button Classes="accent-btn corner-primary" Background="{DynamicResource AccentButtonBackground}"
+                                Command="{Binding PagePlayArtistCommand}" ToolTip.Tip="{loc:T Main.PlayAllTip}">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <PathIcon Data="{StaticResource PlayIcon}" Width="12" Height="12"
+                                          Foreground="{DynamicResource AccentForegroundBrush}" VerticalAlignment="Center"/>
+                                <TextBlock Text="{loc:T Main.PlayTip}" FontSize="12" FontWeight="SemiBold"
+                                           Foreground="{DynamicResource AccentForegroundBrush}" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
+                    </StackPanel>
+
+                    <!-- Artists page: sort popover (Name / Songs / Albums / Time / Genre + direction)
+                         and the View menu (Grid / List). Both hide under Cover Flow. -->
+                    <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center"
+                                IsVisible="{Binding ArtistSortVisible}">
+                        <Panel VerticalAlignment="Center">
+                            <Button Classes="corner-icon" AutomationProperties.Name="{loc:T Main.Sort}">
+                                <ToolTip.Tip>
+                                    <TextBlock><Run Text="{loc:T Main.Sort}"/><Run Text=" "/><Run Text="{Binding ArtistSortLabel}"/></TextBlock>
+                                </ToolTip.Tip>
+                                <PathIcon Data="{StaticResource SortIcon}"/>
+                                <Button.Flyout>
+                                    <MenuFlyout Placement="BottomEdgeAlignedRight"
+                                                helpers:MenuOpenAnimation.EnableFlyoutClose="True">
+                                        <MenuItem Header="{loc:T Main.Name}" Command="{Binding ArtistSortCommand}" CommandParameter="name">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ArtistSortMode, Converter={StaticResource StringEquals}, ConverterParameter=name}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.SongCount}" Command="{Binding ArtistSortCommand}" CommandParameter="songs">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ArtistSortMode, Converter={StaticResource StringEquals}, ConverterParameter=songs}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.AlbumCount}" Command="{Binding ArtistSortCommand}" CommandParameter="albums">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ArtistSortMode, Converter={StaticResource StringEquals}, ConverterParameter=albums}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Time}" Command="{Binding ArtistSortCommand}" CommandParameter="time">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ArtistSortMode, Converter={StaticResource StringEquals}, ConverterParameter=time}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Genre}" Command="{Binding ArtistSortCommand}" CommandParameter="genre">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ArtistSortMode, Converter={StaticResource StringEquals}, ConverterParameter=genre}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <Separator/>
+                                        <MenuItem Header="{loc:T Main.Ascending}" Command="{Binding ArtistSortCommand}" CommandParameter="Ascending">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ArtistSortAscending}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.Descending}" Command="{Binding ArtistSortCommand}" CommandParameter="Descending">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding ArtistSortDescending}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                    </MenuFlyout>
+                                </Button.Flyout>
+                            </Button>
+                            <Border Classes="corner-dot" IsVisible="{Binding IsArtistSortActive}"/>
+                        </Panel>
+                        <!-- View: Grid / List, the same View glyph and menu shape as Albums. -->
+                        <Button Classes="corner-icon" AutomationProperties.Name="{loc:T Main.AlbumView}"
+                                ToolTip.Tip="{loc:T Main.AlbumView}">
+                            <PathIcon Data="{StaticResource ViewIcon}"/>
+                            <Button.Flyout>
+                                <MenuFlyout Placement="BottomEdgeAlignedRight"
+                                            helpers:MenuOpenAnimation.EnableFlyoutClose="True">
+                                    <MenuItem Header="{loc:T Main.AlbumGrid}" Command="{Binding SetArtistViewCommand}" CommandParameter="grid">
+                                        <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding !IsArtistListView}"/></MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T Main.ViewList}" Command="{Binding SetArtistViewCommand}" CommandParameter="list">
+                                        <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding IsArtistListView}"/></MenuItem.Icon>
+                                    </MenuItem>
+                                </MenuFlyout>
+                            </Button.Flyout>
+                        </Button>
+                    </StackPanel>
+
+                    <!-- Favorites: shuffle icon + Play (primary). -->
+                    <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center"
+                                IsVisible="{Binding FavoritesActionsVisible}">
+                        <Button Classes="corner-icon" Command="{Binding PageShuffleFavoritesCommand}" ToolTip.Tip="{loc:T Main.ShuffleTip}">
+                            <PathIcon Data="{StaticResource ShuffleIcon}"/>
+                        </Button>
+                        <Button Classes="accent-btn corner-primary" Background="{DynamicResource AccentButtonBackground}"
+                                Command="{Binding PagePlayFavoritesCommand}" ToolTip.Tip="{loc:T Main.PlayTip}">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <PathIcon Data="{StaticResource PlayIcon}" Width="12" Height="12"
+                                          Foreground="{DynamicResource AccentForegroundBrush}" VerticalAlignment="Center"/>
+                                <TextBlock Text="{loc:T Main.PlayTip}" FontSize="12" FontWeight="SemiBold"
+                                           Foreground="{DynamicResource AccentForegroundBrush}" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
+                    </StackPanel>
+
+                    <!-- Folders: manage folders (page option, opens Settings > Library) · sort popover ·
+                         shuffle icon · Play (primary). Same shuffle-icon + Play pair as Favorites. -->
+                    <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center"
+                                IsVisible="{Binding FoldersActionsVisible}">
+                        <Button Classes="corner-icon" Command="{Binding PageManageFoldersCommand}" ToolTip.Tip="{loc:T Main.ManageFolders}">
+                            <PathIcon Data="{StaticResource FolderIcon}"/>
+                        </Button>
+                        <Panel VerticalAlignment="Center">
+                            <Button Classes="corner-icon" AutomationProperties.Name="{loc:T Main.Sort}">
+                                <ToolTip.Tip>
+                                    <TextBlock><Run Text="{loc:T Main.Sort}"/><Run Text=" "/><Run Text="{Binding FoldersSortLabel}"/></TextBlock>
+                                </ToolTip.Tip>
+                                <PathIcon Data="{StaticResource SortIcon}"/>
+                                <Button.Flyout>
+                                    <MenuFlyout Placement="BottomEdgeAlignedRight"
+                                                helpers:MenuOpenAnimation.EnableFlyoutClose="True">
+                                        <MenuItem Header="{loc:T Main.FoldersSortDefault}" Command="{Binding FoldersSortCommand}" CommandParameter="default">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding FoldersSortMode, Converter={StaticResource StringEquals}, ConverterParameter=default}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.FoldersSortModifiedNewest}" Command="{Binding FoldersSortCommand}" CommandParameter="modified-newest">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding FoldersSortMode, Converter={StaticResource StringEquals}, ConverterParameter=modified-newest}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T Main.FoldersSortModifiedOldest}" Command="{Binding FoldersSortCommand}" CommandParameter="modified-oldest">
+                                            <MenuItem.Icon><controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding FoldersSortMode, Converter={StaticResource StringEquals}, ConverterParameter=modified-oldest}"/></MenuItem.Icon>
+                                        </MenuItem>
+                                    </MenuFlyout>
+                                </Button.Flyout>
+                            </Button>
+                            <Border Classes="corner-dot" IsVisible="{Binding IsFoldersSortActive}"/>
+                        </Panel>
+                        <Button Classes="corner-icon" Command="{Binding PageShuffleFolderCommand}" ToolTip.Tip="{loc:T Main.ShuffleFolderTip}">
+                            <PathIcon Data="{StaticResource ShuffleIcon}"/>
+                        </Button>
+                        <Button Classes="accent-btn corner-primary" Background="{DynamicResource AccentButtonBackground}"
+                                Command="{Binding PagePlayFolderCommand}" ToolTip.Tip="{loc:T Main.PlayFolderTip}">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <PathIcon Data="{StaticResource PlayIcon}" Width="12" Height="12"
+                                          Foreground="{DynamicResource AccentForegroundBrush}" VerticalAlignment="Center"/>
+                                <TextBlock Text="{loc:T Main.PlayTip}" FontSize="12" FontWeight="SemiBold"
+                                           Foreground="{DynamicResource AccentForegroundBrush}" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
+                    </StackPanel>
+
+                    <!-- View mode: one icon showing the mode you would switch to. While Cover
+                         Flow is on, a layout icon (Carousel / Cascade / Collage) sits beside it. -->
+                    <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center"
+                                IsVisible="{Binding HasViewModeToggle}">
+                        <Button Classes="corner-icon" AutomationProperties.Name="{loc:T Main.Layout}" IsVisible="{Binding IsCoverFlowMode}">
+                            <ToolTip.Tip>
+                                <TextBlock><Run Text="{loc:T Main.Layout}"/><Run Text=" "/><Run Text="{Binding CoverFlowLayoutLabel}"/></TextBlock>
+                            </ToolTip.Tip>
+                            <PathIcon Data="{StaticResource ViewIcon}"/>
+                            <Button.Flyout>
+                                <MenuFlyout Placement="BottomEdgeAlignedRight"
+                                            helpers:MenuOpenAnimation.EnableFlyoutClose="True">
+                                    <MenuItem Header="{loc:T Main.Carousel}" Command="{Binding SetCoverFlowLayoutCommand}" CommandParameter="Carousel"/>
+                                    <MenuItem Header="{loc:T Main.Cascade}" Command="{Binding SetCoverFlowLayoutCommand}" CommandParameter="Cascade"/>
+                                    <MenuItem Header="{loc:T Main.Collage}" Command="{Binding SetCoverFlowLayoutCommand}" CommandParameter="Collage"/>
+                                </MenuFlyout>
+                            </Button.Flyout>
+                        </Button>
+                        <Button Classes="corner-icon" IsVisible="{Binding IsCoverFlowMode}"
+                                Command="{Binding SetLibraryModeCommand}" ToolTip.Tip="{loc:T Main.SwitchToLibrary}">
+                            <PathIcon Data="{StaticResource GridViewIcon}"/>
+                        </Button>
+                        <Button Classes="corner-icon" IsVisible="{Binding CoverFlowToggleVisible}"
+                                Command="{Binding SetCoverFlowModeCommand}" ToolTip.Tip="{loc:T Main.SwitchToCoverFlow}">
+                            <PathIcon Data="{StaticResource CoverFlowIcon}"/>
+                        </Button>
+                        <!-- Albums (GitHub #164): grid / album carousel, like the artist page's
+                             toggle; the icon shows the layout a click switches to. -->
+                        <Button Classes="corner-icon" Command="{Binding AlbumViewToggleCommand}"
+                                ToolTip.Tip="{loc:T ArtistDetail.ShowCarousel}"
+                                AutomationProperties.Name="{loc:T ArtistDetail.ShowCarousel}">
+                            <Button.IsVisible>
+                                <MultiBinding Converter="{x:Static BoolConverters.And}">
+                                    <Binding Path="AlbumsViewToggleVisible"/>
+                                    <Binding Path="!IsAlbumCarouselView"/>
+                                </MultiBinding>
+                            </Button.IsVisible>
+                            <PathIcon Data="{StaticResource AlbumCarouselIcon}"/>
+                        </Button>
+                        <Button Classes="corner-icon" Command="{Binding AlbumViewToggleCommand}"
+                                ToolTip.Tip="{loc:T ArtistDetail.ShowGrid}"
+                                AutomationProperties.Name="{loc:T ArtistDetail.ShowGrid}">
+                            <Button.IsVisible>
+                                <MultiBinding Converter="{x:Static BoolConverters.And}">
+                                    <Binding Path="AlbumsViewToggleVisible"/>
+                                    <Binding Path="IsAlbumCarouselView"/>
+                                </MultiBinding>
+                            </Button.IsVisible>
+                            <PathIcon Data="{StaticResource GridViewIcon}"/>
+                        </Button>
+                    </StackPanel>
+
+                </StackPanel>
+            </Grid>
+
+            <!-- Zone C: Main Content Area + Overlay Panels -->
+            <DockPanel x:Name="ContentDockPanel" Grid.Row="1">
+                <Grid Background="{DynamicResource AppMainBackground}">
+                <!-- Tint Whole Window: covers the content surface too (see WindowTintLayer). -->
+                <Border Background="{Binding WindowTintBrush}"
+                        IsVisible="{Binding IsWindowTinted}"
+                        IsHitTestVisible="False" />
+                <ContentControl x:Name="PageHost"
+                                Content="{Binding CurrentView}"
+                                Classes="page-host"
+                                RenderTransformOrigin="50%,50%">
+                    <ContentControl.Transitions>
+                        <Transitions>
+                            <DoubleTransition Property="Opacity" Duration="0:0:0.18">
+                                <DoubleTransition.Easing>
+                                    <CubicEaseOut/>
+                                </DoubleTransition.Easing>
+                            </DoubleTransition>
+                        </Transitions>
+                    </ContentControl.Transitions>
+                </ContentControl>
+
+                <!-- Lyrics side panel overlays content so opening it does not resize album grids.
+                     IsVisible gates the whole subtree while closed: the karaoke word cells
+                     otherwise keep measuring/arranging behind the 0-width clip on every
+                     lyrics load, stalling the UI thread at track start (frozen row EQ). -->
+                <Border x:Name="LyricsPanelWrapper"
+                        HorizontalAlignment="Right"
+                        Width="0"
+                        IsVisible="False"
+                        Margin="0,8,8,12"
+                        CornerRadius="16"
+                        ClipToBounds="True"
+                        ZIndex="10">
+                    <Border.Transitions>
+                        <Transitions>
+                            <DoubleTransition Property="Width" Duration="0:0:0.2">
+                                <DoubleTransition.Easing>
+                                    <CubicEaseOut/>
+                                </DoubleTransition.Easing>
+                            </DoubleTransition>
+                        </Transitions>
+                    </Border.Transitions>
+                    <Grid Width="340">
+                        <!-- Opaque dark base so the panel never bleeds through; the view
+                             itself paints the page-matched background (artwork/solid/gradient). -->
+                        <Border Background="{DynamicResource AppSidebarBackground}" CornerRadius="16"/>
+                        <!-- The panel view is built on first open (EnsureLyricsPanelLoaded):
+                             its karaoke layout is a large slice of MainWindow's
+                             InitializeComponent and the panel starts closed. -->
+                        <ContentControl x:Name="LyricsPanelHost"/>
+                    </Grid>
+                </Border>
+
+                <!-- Queue drawer frost (Liquid Glass only, GitHub #104). A sibling UNDER the
+                     drawer with its exact geometry and transform, so it is never inside the
+                     drawer's rounded clip or its fading opacity layer (see the Settings sheet):
+                     it fades on its own Fade. Tint = the drawer's colour at Glass Opacity.
+                     Hidden while glass is off, so the drawer paints exactly as before. -->
+                <controls:GlassPanel x:Name="QueueGlass"
+                                     HorizontalAlignment="Right"
+                                     Width="{Binding Player.QueuePanelWidth}"
+                                     Margin="0,8,8,8"
+                                     CornerRadius="16"
+                                     Background="{DynamicResource QueueDrawerBackground}"
+                                     GlassTintOpacity="{Binding Player.IslandBackgroundOpacity}"
+                                     BlurRadius="14"
+                                     IsVisible="False"
+                                     Fade="0"
+                                     IsHitTestVisible="False"
+                                     RenderTransformOrigin="100%,50%"
+                                     RenderTransform="translateX(16px) scale(0.97)"
+                                     ZIndex="20">
+                    <controls:GlassPanel.Transitions>
+                        <Transitions>
+                            <DoubleTransition Property="Fade" Duration="0:0:0.18">
+                                <DoubleTransition.Easing>
+                                    <CubicEaseOut/>
+                                </DoubleTransition.Easing>
+                            </DoubleTransition>
+                            <TransformOperationsTransition Property="RenderTransform" Duration="0:0:0.18">
+                                <TransformOperationsTransition.Easing>
+                                    <CubicEaseOut/>
+                                </TransformOperationsTransition.Easing>
+                            </TransformOperationsTransition>
+                        </Transitions>
+                    </controls:GlassPanel.Transitions>
+                </controls:GlassPanel>
+
+                <!-- Queue popup panel (right side, rounded, opaque fill while glass is off).
+                     Visibility and the fade/slide open-close animation are driven from
+                     code-behind (IsQueuePopupOpen handler) so the close can play before
+                     the panel leaves the tree — same pattern as the Settings modal.
+                     Its fill comes from the Border#QueuePopupPanel style (Window.Styles).
+                     GitHub #147: its width is the user's (Player.QueuePanelWidth), dragged at
+                     the left edge (QueueResizeGrip) or set in Settings ▸ Player ▸ Queue. -->
+                <Border x:Name="QueuePopupPanel"
+                        HorizontalAlignment="Right"
+                        Width="{Binding Player.QueuePanelWidth}"
+                        Margin="0,8,8,8"
+                        CornerRadius="16"
+                        ClipToBounds="True"
+                        TextElement.Foreground="{DynamicResource QueueDrawerForeground}"
+                        IsVisible="False"
+                        Opacity="0"
+                        RenderTransformOrigin="100%,50%"
+                        RenderTransform="translateX(16px) scale(0.97)"
+                        BoxShadow="-2 0 12 0 #40000000"
+                        ZIndex="20">
+                    <Border.Transitions>
+                        <Transitions>
+                            <DoubleTransition Property="Opacity" Duration="0:0:0.18">
+                                <DoubleTransition.Easing>
+                                    <CubicEaseOut/>
+                                </DoubleTransition.Easing>
+                            </DoubleTransition>
+                            <TransformOperationsTransition Property="RenderTransform" Duration="0:0:0.18">
+                                <TransformOperationsTransition.Easing>
+                                    <CubicEaseOut/>
+                                </TransformOperationsTransition.Easing>
+                            </TransformOperationsTransition>
+                        </Transitions>
+                    </Border.Transitions>
+
+                    <Panel>
+
+                    <DockPanel>
+                        <DockPanel.Styles>
+                            <!-- Artist credit acts as a link: no button chrome, subtle highlight
+                                 behind the name on hover/press (matching the player bar's artist link). -->
+                            <Style Selector="Button.queue-link">
+                                <Setter Property="Background" Value="Transparent"/>
+                                <Setter Property="BorderThickness" Value="0"/>
+                                <Setter Property="Padding" Value="0"/>
+                                <Setter Property="Cursor" Value="Hand"/>
+                            </Style>
+                            <!-- Opt out of the global button hover/press zoom. -->
+                            <Style Selector="Button.queue-link:pointerover">
+                                <Setter Property="RenderTransform" Value="scale(1)"/>
+                            </Style>
+                            <Style Selector="Button.queue-link:pressed">
+                                <Setter Property="RenderTransform" Value="scale(1)"/>
+                            </Style>
+                            <Style Selector="Button.queue-link /template/ ContentPresenter#PART_ContentPresenter">
+                                <Setter Property="Background" Value="Transparent"/>
+                            </Style>
+                            <Style Selector="Button.queue-link:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+                                <Setter Property="Background" Value="Transparent"/>
+                            </Style>
+                            <Style Selector="Button.queue-link:pressed /template/ ContentPresenter#PART_ContentPresenter">
+                                <Setter Property="Background" Value="Transparent"/>
+                            </Style>
+                            <Style Selector="Button.queue-link:pointerover Border.artist-text-hover">
+                                <Setter Property="Background" Value="#22FFFFFF"/>
+                            </Style>
+                            <Style Selector="Button.queue-link:pressed Border.artist-text-hover">
+                                <Setter Property="Background" Value="#33FFFFFF"/>
+                            </Style>
+                            <!-- Disabled Clear (empty queue): keep the accent fill and just dim it,
+                                 otherwise Fluent's disabled grey vanishes against the dark panel. -->
+                            <Style Selector="Button.queue-action:disabled">
+                                <Setter Property="Opacity" Value="0.35"/>
+                            </Style>
+                            <Style Selector="Button.queue-action:disabled /template/ ContentPresenter#PART_ContentPresenter">
+                                <Setter Property="Background" Value="{DynamicResource AccentButtonBackground}"/>
+                                <Setter Property="Foreground" Value="{DynamicResource AccentForegroundBrush}"/>
+                            </Style>
+                            <!-- GitHub #134: the header's Clear Played, a quiet chip next to the title. -->
+                            <Style Selector="Button.queue-clear-played">
+                                <Setter Property="Background" Value="{DynamicResource TrackListHoverBrush}"/>
+                                <Setter Property="Foreground" Value="{DynamicResource QueueDrawerForeground}"/>
+                                <Setter Property="BorderThickness" Value="0"/>
+                            </Style>
+                            <Style Selector="Button.queue-clear-played:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+                                <Setter Property="Background" Value="{DynamicResource TrackListMultiSelectBrush}"/>
+                                <Setter Property="Foreground" Value="{DynamicResource QueueDrawerForeground}"/>
+                            </Style>
+                            <Style Selector="Button.queue-clear-played:disabled">
+                                <Setter Property="Opacity" Value="0.4"/>
+                            </Style>
+                            <Style Selector="Button.queue-clear-played:disabled /template/ ContentPresenter#PART_ContentPresenter">
+                                <Setter Property="Background" Value="{DynamicResource TrackListHoverBrush}"/>
+                                <Setter Property="Foreground" Value="{DynamicResource QueueDrawerForeground}"/>
+                            </Style>
+                        </DockPanel.Styles>
+                        <!-- Compact header: "Queue • N", then icon chips at the right end:
+                             History, Repeat, Reshuffle (Shuffle on) and, with Keep Played Songs
+                             on, Clear Played (GitHub #134). -->
+                        <DockPanel DockPanel.Dock="Top" Margin="20,16,16,6">
+                        <!-- Reshuffle (Discord, vari): the same quiet chip, icon-only so it fits
+                             beside Clear Played in every language; shown while Shuffle is on, as
+                             Clear Played is while Keep Played Songs is, and dimmed with fewer
+                             than two songs up next (the command's CanExecute). -->
+                        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" Spacing="6"
+                                    VerticalAlignment="Center">
+                        <!-- Discord (Luwi): History shows the played songs above Now Playing (the
+                             Keep Played Songs setting, one click away); accent while on. -->
+                        <Button x:Name="QueueHistoryButton"
+                                Classes="queue-clear-played"
+                                Command="{Binding Player.ToggleShowPlayedInQueueCommand}"
+                                ToolTip.Tip="{loc:T Queue.ShowPlayedTip}"
+                                AutomationProperties.Name="{loc:T Queue.History}"
+                                Width="28" Height="24"
+                                Padding="0"
+                                CornerRadius="999"
+                                HorizontalContentAlignment="Center"
+                                VerticalContentAlignment="Center"
+                                VerticalAlignment="Center"
+                                Cursor="Hand">
+                            <Panel>
+                                <controls:LineIcon Data="{StaticResource MenuLineHistory}" Width="14" Height="14"
+                                                   Foreground="{DynamicResource QueueDrawerForeground}"
+                                                   IsVisible="{Binding !Player.KeepPlayedInQueue}"/>
+                                <controls:LineIcon Data="{StaticResource MenuLineHistory}" Width="14" Height="14"
+                                                   Foreground="{DynamicResource AccentColorBrush}"
+                                                   IsVisible="{Binding Player.KeepPlayedInQueue}"/>
+                            </Panel>
+                        </Button>
+                        <!-- GitHub #144: Repeat in the panel too (the island's Repeat is opt-in),
+                             Off → All → One like everywhere else; the tooltip names the mode. -->
+                        <Button x:Name="QueueRepeatButton"
+                                Classes="queue-clear-played"
+                                Command="{Binding Player.CycleRepeatCommand}"
+                                ToolTip.Tip="{Binding Player.RepeatModeTip}"
+                                AutomationProperties.Name="{loc:T Queue.RepeatTip}"
+                                Width="28" Height="24"
+                                Padding="0"
+                                CornerRadius="999"
+                                HorizontalContentAlignment="Center"
+                                VerticalContentAlignment="Center"
+                                VerticalAlignment="Center"
+                                Cursor="Hand">
+                            <Panel>
+                                <PathIcon Data="{StaticResource RepeatAllIcon}" Width="13" Height="13"
+                                          Foreground="{DynamicResource QueueDrawerForeground}"
+                                          IsVisible="{Binding Player.RepeatMode, Converter={x:Static ObjectConverters.Equal}, ConverterParameter={x:Static m:RepeatMode.Off}}"/>
+                                <PathIcon Data="{StaticResource RepeatAllIcon}" Width="13" Height="13"
+                                          Foreground="{DynamicResource AccentColorBrush}"
+                                          IsVisible="{Binding Player.RepeatMode, Converter={x:Static ObjectConverters.Equal}, ConverterParameter={x:Static m:RepeatMode.All}}"/>
+                                <PathIcon Data="{StaticResource RepeatOneIcon}" Width="13" Height="13"
+                                          Foreground="{DynamicResource AccentColorBrush}"
+                                          IsVisible="{Binding Player.RepeatMode, Converter={x:Static ObjectConverters.Equal}, ConverterParameter={x:Static m:RepeatMode.One}}"/>
+                            </Panel>
+                        </Button>
+                        <Button x:Name="QueueReshuffleButton"
+                                Classes="queue-clear-played"
+                                Command="{Binding Player.ReshuffleCommand}"
+                                IsVisible="{Binding Player.IsShuffleEnabled}"
+                                ToolTip.Tip="{loc:T Queue.Reshuffle}"
+                                Width="28" Height="24"
+                                Padding="0"
+                                CornerRadius="999"
+                                HorizontalContentAlignment="Center"
+                                VerticalContentAlignment="Center"
+                                VerticalAlignment="Center"
+                                Cursor="Hand">
+                            <PathIcon Data="{StaticResource ShuffleIcon}" Width="13" Height="13"
+                                      Foreground="{DynamicResource QueueDrawerForeground}"/>
+                        </Button>
+                        <Button x:Name="QueueClearPlayedButton"
+                                Classes="queue-clear-played"
+                                Click="OnQueueClearPlayedClick"
+                                IsVisible="{Binding Player.KeepPlayedInQueue}"
+                                IsEnabled="{Binding Player.HasPlayedQueueRows}"
+                                ToolTip.Tip="{loc:T Queue.ClearPlayed}"
+                                AutomationProperties.Name="{loc:T Queue.ClearPlayed}"
+                                Width="28" Height="24"
+                                Padding="0"
+                                CornerRadius="999"
+                                HorizontalContentAlignment="Center"
+                                VerticalContentAlignment="Center"
+                                VerticalAlignment="Center"
+                                Cursor="Hand">
+                            <!-- Icon-only like its neighbours, so History + Repeat + Reshuffle +
+                                 Clear Played fit beside "Queue • N" in every language. -->
+                            <controls:LineIcon Data="{StaticResource MenuLineTrash}" Width="14" Height="14"
+                                               Foreground="{DynamicResource QueueDrawerForeground}"/>
+                        </Button>
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal" Spacing="7"
+                                    VerticalAlignment="Center">
+                            <TextBlock Text="{loc:T Main.Queue}"
+                                       FontSize="18"
+                                       FontWeight="Bold"
+                                       Foreground="{DynamicResource QueueDrawerForeground}" />
+                            <TextBlock Text="{Binding Player.UpNext.Count, StringFormat='&#x2022; {0}'}"
+                                       FontSize="15"
+                                       FontWeight="SemiBold"
+                                       Foreground="{DynamicResource QueueDrawerForeground}"
+                                       Opacity="0.5"
+                                       VerticalAlignment="Center"
+                                       Margin="0,2,0,0"
+                                       IsVisible="{Binding !!Player.UpNext.Count}" />
+                        </StackPanel>
+                        </DockPanel>
+
+                        <!-- Accent action pills: Close dismisses the popup, Clear empties the
+                             queue (same confirm-guarded handler the old ghost button used).
+                             Both track the live accent via AccentColorBrush. -->
+                        <Grid DockPanel.Dock="Top" Margin="16,2,16,10"
+                              ColumnDefinitions="*,*" ColumnSpacing="8">
+                            <Button Grid.Column="0"
+                                    Classes="accent-pill queue-action"
+                                    Content="{loc:T Main.Close}"
+                                    Command="{Binding Player.ShowQueueCommand}"
+                                    Padding="0,9"
+                                    FontSize="13"
+                                    FontWeight="Bold"
+                                    CornerRadius="999"
+                                    HorizontalAlignment="Stretch"
+                                    HorizontalContentAlignment="Center"
+                                    Cursor="Hand" />
+                            <Button Grid.Column="1"
+                                    Classes="accent-pill queue-action"
+                                    Content="{loc:T Main.Clear}"
+                                    Click="OnQueueClearClick"
+                                    IsEnabled="{Binding !!Player.UpNext.Count}"
+                                    Padding="0,9"
+                                    FontSize="13"
+                                    FontWeight="Bold"
+                                    CornerRadius="999"
+                                    HorizontalAlignment="Stretch"
+                                    HorizontalContentAlignment="Center"
+                                    Cursor="Hand" />
+                        </Grid>
+
+                        <!-- GitHub #85: the playing track, pinned above the list. Outside the
+                             ListBox so UpNext indices, drag slots and row numbers are unchanged.
+                             Same card as a queue row, marked the way Home marks its playing row
+                             (accent fill, accent-foreground text); duration in the number slot.
+                             GitHub #134: with Keep Played Songs on the playing track is a row of the
+                             list instead, in place between the played songs and Up Next. -->
+                        <Panel DockPanel.Dock="Top" IsVisible="{Binding !Player.KeepPlayedInQueue}">
+                        <StackPanel x:Name="QueueNowPlaying"
+                                    IsVisible="{Binding Player.CurrentTrack, Converter={x:Static ObjectConverters.IsNotNull}}">
+                            <TextBlock Text="{loc:T Queue.NowPlaying}"
+                                       FontSize="11"
+                                       FontWeight="SemiBold"
+                                       Foreground="{DynamicResource QueueDrawerForeground}"
+                                       Opacity="0.55"
+                                       Margin="24,0,12,4" />
+                            <Border Margin="12,1,12,1"
+                                    Padding="8,4"
+                                    CornerRadius="10"
+                                    Background="{DynamicResource AccentButtonBackground}"
+                                    DataContext="{Binding Player.CurrentTrack}"
+                                    x:DataType="m:Track">
+                                <Grid ColumnDefinitions="Auto,*,Auto" Height="48">
+                                    <Border Grid.Column="0"
+                                            Width="42" Height="42"
+                                            CornerRadius="7"
+                                            ClipToBounds="True"
+                                            VerticalAlignment="Center"
+                                            Margin="0,0,10,0">
+                                        <controls:CachedImage SourcePath="{Binding AlbumArtworkPath}"
+                                                              RenderOptions.BitmapInterpolationMode="HighQuality"
+                                                              Stretch="UniformToFill" />
+                                    </Border>
+                                    <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="0,0,8,0">
+                                        <Grid ColumnDefinitions="Auto,Auto">
+                                            <TextBlock Grid.Column="0"
+                                                       Classes="one-line-explicit-title"
+                                                       FontSize="13"
+                                                       FontWeight="SemiBold"
+                                                       Foreground="{DynamicResource AccentForegroundBrush}"
+                                                       MaxWidth="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueTitleMaxWidth, FallbackValue=165}">
+                                                <TextBlock.Text>
+                                                    <MultiBinding Converter="{x:Static helpers:QueueRowConverters.Line1}">
+                                                        <Binding />
+                                                        <Binding Path="$parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueRowLayout" />
+                                                    </MultiBinding>
+                                                </TextBlock.Text>
+                                            </TextBlock>
+                                            <Border Grid.Column="1"
+                                                    Classes="explicit-badge compact"
+                                                    Margin="4,0,0,0"
+                                                    IsVisible="{Binding IsExplicit}"
+                                                    ToolTip.Tip="{loc:T Main.ExplicitTip}"
+                                                    VerticalAlignment="Center">
+                                                <TextBlock Text="E"
+                                                           Classes="explicit-badge-text compact"
+                                                           FontSize="8"
+                                                           Opacity="0.9" />
+                                            </Border>
+                                        </Grid>
+                                        <!-- GitHub #147: line 2 is a link while it is the artist,
+                                             plain text for any other field, gone for None. -->
+                                        <Button Classes="queue-link"
+                                                AutomationProperties.Name="{Binding ArtistDisplay}"
+                                                HorizontalAlignment="Left"
+                                                Margin="0,2,0,0"
+                                                IsVisible="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueRowLayout.Line2IsArtistLink, FallbackValue=True}"
+                                                Command="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Player.ViewArtistCommand}"
+                                                CommandParameter="{Binding}">
+                                            <Border Classes="artist-text-hover"
+                                                    CornerRadius="2"
+                                                    Padding="2,0,3,0">
+                                                <TextBlock FontSize="11"
+                                                           FontWeight="SemiBold"
+                                                           Foreground="{DynamicResource AccentForegroundBrush}"
+                                                           Opacity="0.75"
+                                                           TextTrimming="CharacterEllipsis"
+                                                           MaxLines="1">
+                                                    <TextBlock.Text>
+                                                        <MultiBinding Converter="{x:Static helpers:QueueRowConverters.Line2}">
+                                                            <Binding />
+                                                            <Binding Path="$parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueRowLayout" />
+                                                        </MultiBinding>
+                                                    </TextBlock.Text>
+                                                </TextBlock>
+                                            </Border>
+                                        </Button>
+                                        <TextBlock FontSize="11"
+                                                   FontWeight="SemiBold"
+                                                   Foreground="{DynamicResource AccentForegroundBrush}"
+                                                   Opacity="0.75"
+                                                   TextTrimming="CharacterEllipsis"
+                                                   MaxLines="1"
+                                                   Margin="2,2,3,0"
+                                                   IsVisible="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueRowLayout.Line2IsPlain, FallbackValue=False}">
+                                            <TextBlock.Text>
+                                                <MultiBinding Converter="{x:Static helpers:QueueRowConverters.Line2}">
+                                                    <Binding />
+                                                    <Binding Path="$parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueRowLayout" />
+                                                </MultiBinding>
+                                            </TextBlock.Text>
+                                        </TextBlock>
+                                    </StackPanel>
+                                    <TextBlock Grid.Column="2"
+                                               IsVisible="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueRowLayout.ShowsRight, FallbackValue=True}"
+                                               Text="{Binding DurationFormatted}"
+                                               FontSize="12"
+                                               FontWeight="SemiBold"
+                                               Foreground="{DynamicResource AccentForegroundBrush}"
+                                               Opacity="0.75"
+                                               TextAlignment="Right"
+                                               VerticalAlignment="Center"
+                                               Margin="4,0,4,0" />
+                                </Grid>
+                            </Border>
+                        </StackPanel>
+                        </Panel>
+
+                        <!-- Queue track list (virtualized, drag-reorder enabled). GitHub #134: its
+                             rows are Player.QueueRows — Up Next, or with Keep Played Songs on the
+                             played songs, the playing one and Up Next as one list. The code-behind
+                             stamps queue-played / queue-current on the row containers. -->
+                        <Grid x:Name="QueueListWrapper">
+                            <ListBox x:Name="QueuePopupListBox"
+                                     Classes="queue-popup"
+                                     ItemsSource="{Binding Player.QueueRows}"
+                                     Background="Transparent"
+                                     BorderThickness="0"
+                                     Margin="0,6,0,8"
+                                     SelectionMode="Single"
+                                     AutoScrollToSelectedItem="False"
+                                     ScrollViewer.VerticalScrollBarVisibility="Hidden"
+                                     DragDrop.AllowDrop="True"
+                                     DoubleTapped="OnQueueItemDoubleTapped">
+                                <ListBox.Styles>
+                                    <Style Selector="ListBoxItem">
+                                        <Setter Property="Padding" Value="0"/>
+                                        <Setter Property="Margin" Value="0,1"/>
+                                        <Setter Property="Cursor" Value="Hand"/>
+                                        <Setter Property="Background" Value="Transparent"/>
+                                        <Setter Property="Foreground" Value="White"/>
+                                        <Setter Property="Transitions">
+                                            <Transitions>
+                                                <DoubleTransition Property="Opacity" Duration="0:0:0.15"/>
+                                            </Transitions>
+                                        </Setter>
+                                    </Style>
+                                    <!-- Hover highlight on each queue row, matching album track-list. -->
+                                    <Style Selector="Border.queue-row">
+                                        <Setter Property="Background" Value="Transparent"/>
+                                        <Setter Property="Transitions">
+                                            <Transitions>
+                                                <BrushTransition Property="Background" Duration="0:0:0.12"/>
+                                            </Transitions>
+                                        </Setter>
+                                    </Style>
+                                    <Style Selector="Border.queue-row:pointerover">
+                                        <Setter Property="Background" Value="{DynamicResource TrackListHoverBrush}"/>
+                                    </Style>
+                                    <!-- GitHub #85: selected rows (click / Ctrl / Shift) carry the track
+                                         lists' multi-select wash; declared after hover so it wins. -->
+                                    <Style Selector="ListBoxItem.ctrl-selected Border.queue-row">
+                                        <Setter Property="Background" Value="{DynamicResource TrackListMultiSelectBrush}"/>
+                                    </Style>
+                                    <!-- GitHub #134 (Keep Played Songs). Played rows: same size, a
+                                         little dimmed, a check in the number slot. -->
+                                    <Style Selector="TextBlock.queue-fg">
+                                        <Setter Property="Foreground" Value="{DynamicResource QueueDrawerForeground}"/>
+                                    </Style>
+                                    <Style Selector="Grid.queue-row-content">
+                                        <Setter Property="Transitions">
+                                            <Transitions>
+                                                <DoubleTransition Property="Opacity" Duration="0:0:0.12"/>
+                                            </Transitions>
+                                        </Setter>
+                                    </Style>
+                                    <Style Selector="controls|LineIcon.queue-played-mark, controls|LineIcon.queue-current-mark">
+                                        <Setter Property="IsVisible" Value="False"/>
+                                    </Style>
+                                    <Style Selector="ListBoxItem.queue-played Grid.queue-row-content">
+                                        <Setter Property="Opacity" Value="0.6"/>
+                                    </Style>
+                                    <Style Selector="ListBoxItem.queue-played Border.queue-row:pointerover Grid.queue-row-content">
+                                        <Setter Property="Opacity" Value="0.9"/>
+                                    </Style>
+                                    <Style Selector="ListBoxItem.queue-played controls|LineIcon.queue-played-mark">
+                                        <Setter Property="IsVisible" Value="True"/>
+                                    </Style>
+                                    <!-- GitHub #154: a song whose file is missing reads dimmed, marked. -->
+                                    <Style Selector="Grid.queue-row-content.queue-missing">
+                                        <Setter Property="Opacity" Value="0.45"/>
+                                    </Style>
+                                    <!-- The playing row: the accent card the pinned Now Playing row uses,
+                                         a speaker in the number slot. Last, so it wins over hover. -->
+                                    <Style Selector="ListBoxItem.queue-current Border.queue-row">
+                                        <Setter Property="Background" Value="{DynamicResource AccentButtonBackground}"/>
+                                    </Style>
+                                    <Style Selector="ListBoxItem.queue-current TextBlock.queue-fg">
+                                        <Setter Property="Foreground" Value="{DynamicResource AccentForegroundBrush}"/>
+                                    </Style>
+                                    <Style Selector="ListBoxItem.queue-current controls|LineIcon.queue-current-mark">
+                                        <Setter Property="IsVisible" Value="True"/>
+                                    </Style>
+                                    <!-- GitHub #147: with Duration in the right slot, played and playing
+                                         rows show their check / speaker there instead. -->
+                                    <Style Selector="TextBlock.queue-row-duration">
+                                        <Setter Property="Opacity" Value="0.5"/>
+                                    </Style>
+                                    <Style Selector="ListBoxItem.queue-played TextBlock.queue-row-duration, ListBoxItem.queue-current TextBlock.queue-row-duration">
+                                        <Setter Property="Opacity" Value="0"/>
+                                    </Style>
+                                </ListBox.Styles>
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate x:DataType="m:Track">
+                                        <!-- Single rounded-pill container wraps the entire row so the
+                                             drag highlight covers album art + text + number as one card. -->
+                                        <Border Classes="queue-row"
+                                                Margin="12,1,12,1"
+                                                Padding="8,4"
+                                                CornerRadius="10"
+                                                Tag="{Binding}"
+                                                PointerPressed="OnQueueItemPointerPressed"
+                                                PointerMoved="OnQueueItemPointerMoved"
+                                                PointerReleased="OnQueueItemPointerReleased"
+                                                PointerCaptureLost="OnQueueItemPointerCaptureLost"
+                                                ContextRequested="OnQueueRowContextRequested">
+                                            <Border.ContextMenu>
+                                                <ContextMenu>
+                                                    <MenuItem Header="{loc:T Main.RemoveFromQueue}"
+                                                              Classes="queue-menu-remove"
+                                                              Click="OnQueueRemoveClick">
+                                                        <MenuItem.Icon>
+                                                            <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineQueueRemove}"/>
+                                                        </MenuItem.Icon>
+                                                    </MenuItem>
+                                                    <!-- GitHub #105: ReplayGain for queued tracks, library or not. -->
+                                                    <MenuItem Header="{loc:T Main.ScanReplayGain}"
+                                                              Click="OnQueueScanReplayGainClick">
+                                                        <MenuItem.Icon>
+                                                            <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineReplayGain}"/>
+                                                        </MenuItem.Icon>
+                                                    </MenuItem>
+                                                    <!-- GitHub #134: on played rows (Keep Played Songs). -->
+                                                    <MenuItem Header="{loc:T Queue.ClearPlayed}"
+                                                              Classes="queue-menu-clear-played"
+                                                              IsVisible="False"
+                                                              Click="OnQueueClearPlayedClick">
+                                                        <MenuItem.Icon>
+                                                            <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineTrash}"/>
+                                                        </MenuItem.Icon>
+                                                    </MenuItem>
+                                                </ContextMenu>
+                                            </Border.ContextMenu>
+                                        <Grid ColumnDefinitions="Auto,*,Auto,Auto" Height="48"
+                                              Classes="queue-row-content"
+                                              Classes.queue-missing="{Binding IsFileMissing}"
+                                              Background="Transparent">
+
+                                            <!-- Album art thumbnail -->
+                                            <Border Grid.Column="0"
+                                                    Width="42" Height="42"
+                                                    CornerRadius="7"
+                                                    ClipToBounds="True"
+                                                    VerticalAlignment="Center"
+                                                    Margin="0,0,10,0">
+                                                <controls:CachedImage SourcePath="{Binding AlbumArtworkPath}"
+                                                                      RenderOptions.BitmapInterpolationMode="HighQuality"
+                                                                      Stretch="UniformToFill" />
+                                            </Border>
+                                            <!-- Title + Artist -->
+                                            <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="0,0,8,0">
+                                                <Grid ColumnDefinitions="Auto,Auto">
+                                                    <TextBlock Grid.Column="0"
+                                                               Classes="one-line-explicit-title queue-fg"
+                                                               FontSize="13"
+                                                               FontWeight="SemiBold"
+                                                               MaxWidth="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueTitleMaxWidth, FallbackValue=165}">
+                                                        <TextBlock.Text>
+                                                            <MultiBinding Converter="{x:Static helpers:QueueRowConverters.Line1}">
+                                                                <Binding />
+                                                                <Binding Path="$parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueRowLayout" />
+                                                            </MultiBinding>
+                                                        </TextBlock.Text>
+                                                    </TextBlock>
+                                                    <Border Grid.Column="1"
+                                                            Classes="explicit-badge compact"
+                                                            Margin="4,0,0,0"
+                                                            IsVisible="{Binding IsExplicit}"
+                                                            ToolTip.Tip="{loc:T Main.ExplicitTip}"
+                                                            VerticalAlignment="Center">
+                                                        <TextBlock Text="E"
+                                                                   Classes="explicit-badge-text compact"
+                                                                   FontSize="8"
+                                                                   Opacity="0.9" />
+                                                    </Border>
+                                                </Grid>
+                                                <!-- GitHub #147: line 2 is a link while it is the artist,
+                                                     plain text for any other field, gone for None. -->
+                                                <Button Classes="queue-link"
+                                                        AutomationProperties.Name="{Binding ArtistDisplay}"
+                                                        HorizontalAlignment="Left"
+                                                        Margin="0,2,0,0"
+                                                        IsVisible="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueRowLayout.Line2IsArtistLink, FallbackValue=True}"
+                                                        Command="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Player.ViewArtistCommand}"
+                                                        CommandParameter="{Binding}">
+                                                    <Border Classes="artist-text-hover"
+                                                            CornerRadius="2"
+                                                            Padding="2,0,3,0">
+                                                        <TextBlock Classes="queue-fg"
+                                                                   FontSize="11"
+                                                                   FontWeight="SemiBold"
+                                                                   Opacity="0.55"
+                                                                   TextTrimming="CharacterEllipsis"
+                                                                   MaxLines="1">
+                                                            <TextBlock.Text>
+                                                                <MultiBinding Converter="{x:Static helpers:QueueRowConverters.Line2}">
+                                                                    <Binding />
+                                                                    <Binding Path="$parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueRowLayout" />
+                                                                </MultiBinding>
+                                                            </TextBlock.Text>
+                                                        </TextBlock>
+                                                    </Border>
+                                                </Button>
+                                                <TextBlock Classes="queue-fg"
+                                                           FontSize="11"
+                                                           FontWeight="SemiBold"
+                                                           Opacity="0.55"
+                                                           TextTrimming="CharacterEllipsis"
+                                                           MaxLines="1"
+                                                           Margin="2,2,3,0"
+                                                           IsVisible="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueRowLayout.Line2IsPlain, FallbackValue=False}">
+                                                    <TextBlock.Text>
+                                                        <MultiBinding Converter="{x:Static helpers:QueueRowConverters.Line2}">
+                                                            <Binding />
+                                                            <Binding Path="$parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueRowLayout" />
+                                                        </MultiBinding>
+                                                    </TextBlock.Text>
+                                                </TextBlock>
+                                            </StackPanel>
+                                            <!-- Queue position (stamped from code-behind; virtualization
+                                                 recycles rows, so there is no per-item index to bind).
+                                                 GitHub #134: played rows show a check, the playing row
+                                                 a speaker, instead of a number. -->
+                                            <!-- GitHub #154: the file can't be found (moved, deleted, drive unplugged). -->
+                                            <Border Grid.Column="2"
+                                                    Classes="explicit-badge compact"
+                                                    Margin="0,0,4,0"
+                                                    IsVisible="{Binding IsFileMissing}"
+                                                    ToolTip.Tip="{loc:T Queue.MissingTip}"
+                                                    AutomationProperties.Name="{loc:T Queue.MissingTip}"
+                                                    VerticalAlignment="Center">
+                                                <TextBlock Text="{loc:T Queue.MissingBadge}"
+                                                           Classes="explicit-badge-text compact"
+                                                           FontSize="8"
+                                                           Opacity="0.9" />
+                                            </Border>
+                                            <Panel Grid.Column="3" MinWidth="20" Margin="4,0,4,0"
+                                                   VerticalAlignment="Center"
+                                                   IsVisible="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueRowLayout.ShowsRight, FallbackValue=True}">
+                                                <TextBlock x:Name="QueueRowNumber"
+                                                           Classes="queue-fg"
+                                                           FontSize="14"
+                                                           FontWeight="SemiBold"
+                                                           Opacity="0.4"
+                                                           TextAlignment="Right"
+                                                           VerticalAlignment="Center"
+                                                           IsVisible="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueRowLayout.ShowsPosition, FallbackValue=True}" />
+                                                <!-- GitHub #147: Duration in the right slot (Settings ▸ Player ▸ Queue). -->
+                                                <TextBlock Classes="queue-fg queue-row-duration"
+                                                           Text="{Binding DurationFormatted}"
+                                                           FontSize="12"
+                                                           FontWeight="SemiBold"
+                                                           TextAlignment="Right"
+                                                           VerticalAlignment="Center"
+                                                           IsVisible="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueRowLayout.ShowsDuration, FallbackValue=False}" />
+                                                <controls:LineIcon Classes="queue-played-mark"
+                                                                   Data="{StaticResource MenuLineCheck}"
+                                                                   Foreground="{DynamicResource QueueDrawerForeground}"
+                                                                   Width="16" Height="16"
+                                                                   Opacity="0.7"
+                                                                   HorizontalAlignment="Right"
+                                                                   VerticalAlignment="Center" />
+                                                <controls:LineIcon Classes="queue-current-mark"
+                                                                   Data="{StaticResource MenuLineVolume}"
+                                                                   Foreground="{DynamicResource AccentForegroundBrush}"
+                                                                   Width="18" Height="18"
+                                                                   HorizontalAlignment="Right"
+                                                                   VerticalAlignment="Center" />
+                                            </Panel>
+                                        </Grid>
+                                        </Border>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+
+                            <!-- GitHub #92: empty-queue hint. Not hit-testable, so a library row
+                                 dragged over it still lands on the ListBox (OnQueueDrop).
+                                 GitHub #134: only when there is nothing at all (it showed under a
+                                 playing song and its played songs whenever Up Next was empty). -->
+                            <StackPanel x:Name="QueueEmptyHint"
+                                        IsVisible="{Binding Player.IsQueueEmpty}"
+                                        IsHitTestVisible="False"
+                                        VerticalAlignment="Top"
+                                        Margin="32,40,32,0"
+                                        Spacing="6">
+                                <TextBlock Text="{loc:T Main.QueueEmptyTitle}"
+                                           FontSize="14"
+                                           FontWeight="SemiBold"
+                                           Foreground="{DynamicResource QueueDrawerForeground}"
+                                           Opacity="0.7"
+                                           TextAlignment="Center" />
+                                <TextBlock Text="{loc:T Main.QueueEmptyHint}"
+                                           FontSize="12"
+                                           Foreground="{DynamicResource QueueDrawerForeground}"
+                                           Opacity="0.45"
+                                           TextWrapping="Wrap"
+                                           TextAlignment="Center" />
+                            </StackPanel>
+
+                            <!-- GitHub #134: a song is playing (pinned above) and Up Next is empty. -->
+                            <StackPanel x:Name="QueueNothingUpNext"
+                                        IsVisible="{Binding Player.ShowQueueNothingUpNext}"
+                                        IsHitTestVisible="False"
+                                        VerticalAlignment="Top"
+                                        Margin="32,28,32,0"
+                                        Spacing="6">
+                                <TextBlock Text="{loc:T Main.QueueNothingUpNextTitle}"
+                                           FontSize="13"
+                                           FontWeight="SemiBold"
+                                           Foreground="{DynamicResource QueueDrawerForeground}"
+                                           Opacity="0.6"
+                                           TextAlignment="Center" />
+                                <TextBlock Text="{loc:T Main.QueueNothingUpNextHint}"
+                                           FontSize="12"
+                                           Foreground="{DynamicResource QueueDrawerForeground}"
+                                           Opacity="0.4"
+                                           TextWrapping="Wrap"
+                                           TextAlignment="Center" />
+                            </StackPanel>
+
+                            <!-- Floating drag preview: follows the pointer Y while reordering.
+                                 DataContext starts pinned to null (the state ResetQueueDragState
+                                 restores after every drag) so the Track-typed bindings inside never
+                                 see the window's inherited MainWindowViewModel — casting that to
+                                 Track logged three binding warnings at every startup. StartQueueDrag
+                                 assigns the real Track before the preview becomes visible. -->
+                            <Border x:Name="QueueDragPreview"
+                                    x:DataType="m:Track"
+                                    DataContext="{x:Null}"
+                                    IsHitTestVisible="False"
+                                    IsVisible="False"
+                                    Margin="12,0,12,0"
+                                    Padding="8,4"
+                                    CornerRadius="10"
+                                    Background="{DynamicResource AccentColorBrush}"
+                                    HorizontalAlignment="Stretch"
+                                    VerticalAlignment="Top"
+                                    BoxShadow="0 10 28 0 #80000000"
+                                    RenderTransformOrigin="50%,50%">
+                                <!-- Scale = lift + velocity stretch, Translate = eased position
+                                     (both driven per frame from code-behind). -->
+                                <Border.RenderTransform>
+                                    <TransformGroup>
+                                        <ScaleTransform />
+                                        <TranslateTransform />
+                                    </TransformGroup>
+                                </Border.RenderTransform>
+                                <Grid ColumnDefinitions="Auto,*,Auto" Height="48">
+                                    <Border Grid.Column="0"
+                                            Width="42" Height="42"
+                                            CornerRadius="7"
+                                            ClipToBounds="True"
+                                            VerticalAlignment="Center"
+                                            Margin="0,0,10,0">
+                                        <controls:CachedImage SourcePath="{Binding AlbumArtworkPath}"
+                                                              RenderOptions.BitmapInterpolationMode="HighQuality"
+                                                              Stretch="UniformToFill" />
+                                    </Border>
+                                    <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="0,0,8,0">
+                                        <TextBlock FontSize="13"
+                                                    FontWeight="SemiBold"
+                                                    Foreground="{DynamicResource AccentForegroundBrush}"
+                                                   TextTrimming="CharacterEllipsis"
+                                                   MaxLines="1">
+                                            <TextBlock.Text>
+                                                <MultiBinding Converter="{x:Static helpers:QueueRowConverters.Line1}">
+                                                    <Binding />
+                                                    <Binding Path="$parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueRowLayout" />
+                                                </MultiBinding>
+                                            </TextBlock.Text>
+                                        </TextBlock>
+                                        <TextBlock FontSize="11"
+                                                    FontWeight="Bold"
+                                                    Foreground="{DynamicResource AccentForegroundBrush}"
+                                                   Opacity="0.7"
+                                                   TextTrimming="CharacterEllipsis"
+                                                   MaxLines="1"
+                                                   Margin="0,2,0,0"
+                                                   IsVisible="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueRowLayout.HasLine2, FallbackValue=True}">
+                                            <TextBlock.Text>
+                                                <MultiBinding Converter="{x:Static helpers:QueueRowConverters.Line2}">
+                                                    <Binding />
+                                                    <Binding Path="$parent[Window].((vm:MainWindowViewModel)DataContext).Player.QueueRowLayout" />
+                                                </MultiBinding>
+                                            </TextBlock.Text>
+                                        </TextBlock>
+                                    </StackPanel>
+                                </Grid>
+                            </Border>
+
+                            <!-- GitHub #88: rubber-band selection rectangle, sized from code-behind
+                                 (OnQueueBand*). Rim and wash are separate so the fill can be faint
+                                 while the edge stays crisp. -->
+                            <Border x:Name="QueueMarquee"
+                                    IsHitTestVisible="False"
+                                    IsVisible="False"
+                                    HorizontalAlignment="Left"
+                                    VerticalAlignment="Top"
+                                    CornerRadius="6"
+                                    BorderThickness="1"
+                                    BorderBrush="{DynamicResource AccentColorBrush}">
+                                <Border CornerRadius="5"
+                                        Background="{DynamicResource AccentColorBrush}"
+                                        Opacity="0.18" />
+                            </Border>
+                        </Grid>
+                    </DockPanel>
+
+                    <!-- GitHub #147: drag the panel's left edge to resize it (300-720, never
+                         past the window); double-click it for the stock 330. Last child, so it
+                         sits over the list's left gutter. -->
+                    <Border x:Name="QueueResizeGrip"
+                            Width="6"
+                            HorizontalAlignment="Left"
+                            VerticalAlignment="Stretch"
+                            Background="Transparent"
+                            Cursor="SizeWestEast"
+                            PointerPressed="OnQueueResizeGripPressed"
+                            PointerMoved="OnQueueResizeGripMoved"
+                            PointerReleased="OnQueueResizeGripReleased"
+                            PointerCaptureLost="OnQueueResizeGripCaptureLost"/>
+                    </Panel>
+                </Border>
+
+            </Grid>
+            </DockPanel>
+
+        </Grid>
+    </DockPanel>
+
+    <!-- Drag-drop overlay (shown while dragging importable files over the window): the
+         import card, or the drop zones with "Import dropped files" off (GitHub #108). -->
+    <views:DropOverlay x:Name="DragDropOverlay" />
+
+    <!-- Drop-import progress pill (spinner + "Copying files 3 of 10") -->
+    <Border IsVisible="{Binding IsDropImporting}"
+            IsHitTestVisible="False"
+            HorizontalAlignment="Center"
+            VerticalAlignment="Center"
+            Background="{DynamicResource IslandBackground}"
+            BorderBrush="#22FFFFFF"
+            BorderThickness="1"
+            CornerRadius="999"
+            Padding="16,9"
+            ZIndex="40">
+        <Border.Styles>
+            <!-- Same rotating-arc spinner as Settings' background work indicator -->
+            <Style Selector="Ellipse.loading-spinner">
+                <Setter Property="Width" Value="14"/>
+                <Setter Property="Height" Value="14"/>
+                <Setter Property="Stroke" Value="{DynamicResource AccentColorBrush}"/>
+                <Setter Property="StrokeThickness" Value="2"/>
+                <Setter Property="StrokeDashArray" Value="11,5"/>
+                <Setter Property="StrokeLineCap" Value="Round"/>
+                <Setter Property="RenderTransformOrigin" Value="50%,50%"/>
+            </Style>
+            <!-- Animation keyed on [IsVisible=True] (same pattern as LyricsView's
+                 search dots): selector matching ignores visibility, so an ungated
+                 INFINITE clock would tick behind the hidden pill for the whole
+                 app session. -->
+            <Style Selector="Ellipse.loading-spinner[IsVisible=True]">
+                <Style.Animations>
+                    <Animation Duration="0:0:0.85" IterationCount="INFINITE" Easing="LinearEasing">
+                        <KeyFrame Cue="0%"><Setter Property="RotateTransform.Angle" Value="0"/></KeyFrame>
+                        <KeyFrame Cue="100%"><Setter Property="RotateTransform.Angle" Value="360"/></KeyFrame>
+                    </Animation>
+                </Style.Animations>
+            </Style>
+        </Border.Styles>
+        <StackPanel Orientation="Horizontal" Spacing="10">
+            <!-- Own IsVisible mirrors the pill Border's so the [IsVisible=True]
+                 animation gate can see it (parent visibility alone is invisible
+                 to the selector). A finished drop's outcome shows a check instead. -->
+            <Ellipse Classes="loading-spinner" VerticalAlignment="Center"
+                     IsVisible="{Binding IsDropImportSpinnerVisible}"/>
+            <PathIcon Data="{StaticResource CheckmarkIcon}"
+                      Width="14" Height="14"
+                      Foreground="{DynamicResource AccentColorBrush}"
+                      VerticalAlignment="Center"
+                      IsVisible="{Binding DropImportDone}"/>
+            <TextBlock Text="{Binding DropImportStatus}"
+                       FontSize="13" FontWeight="SemiBold"
+                       Foreground="{DynamicResource IslandForeground}"
+                       VerticalAlignment="Center"/>
+        </StackPanel>
+    </Border>
+
+    <!-- Plugin notice pill (IPluginHost.Notify): same glass pill as the drop-import one,
+         near the top so it never covers the playback island; clears itself after a few seconds. -->
+    <Border IsVisible="{Binding PluginNotice, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"
+            IsHitTestVisible="False"
+            HorizontalAlignment="Center"
+            VerticalAlignment="Top"
+            Margin="0,72,0,0"
+            MaxWidth="560"
+            Background="{DynamicResource IslandBackground}"
+            BorderBrush="#22FFFFFF"
+            BorderThickness="1"
+            CornerRadius="999"
+            Padding="16,9"
+            ZIndex="40">
+        <TextBlock Text="{Binding PluginNotice}"
+                   FontSize="13" FontWeight="SemiBold"
+                   TextTrimming="CharacterEllipsis"
+                   Foreground="{DynamicResource IslandForeground}"
+                   VerticalAlignment="Center"/>
+    </Border>
+
+    <!-- "Added to Queue" / "Playing Next" confirmation (owner 10-08): rises just above the
+         island (16 margin + 50 island + 14 gap), above it in Z, never hit-tested. -->
+    <views:QueueToastView DataContext="{Binding QueueToast}"
+                          Margin="0,0,0,80"
+                          ZIndex="40" />
+
+    <!-- "Continue from your phone" (Pick Up on Computer): above the queue toast's spot. -->
+    <views:HandoffPromptView DataContext="{Binding HandoffPrompt}"
+                             Margin="0,0,0,132"
+                             ZIndex="41" />
+
+    <!-- Bottom playback island (Apple Music-style glass pill). No clip: the island's glass
+         must hear of repaints right beside the pill, which its blur reads (see GlassReach). -->
+    <views:PlaybackBarView DataContext="{Binding Player}"
+                           ClipToBounds="False"
+                           CompactWhenLyricsPageActive="False"
+                           IsVisible="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).IsPlaybackBarMounted, FallbackValue=False}"
+                           IsHitTestVisible="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).IsPlaybackBarHitTestVisible, FallbackValue=False}"
+                           Opacity="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).PlaybackBarOpacity, FallbackValue=0}"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Bottom"
+                           Margin="0,0,0,16"
+                           ZIndex="30" />
+
+    <!-- GitHub #92: idle island. The island above unmounts while nothing is loaded, and its
+         Queue button with it; this pill takes its place so the queue (and anything dropped
+         into it) stays one click away. Same glass fill and ring as the island. -->
+    <Border IsVisible="{Binding IsIdleIslandVisible}"
+            HorizontalAlignment="Center"
+            VerticalAlignment="Bottom"
+            Margin="0,0,0,16"
+            Height="44"
+            CornerRadius="999"
+            BorderBrush="{DynamicResource IslandOutlineBrush}"
+            BorderThickness="1.5"
+            ZIndex="30">
+        <controls:GlassPanel CornerRadius="999" BlurRadius="14">
+            <controls:GlassPanel.Background>
+                <SolidColorBrush Color="{DynamicResource IslandBackgroundColor}" Opacity="{Binding Player.IslandBackgroundOpacity}"/>
+            </controls:GlassPanel.Background>
+            <StackPanel Orientation="Horizontal" Spacing="14" Margin="20,0,6,0" VerticalAlignment="Center">
+                <TextBlock Text="{loc:T Main.NothingPlaying}"
+                           FontSize="13"
+                           FontWeight="SemiBold"
+                           Foreground="{DynamicResource IslandForeground}"
+                           Opacity="0.6"
+                           VerticalAlignment="Center" />
+                <Button Classes="accent-pill"
+                        Command="{Binding Player.ShowQueueCommand}"
+                        AutomationProperties.Name="{loc:T Main.Queue}"
+                        CornerRadius="999"
+                        Padding="12,6"
+                        VerticalAlignment="Center"
+                        Cursor="Hand">
+                    <StackPanel Orientation="Horizontal" Spacing="7">
+                        <controls:LineIcon Width="15" Height="15" Data="{StaticResource MenuLineQueue}"
+                                           Foreground="{DynamicResource AccentForegroundBrush}" VerticalAlignment="Center" />
+                        <TextBlock Text="{loc:T Main.Queue}"
+                                   FontSize="13"
+                                   FontWeight="Bold"
+                                   VerticalAlignment="Center" />
+                    </StackPanel>
+                </Button>
+            </StackPanel>
+        </controls:GlassPanel>
+    </Border>
+
+    <!-- Sidebar: overlaid so hover-expand doesn't reflow content -->
+    <Border x:Name="SidebarWrapper"
+            HorizontalAlignment="Left"
+            VerticalAlignment="Stretch"
+            Width="60"
+            Margin="8,8,8,12"
+            CornerRadius="20"
+            ZIndex="10">
+        <Border.Transitions>
+            <Transitions>
+                <DoubleTransition Property="Width" Duration="0:0:0.2">
+                    <DoubleTransition.Easing>
+                        <CubicEaseOut/>
+                    </DoubleTransition.Easing>
+                </DoubleTransition>
+            </Transitions>
+        </Border.Transitions>
+        <!-- Liquid Glass host: off, paints the sidebar fill the view used to paint
+             itself; on, frosts the page content scrolling past under the rail. The
+             rounded clip sits on the content, not on SidebarWrapper: the glass draws its
+             own rounded shape, and a clipping ancestor would hide from it the repaints of
+             the page beside the rail that its blur reads (see GlassReach). -->
+        <controls:GlassPanel Background="{DynamicResource IslandBackground}"
+                             CornerRadius="20"
+                             GlassTintOpacity="0.55">
+            <Border CornerRadius="20" ClipToBounds="True">
+                <views:SidebarView x:Name="SidebarPane"
+                                   HorizontalAlignment="Stretch"
+                                   DataContext="{Binding Sidebar}" />
+            </Border>
+        </controls:GlassPanel>
+    </Border>
+
+    </Panel>
+
+    <!-- Settings modal overlay (dark backdrop + centered popup card).
+         Visibility and the fade/scale open-close animation are driven from
+         code-behind (IsSettingsModalOpen handler) so the close can play before
+         the overlay leaves the tree. -->
+    <!-- The dim scrim is a SIBLING of the overlay, not its Background, so it never sits
+         inside the overlay's fading opacity layer. The Settings sheet's GlassPanel snapshots
+         the surface beneath it; on the GPU backend that snapshot excludes whatever the
+         current opacity layer has drawn, so a scrim inside the layer was missing from the
+         blur and the frosted card flashed brighter than its surroundings during the fade
+         (the "transparent box" on close). Code-behind mirrors the overlay's Opacity /
+         IsVisible onto this scrim. -->
+    <!-- Owner 10-08 "make the background blur just like the metadata pop up": the scrim
+         holds a blurred snapshot of AppContentLayer (taken once per open, freed on close)
+         under the dim, the PillDialogHost look. Dim alone until the snapshot lands, or where
+         the backend can't take one. Owner 10-18: that frozen copy stood still and jumped
+         forward on every retake while the lyrics moved under it, so LiveBlur blurs
+         AppContentLayer itself instead (the snapshot stays the Liquid Glass fallback). -->
+    <controls:BlurredBackdrop Name="SettingsScrim"
+            IsVisible="False"
+            Opacity="0"
+            LiveBlur="True"
+            Dim="#A6000000"
+            ZIndex="99">
+        <controls:BlurredBackdrop.Transitions>
+            <Transitions>
+                <DoubleTransition Property="Opacity" Duration="0:0:0.14">
+                    <DoubleTransition.Easing>
+                        <CubicEaseOut/>
+                    </DoubleTransition.Easing>
+                </DoubleTransition>
+            </Transitions>
+        </controls:BlurredBackdrop.Transitions>
+    </controls:BlurredBackdrop>
+    <!-- The overlay itself never fades (Opacity stays 1). Its opacity used to drive the
+         open/close animation, but the GPU backend does not apply an ancestor's opacity
+         layer to the GlassPanel's custom Skia draw: the frost stayed at full strength while
+         the card's text and the scrim had already faded out, leaving a "transparent box"
+         for the last frames of every close. So the three pieces fade on their own:
+         SettingsScrim (Opacity), SettingsGlass (its own Fade, applied inside the draw) and
+         SettingsCard (Opacity — it holds only content, no frost). -->
+    <Border Name="SettingsOverlay"
+            IsVisible="False"
+            Background="Transparent"
+            ZIndex="100"
+            Tapped="OnSettingsBackdropTapped">
+      <Panel>
+        <!-- Card fill / frost. A sibling UNDER the card with the card's exact geometry and
+             scale transform, so it is never inside the card's opacity layer. Off, it paints
+             the same AppMainBackground the card used to. -->
+        <controls:GlassPanel Name="SettingsGlass"
+                             MaxWidth="1000" MaxHeight="720" Margin="24,24"
+                             HorizontalAlignment="Stretch"
+                             VerticalAlignment="Stretch"
+                             CornerRadius="22"
+                             Background="{DynamicResource AppMainBackground}"
+                             GlassTintOpacity="0.3"
+                             BlurRadius="22"
+                             EdgeThickness="0"
+                             Fade="0"
+                             IsHitTestVisible="False"
+                             RenderTransformOrigin="50%,50%"
+                             RenderTransform="scale(0.96)">
+            <controls:GlassPanel.Transitions>
+                <Transitions>
+                    <TransformOperationsTransition Property="RenderTransform" Duration="0:0:0.14">
+                        <TransformOperationsTransition.Easing>
+                            <CubicEaseOut/>
+                        </TransformOperationsTransition.Easing>
+                    </TransformOperationsTransition>
+                    <DoubleTransition Property="Fade" Duration="0:0:0.14">
+                        <DoubleTransition.Easing>
+                            <CubicEaseOut/>
+                        </DoubleTransition.Easing>
+                    </DoubleTransition>
+                    <DoubleTransition Property="MaxWidth" Duration="0:0:0.28" Easing="{StaticResource SettingsCardResizeEase}"/>
+                    <DoubleTransition Property="MaxHeight" Duration="0:0:0.28" Easing="{StaticResource SettingsCardResizeEase}"/>
+                </Transitions>
+            </controls:GlassPanel.Transitions>
+        </controls:GlassPanel>
+        <!-- Stretch + MaxHeight: the card is always min(720, window − margin) tall, whatever
+             page is open. With VerticalAlignment=Center it sized to its content, so short
+             pages (Plugins, Statistics) visibly shrank the whole dialog.
+             Stretch + MaxWidth the same way across (GitHub #145): a fixed 1000 px card ran off
+             both sides of anything narrower — the 780 px minimum window, or a 1560 px window at
+             200% Interface Size — cutting off the close button (UiScaleTests). -->
+        <Border Name="SettingsCard"
+                MaxWidth="1000" MaxHeight="720" Margin="24,24"
+                Opacity="0"
+                BorderBrush="#22FFFFFF"
+                BorderThickness="1"
+                CornerRadius="22"
+                HorizontalAlignment="Stretch"
+                VerticalAlignment="Stretch"
+                RenderTransformOrigin="50%,50%"
+                RenderTransform="scale(0.96)"
+                Tapped="OnSettingsCardTapped"
+                BoxShadow="0 24 60 0 #80000000">
+            <Border.Transitions>
+                <Transitions>
+                    <TransformOperationsTransition Property="RenderTransform" Duration="0:0:0.14">
+                        <TransformOperationsTransition.Easing>
+                            <CubicEaseOut/>
+                        </TransformOperationsTransition.Easing>
+                    </TransformOperationsTransition>
+                    <!-- Card fade for every open/close (see the overlay note above). -->
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.14">
+                        <DoubleTransition.Easing>
+                            <CubicEaseOut/>
+                        </DoubleTransition.Easing>
+                    </DoubleTransition>
+                    <!-- Growing to fit a plugin's own view and back (SizeSettingsCard), in step with the frost. -->
+                    <DoubleTransition Property="MaxWidth" Duration="0:0:0.28" Easing="{StaticResource SettingsCardResizeEase}"/>
+                    <DoubleTransition Property="MaxHeight" Duration="0:0:0.28" Easing="{StaticResource SettingsCardResizeEase}"/>
+                </Transitions>
+            </Border.Transitions>
+            <!-- Clip children (the opaque settings rail in particular) to the card's
+                 rounded rect. Done on an inner Border so the card's BoxShadow, which
+                 draws outside the bounds, is not clipped with it. -->
+            <Border CornerRadius="21" ClipToBounds="True">
+                <!-- Settings content, built on first open rather than at window
+                     construction. SettingsView is ~3,000 lines of XAML for a modal that
+                     is closed at startup, and instantiating it inline made it part of
+                     MainWindow's InitializeComponent — the single largest block of the
+                     launch path. Code-behind fills this host the first time the modal
+                     opens (EnsureSettingsViewLoaded). The close X lives in the
+                     SettingsView page header (it binds CloseSettingsCommand through the window). -->
+                <ContentControl Name="SettingsViewHost"
+                                DataContext="{Binding Settings}"
+                                Background="Transparent"/>
+            </Border>
+        </Border>
+      </Panel>
+    </Border>
+
+    <!-- Drag chip: follows the pointer while tracks / an album are dragged (the OS drag
+         shows no picture of what is moving). Artwork, title, artist, and a count badge
+         when more than one song rides along. Filled and positioned from code-behind
+         (DragFileBehavior.DragPreviewStarted + the window's DragOver). Never hit-testable,
+         so it can't steal the drop from what is under the pointer. -->
+    <Border x:Name="DragChip"
+            IsVisible="False"
+            IsHitTestVisible="False"
+            ZIndex="100"
+            HorizontalAlignment="Left"
+            VerticalAlignment="Top"
+            MaxWidth="260"
+            Padding="6,6,14,6"
+            CornerRadius="12"
+            Background="{DynamicResource IslandBackground}"
+            BorderBrush="#26FFFFFF"
+            BorderThickness="1"
+            BoxShadow="0 10 30 0 #80000000"
+            Opacity="0">
+        <Border.Transitions>
+            <Transitions>
+                <DoubleTransition Property="Opacity" Duration="0:0:0.12" />
+            </Transitions>
+        </Border.Transitions>
+        <Border.RenderTransform>
+            <TranslateTransform />
+        </Border.RenderTransform>
+        <Grid ColumnDefinitions="Auto,*">
+            <Panel Width="40" Height="40">
+                <Border CornerRadius="7" ClipToBounds="True" Background="#22FFFFFF">
+                    <controls:CachedImage x:Name="DragChipArt"
+                                          DecodeWidth="128"
+                                          Stretch="UniformToFill"
+                                          RenderOptions.BitmapInterpolationMode="HighQuality" />
+                </Border>
+                <Border x:Name="DragChipCount"
+                        IsVisible="False"
+                        MinWidth="18" Height="18"
+                        Padding="5,0"
+                        CornerRadius="9"
+                        Margin="0,-6,-7,0"
+                        HorizontalAlignment="Right"
+                        VerticalAlignment="Top"
+                        Background="{DynamicResource AccentColorBrush}">
+                    <TextBlock x:Name="DragChipCountText"
+                               FontSize="10"
+                               FontWeight="Bold"
+                               Foreground="{DynamicResource AccentForegroundBrush}"
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Center" />
+                </Border>
+            </Panel>
+            <StackPanel Grid.Column="1" Margin="10,0,0,0" VerticalAlignment="Center" Spacing="1">
+                <!-- Title run + the tiles' compact E badge (set from OnDragPreviewStarted). -->
+                <TextBlock x:Name="DragChipTitle"
+                           FontSize="13"
+                           FontWeight="SemiBold"
+                           Foreground="{DynamicResource IslandForeground}"
+                           TextTrimming="CharacterEllipsis"
+                           MaxLines="1">
+                    <Run />
+                    <InlineUIContainer BaselineAlignment="Center">
+                        <Border x:Name="DragChipExplicit"
+                                Classes="explicit-badge compact"
+                                Margin="6,0,0,0"
+                                IsVisible="False">
+                            <TextBlock Text="E"
+                                       Classes="explicit-badge-text compact"
+                                       FontSize="8"
+                                       Opacity="0.9" />
+                        </Border>
+                    </InlineUIContainer>
+                </TextBlock>
+                <TextBlock x:Name="DragChipSubtitle"
+                           FontSize="11"
+                           FontWeight="SemiBold"
+                           Opacity="0.55"
+                           Foreground="{DynamicResource IslandForeground}"
+                           TextTrimming="CharacterEllipsis"
+                           MaxLines="1" />
+            </StackPanel>
+        </Grid>
+    </Border>
+
+    </Panel>
+
+</Window>

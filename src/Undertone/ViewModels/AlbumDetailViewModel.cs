@@ -1,0 +1,1273 @@
+using System.Collections.ObjectModel;
+using System.Diagnostics;
+using System.Linq;
+using Avalonia.Media;
+using Avalonia.Media.Imaging;
+using Avalonia.Threading;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using Undertone.Helpers;
+using Undertone.Models;
+using Undertone.Services;
+
+namespace Undertone.ViewModels;
+
+/// <summary>
+/// ViewModel for viewing a single album's track listing.
+/// Shown when the user clicks an album in the grid.
+/// </summary>
+public partial class AlbumDetailViewModel : ViewModelBase, IDisposable
+{
+    private readonly PlayerViewModel _player;
+    private readonly ILibraryService _library;
+    private readonly IPersistenceService _persistence;
+    private readonly IAnimatedCoverService _animatedCovers;
+    private readonly ILastFmService _lastFm;
+    private readonly SidebarViewModel _sidebar;
+    private readonly SettingsViewModel? _settings;
+    private readonly System.ComponentModel.PropertyChangedEventHandler _playerPropertyChangedHandler;
+    private readonly EventHandler _libraryUpdatedHandler;
+    private readonly EventHandler _favoritesChangedHandler;
+    private readonly System.ComponentModel.PropertyChangedEventHandler? _settingsPropertyChangedHandler;
+    private readonly EventHandler<string>? _themeChangedHandler;
+    private readonly EventHandler _accentAppliedHandler;
+
+    /// <summary>Saved scroll offset for restoring position after navigation.</summary>
+    public double SavedScrollOffset { get; set; }
+
+    [ObservableProperty] private Album _album;
+    [ObservableProperty] private Bitmap? _albumArt;
+
+    /// <summary>Path to the album's artwork file used by <see cref="Controls.CachedImage"/>
+    /// in the header. Set synchronously when the page opens so the cover paints on
+    /// the first frame from the shared LRU cache — no flash. (The Bitmap-based
+    /// <see cref="AlbumArt"/> property is retained for back-compat with any consumer
+    /// not yet migrated.)</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CanViewArtwork))]
+    [NotifyCanExecuteChangedFor(nameof(ViewArtworkCommand))]
+    private string? _headerArtPath;
+
+    /// <summary>GitHub #114: the header cover opens full size when there is a still cover to
+    /// show. An animated cover plays over the still one; the viewer shows the still.</summary>
+    public bool CanViewArtwork => !string.IsNullOrEmpty(HeaderArtPath);
+
+    /// <summary>Shows a cover file full size until the viewer closes; tests swap it out.</summary>
+    internal Func<string, Task> ShowArtworkViewer { get; set; } = Views.ArtworkViewerDialog.ShowAsync;
+
+    /// <summary>True when this album's track is currently playing AND animated covers are enabled AND a cover exists.</summary>
+    public bool IsCurrentAlbumPlaying =>
+        (_settings?.EnableAnimatedCovers ?? false)
+        && _player.CurrentTrack != null
+        && _player.CurrentTrack.AlbumId == Album.Id
+        && !string.IsNullOrEmpty(_player.CurrentAnimatedCoverPath);
+
+    /// <summary>This album's own animated cover, if any — shown in the header whenever the
+    /// album is being viewed, regardless of whether it's playing.</summary>
+    [ObservableProperty] private string? _animatedCoverPath;
+
+    /// <summary>True when the header should animate (an animated cover exists and the feature is on).</summary>
+    public bool ShowAnimatedCover =>
+        (_settings?.EnableAnimatedCovers ?? false) && !string.IsNullOrEmpty(AnimatedCoverPath);
+
+    partial void OnAnimatedCoverPathChanged(string? value) => OnPropertyChanged(nameof(ShowAnimatedCover));
+
+    public PlayerViewModel Player => _player;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasTint))]
+    private IBrush? _backgroundBrush;
+
+    /// <summary>True while the album block is painted with the cover tint.</summary>
+    public bool HasTint => BackgroundBrush != null;
+
+    /// <summary>Settings → Album Page → Tint whole page: the tint also runs under Other
+    /// Versions / More By; true without a settings VM.</summary>
+    public bool TintWholePage => _settings?.AlbumPageTintWholePage ?? AppSettings.AlbumPageTintWholePageDefault;
+    [ObservableProperty] private bool _isLightTint;
+    [ObservableProperty] private IBrush _pageForegroundBrush = Brushes.White;
+    [ObservableProperty] private IBrush _pageSubtleForegroundBrush = new SolidColorBrush(Color.FromArgb(0xB0, 0xFF, 0xFF, 0xFF));
+    [ObservableProperty] private IBrush _pageDividerBrush = new SolidColorBrush(Color.FromArgb(0x1F, 0xFF, 0xFF, 0xFF));
+
+    // Header controls on a tint (AlbumTintPalette.ForPage): only read by the view's on-tint
+    // styles, so the untinted page keeps its accent resources untouched.
+    [ObservableProperty] private IBrush _tintButtonBackground = new SolidColorBrush(AlbumTintPalette.HeartRed);
+    [ObservableProperty] private IBrush _tintButtonForeground = Brushes.White;
+    [ObservableProperty] private IBrush _tintButtonBorder = Brushes.Transparent;
+    [ObservableProperty] private IBrush _tintIconBrush = Brushes.White;
+    [ObservableProperty] private IBrush _tintHeartBrush = new SolidColorBrush(AlbumTintPalette.HeartRed);
+    [ObservableProperty] private Guid? _currentPlayingTrackId;
+    [ObservableProperty] private bool _isPlayerPlaying;
+    [ObservableProperty] private string _albumDescription = string.Empty;
+    [ObservableProperty] private string _albumDescriptionFull = string.Empty;
+    [ObservableProperty] private bool _isAlbumDescriptionOpen;
+    [ObservableProperty] private bool _isAlbumDescriptionEditing;
+    [ObservableProperty] private string _albumDescriptionEditorText = string.Empty;
+
+    /// <summary>Whether all tracks in the album are favorited (for metadata row heart).</summary>
+    public bool IsAlbumFavorited => Album?.IsAllTracksFavorite ?? false;
+
+    public bool HasAlbumDescription => !string.IsNullOrWhiteSpace(AlbumDescription);
+
+    /// <summary>What the description popup reads: the full text, else the short one (the
+    /// popup used to bind the full text only and showed nothing when just the short existed).</summary>
+    public string AlbumDescriptionDialogText =>
+        !string.IsNullOrWhiteSpace(AlbumDescriptionFull) ? AlbumDescriptionFull : AlbumDescription;
+    public bool HasAlbumDescriptionDialogText => !string.IsNullOrWhiteSpace(AlbumDescriptionDialogText);
+    public bool HasAlbumDescriptionOverflow =>
+        !string.IsNullOrWhiteSpace(AlbumDescription) &&
+        (
+            AlbumDescription.Length > 260 ||
+            (
+                !string.IsNullOrWhiteSpace(AlbumDescriptionFull) &&
+                !string.Equals(
+                    AlbumDescription.Trim(),
+                    AlbumDescriptionFull.Trim(),
+                    StringComparison.Ordinal)
+            )
+        );
+    public bool HasAlbumDescriptionChanges =>
+        !string.Equals(
+            (AlbumDescriptionEditorText ?? string.Empty).Trim(),
+            (!string.IsNullOrWhiteSpace(AlbumDescriptionFull) ? AlbumDescriptionFull : AlbumDescription).Trim(),
+            StringComparison.Ordinal);
+
+    /// <summary>Tracks in this album, ordered by disc and track number.</summary>
+    public BulkObservableCollection<Track> Tracks { get; } = new();
+
+    /// <summary>Other versions of this album (same artist, normalized base title), excluding self.</summary>
+    public ObservableCollection<Album> OtherVersions { get; } = new();
+
+    /// <summary>Up to 20 random albums by the same artist, excluding the current album and any in OtherVersions.</summary>
+    public ObservableCollection<Album> MoreByArtist { get; } = new();
+
+    public bool HasOtherVersions => OtherVersions.Count > 0;
+    public bool HasMoreByArtist => MoreByArtist.Count > 0;
+
+    /// <summary>"Other Versions" / "More By" fold state, shared by every album (Settings keeps it).</summary>
+    public bool IsOtherVersionsExpanded
+    {
+        get => _settings?.AlbumOtherVersionsExpanded ?? _otherVersionsExpanded;
+        set
+        {
+            if (value == IsOtherVersionsExpanded) return;
+            if (_settings != null) _settings.AlbumOtherVersionsExpanded = value;
+            else _otherVersionsExpanded = value;
+            OnPropertyChanged();
+        }
+    }
+    private bool _otherVersionsExpanded = true;
+
+    public bool IsMoreByExpanded
+    {
+        get => _settings?.AlbumMoreByExpanded ?? _moreByExpanded;
+        set
+        {
+            if (value == IsMoreByExpanded) return;
+            if (_settings != null) _settings.AlbumMoreByExpanded = value;
+            else _moreByExpanded = value;
+            OnPropertyChanged();
+        }
+    }
+    private bool _moreByExpanded = true;
+
+    [RelayCommand]
+    private void ToggleOtherVersionsSection() => IsOtherVersionsExpanded = !IsOtherVersionsExpanded;
+
+    [RelayCommand]
+    private void ToggleMoreBySection() => IsMoreByExpanded = !IsMoreByExpanded;
+    public string MoreByArtistTitle => $"More By {Album?.Artist}";
+
+    /// <summary>Tracks grouped by disc number for multi-disc display.</summary>
+    public ObservableCollection<DiscGroup> DiscGroups { get; } = new();
+
+    /// <summary>Whether the album spans multiple discs.</summary>
+    public bool HasMultipleDiscs => DiscGroups.Count > 1;
+
+    /// <summary>Individual artist names parsed from the album artist field, with separator info for display.</summary>
+    public ArtistTokenItem[] ArtistTokens { get; private set; } = Array.Empty<ArtistTokenItem>();
+
+    /// <summary>Whether the album has multiple credited artists.</summary>
+    public bool HasMultipleArtists => ArtistTokens.Length > 1;
+
+    /// <summary>Exposes playlists for the Add to Playlist submenu.</summary>
+    public ObservableCollection<Playlist> Playlists => _sidebar.Playlists;
+
+    /// <summary>Fires when the user wants to go back to the album grid.</summary>
+    public event EventHandler? BackRequested;
+
+    /// <summary>Fires when the user wants to view a track's album (may differ from current album).</summary>
+    public event EventHandler<Track>? ViewAlbumRequested;
+
+    private Action<string>? _viewArtistAction;
+    private Action<Track>? _searchLyricsAction;
+    private Action<string, System.Collections.Generic.IEnumerable<Album>>? _openMoreByArtistAction;
+
+    // Stable random pick of "More By Artist" for the currently-viewed album.
+    // Captured the first time we build sections for an (artist, albumId) pair,
+    // and reused on every rebuild so saves / library updates don't reshuffle.
+    private string? _moreByArtistKey;
+    private List<Guid>? _moreByArtistOrder;
+
+    /// <summary>Sets the action to navigate to an artist's discography.</summary>
+    public void SetViewArtistAction(Action<string> action) => _viewArtistAction = action;
+
+    /// <summary>Sets the action to search lyrics for a track.</summary>
+    public void SetSearchLyricsAction(Action<Track> action) => _searchLyricsAction = action;
+
+    /// <summary>Sets the action to open the dedicated "More By {Artist}" page.</summary>
+    public void SetOpenMoreByArtistAction(Action<string, System.Collections.Generic.IEnumerable<Album>> action)
+        => _openMoreByArtistAction = action;
+
+    public AlbumDetailViewModel(Album album, PlayerViewModel player, IPersistenceService persistence, ILibraryService library, SidebarViewModel sidebar, ILastFmService lastFm, SettingsViewModel? settings = null)
+    {
+        _player = player;
+        _library = library;
+        _persistence = persistence;
+        _animatedCovers = new AnimatedCoverService(persistence);
+        _lastFm = lastFm;
+        _sidebar = sidebar;
+        _settings = settings;
+        _album = album;
+
+        // Parse individual artist names from the album artist field
+        var tokens = Track.ParseArtistTokens(album.Artist);
+        if (tokens.Length == 0) tokens = new[] { album.Artist };
+        ArtistTokens = tokens.Select((name, i) => new ArtistTokenItem(name, IsLast: i == tokens.Length - 1)).ToArray();
+
+        // Load tracks (single Reset event instead of N Add events)
+        Tracks.ReplaceAll(album.Tracks);
+        BuildDiscGroups();
+        AnimatedCoverPath = ResolveAlbumAnimatedCover();
+
+        // Drive the header via CachedImage so the cover paints from the shared LRU
+        // cache on the first frame (no flash). The CachedImage control handles
+        // background decode + previous-frame retention on cache miss internally.
+        var artPath = persistence.GetArtworkPath(album.Id);
+        HeaderArtPath = File.Exists(artPath) ? artPath : null;
+
+        // Track the currently playing song — store handler so we can unsubscribe in Dispose
+        UpdateCurrentPlayingTrack();
+        IsPlayerPlaying = _player.State == Models.PlaybackState.Playing;
+        _playerPropertyChangedHandler = (_, e) =>
+        {
+            if (e.PropertyName == nameof(PlayerViewModel.CurrentTrack))
+            {
+                UpdateCurrentPlayingTrack();
+                OnPropertyChanged(nameof(IsCurrentAlbumPlaying));
+            }
+            if (e.PropertyName == nameof(PlayerViewModel.State))
+                IsPlayerPlaying = _player.State == Models.PlaybackState.Playing;
+            if (e.PropertyName == nameof(PlayerViewModel.CurrentAnimatedCoverPath))
+                OnPropertyChanged(nameof(IsCurrentAlbumPlaying));
+        };
+        _player.PropertyChanged += _playerPropertyChangedHandler;
+
+        // Refresh when library metadata changes (e.g. metadata editor save). A scan's
+        // progressive fill publishes only the tracks found SO FAR every 1.5 s, so an album
+        // missing from one is "not walked yet", not removed — refreshing then closed the
+        // page mid-scan. The authoritative publish follows with IsPublishingPartial false.
+        // Checked at raise time: the scan can end (flag cleared, partial snapshot still
+        // live) before a posted refresh runs.
+        _libraryUpdatedHandler = (_, _) =>
+        {
+            if (_library.IsPublishingPartial) return;
+            Dispatcher.UIThread.Post(RefreshFromLibrary);
+        };
+        _library.LibraryUpdated += _libraryUpdatedHandler;
+
+        // Refresh album-level favorite indicators when any favorite changes externally
+        _favoritesChangedHandler = (_, _) => Dispatcher.UIThread.Post(() =>
+        {
+            OnPropertyChanged(nameof(IsAlbumFavorited));
+            });
+        _library.FavoritesChanged += _favoritesChangedHandler;
+
+        // Live-toggle the cover-art tint when the user flips the setting.
+        if (_settings != null)
+        {
+            _settingsPropertyChangedHandler = (_, e) =>
+            {
+                if (e.PropertyName == nameof(SettingsViewModel.EnableAnimatedCovers))
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        OnPropertyChanged(nameof(IsCurrentAlbumPlaying));
+                        OnPropertyChanged(nameof(ShowAnimatedCover));
+                    });
+                else if (e.PropertyName == nameof(SettingsViewModel.AlbumPageTintEnabled))
+                    Dispatcher.UIThread.Post(RebuildBackgroundBrush);
+                else if (e.PropertyName == nameof(SettingsViewModel.AlbumPageTintStrength))
+                    Dispatcher.UIThread.Post(ReapplyTint);
+                else if (e.PropertyName == nameof(SettingsViewModel.AlbumPageTintWholePage))
+                    Dispatcher.UIThread.Post(() => OnPropertyChanged(nameof(TintWholePage)));
+            };
+            _settings.PropertyChanged += _settingsPropertyChangedHandler;
+            // A theme switch flips the untinted page text between the variants' colours.
+            _themeChangedHandler = (_, _) => Dispatcher.UIThread.Post(RebuildBackgroundBrush);
+            _settings.ThemeChanged += _themeChangedHandler;
+        }
+
+        // The header pills are checked against the accent, which changes with the picker and
+        // with "Accent follows album art" on every track change.
+        _accentAppliedHandler = (_, _) => Dispatcher.UIThread.Post(ReapplyTint);
+        App.AccentApplied += _accentAppliedHandler;
+
+        // Build related-album sections from the local library.
+        // Deferred to background priority so the page paints first; the carousel
+        // rows below the fold can fill in a frame later without delaying first
+        // paint of the album header + track list. On large artist catalogues
+        // this work (normalize titles, OrderBy(Random)) was the dominant cost
+        // of opening an album.
+        Dispatcher.UIThread.Post(BuildRelatedSections, DispatcherPriority.Background);
+
+        // Fetch album description asynchronously; fail silently if unavailable.
+        _ = LoadAlbumDescriptionAsync();
+    }
+
+    partial void OnAlbumChanged(Album value)
+    {
+        var tokens = Track.ParseArtistTokens(value.Artist);
+        if (tokens.Length == 0) tokens = new[] { value.Artist };
+        ArtistTokens = tokens.Select((name, i) => new ArtistTokenItem(name, IsLast: i == tokens.Length - 1)).ToArray();
+        OnPropertyChanged(nameof(ArtistTokens));
+        OnPropertyChanged(nameof(HasMultipleArtists));
+        OnPropertyChanged(nameof(MoreByArtistTitle));
+        BuildRelatedSections();
+    }
+
+    partial void OnAlbumDescriptionChanged(string value)
+    {
+        OnPropertyChanged(nameof(AlbumDescriptionDialogText));
+        OnPropertyChanged(nameof(HasAlbumDescriptionDialogText));
+        OnPropertyChanged(nameof(HasAlbumDescription));
+        OnPropertyChanged(nameof(ShowAddAlbumDescription));
+        OnPropertyChanged(nameof(HasAlbumDescriptionOverflow));
+        OnPropertyChanged(nameof(HasAlbumDescriptionChanges));
+        SaveAlbumDescriptionEditCommand.NotifyCanExecuteChanged();
+    }
+
+    partial void OnAlbumDescriptionFullChanged(string value)
+    {
+        // Keep visibility binding stable even if only one payload variant is available.
+        OnPropertyChanged(nameof(AlbumDescriptionDialogText));
+        OnPropertyChanged(nameof(HasAlbumDescriptionDialogText));
+        OnPropertyChanged(nameof(HasAlbumDescription));
+        OnPropertyChanged(nameof(HasAlbumDescriptionOverflow));
+        OnPropertyChanged(nameof(HasAlbumDescriptionChanges));
+        SaveAlbumDescriptionEditCommand.NotifyCanExecuteChanged();
+    }
+
+    partial void OnAlbumDescriptionEditorTextChanged(string value)
+    {
+        OnPropertyChanged(nameof(HasAlbumDescriptionChanges));
+        SaveAlbumDescriptionEditCommand.NotifyCanExecuteChanged();
+    }
+
+    private async Task LoadAlbumDescriptionAsync()
+    {
+        try
+        {
+            var summaryTask = _lastFm.GetAlbumDescriptionAsync(Album.Artist, Album.Name);
+            var fullTask = _lastFm.GetAlbumDescriptionFullAsync(Album.Artist, Album.Name);
+            await Task.WhenAll(summaryTask, fullTask);
+
+            var summary = await summaryTask;
+            var full = await fullTask;
+
+            var snippet = !string.IsNullOrWhiteSpace(summary) ? summary : full;
+            var fullText = !string.IsNullOrWhiteSpace(full) ? full : summary;
+            // The editor follows the lookup while it still holds what was shown before it:
+            // "Edit Description" can open before the lookup lands, and an untouched (empty)
+            // editor then counted as a change — Save lit up and wrote an empty override that
+            // erased the album's description. Text the user typed is never replaced.
+            var editorUntouched = string.Equals(
+                (AlbumDescriptionEditorText ?? string.Empty).Trim(),
+                AlbumDescriptionDialogText.Trim(),
+                StringComparison.Ordinal);
+            if (!string.IsNullOrWhiteSpace(snippet))
+                AlbumDescription = snippet;
+            if (!string.IsNullOrWhiteSpace(fullText))
+                AlbumDescriptionFull = fullText;
+            if (editorUntouched)
+                AlbumDescriptionEditorText = AlbumDescriptionDialogText;
+        }
+        catch
+        {
+            // Fail silently by design.
+        }
+        finally
+        {
+            IsAlbumDescriptionLoaded = true;
+        }
+    }
+
+    /// <summary>The description lookup finished (found or not). "Add a description" waits for it,
+    /// so it never flashes on an album whose text is still on its way.</summary>
+    [ObservableProperty, NotifyPropertyChangedFor(nameof(ShowAddAlbumDescription))]
+    private bool _isAlbumDescriptionLoaded;
+
+    public bool ShowAddAlbumDescription => IsAlbumDescriptionLoaded && !HasAlbumDescription;
+
+    /// <summary>Resolves this album's animated cover from its first track (sidecar or managed cache).</summary>
+    private string? ResolveAlbumAnimatedCover()
+        => Tracks.Count > 0 ? _animatedCovers.Resolve(Tracks[0]) : null;
+
+    private void RefreshFromLibrary()
+    {
+        // Try to find album by current ID first
+        var updatedAlbum = _library.Albums.FirstOrDefault(a => a.Id == Album.Id);
+
+        // If not found, the album/artist name was edited causing AlbumId to change.
+        // Find the new album by looking for one that contains any of our tracks.
+        if (updatedAlbum == null)
+        {
+            var trackIds = Tracks.Select(t => t.Id).ToHashSet();
+            updatedAlbum = _library.Albums
+                .FirstOrDefault(a => a.Tracks.Any(t => trackIds.Contains(t.Id)));
+        }
+
+        if (updatedAlbum == null)
+        {
+            // Album truly removed — navigate back
+            BackRequested?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+
+        // A metadata save can change the album's identity (album/artist rename →
+        // new AlbumId), but it's still the same page. Re-key the stable
+        // "More By Artist" pick instead of letting the key miss and reshuffle
+        // the carousel under the user.
+        if (_moreByArtistKey != null && _moreByArtistOrder != null)
+            _moreByArtistKey = $"{updatedAlbum.Artist}\0{updatedAlbum.Id}";
+
+        // Every index rebuild hands back a new Album, so this also rebuilds the related
+        // sections (OnAlbumChanged). The same instance means no rebuild ran: nothing to redo.
+        Album = updatedAlbum;
+
+        // The rows are rebuilt only when the track list changed. Track instances survive
+        // an index rebuild (a metadata save edits them in place and re-notifies their
+        // bindings), and the unconditional Reset tore down every row on each scan publish,
+        // analysis pass or save elsewhere: the row under the pointer flickered and an open
+        // track menu closed with its owner row (the Home / artist-page fix, 09-13/09-14).
+        if (!IsShownTrackList(updatedAlbum.Tracks))
+        {
+            Tracks.ReplaceAll(updatedAlbum.Tracks);
+            BuildDiscGroups();
+        }
+        AnimatedCoverPath = ResolveAlbumAnimatedCover();
+
+        // Refresh header art path. CachedImage in the XAML invalidates and
+        // reloads via the shared LRU cache automatically on path change.
+        var artPath = _persistence.GetArtworkPath(updatedAlbum.Id);
+        HeaderArtPath = File.Exists(artPath) ? artPath : null;
+    }
+
+    partial void OnAlbumArtChanged(Bitmap? value)
+    {
+        RebuildBackgroundBrush();
+    }
+
+    // The header art path is set synchronously in the ctor and again on library
+    // refresh; the tint follows it (the Bitmap-based AlbumArt is never assigned now).
+    partial void OnHeaderArtPathChanged(string? value) => RebuildBackgroundBrush();
+
+    private void RebuildBackgroundBrush()
+    {
+        // Apple-Music-style page tint (docs/superpowers/specs/2026-05-04-album-page-tint-design.md):
+        // the cover's edge colour becomes the page background and the page text flips
+        // dark on light covers. Extraction is a Skia decode + ring histogram, so it runs
+        // on a worker and lands via the generation guard — a page that navigated on
+        // before its colour arrived never gets the previous album's tint.
+        var generation = ++_tintGeneration;
+        var artPath = HeaderArtPath;
+        if (artPath == null || _settings?.AlbumPageTintEnabled != true)
+        {
+            ApplyTint(null);
+            return;
+        }
+
+        _ = Task.Run(() =>
+        {
+            var color = DominantColorExtractor.ExtractEdgeBackgroundColorFromFile(artPath);
+            Dispatcher.UIThread.Post(() =>
+            {
+                if (generation != _tintGeneration) return;
+                ApplyTint(color);
+            });
+        });
+    }
+
+    private int _tintGeneration;
+
+    /// <summary>True while the app runs a light-variant theme (Light); the page text is
+    /// dark on those surfaces whenever no cover tint overrides it.</summary>
+    private static bool IsLightThemeActive() =>
+        Avalonia.Application.Current?.ActualThemeVariant == Avalonia.Styling.ThemeVariant.Light;
+
+    /// <summary>Luminance above which the page text goes dark (spec §2).</summary>
+    public const double LightTintThreshold = 0.55;
+
+    /// <summary>The cover edge colour behind the current tint (before the strength blend), so
+    /// the Tint strength slider and accent changes re-blend without decoding the cover again.</summary>
+    private Color? _tintEdgeColor;
+
+    /// <summary>Settings › Artwork › Tint strength, in percent; 100 without a settings VM.</summary>
+    private int TintStrength => _settings?.AlbumPageTintStrength ?? AppSettings.AlbumPageTintStrengthDefault;
+
+    private void ReapplyTint()
+    {
+        if (_tintEdgeColor is { } edge && _settings?.AlbumPageTintEnabled != false)
+            ApplyTint(edge);
+    }
+
+    /// <summary>The theme's own page colour, which a partial tint blends toward.</summary>
+    internal static Color ThemePageColor()
+    {
+        var fallback = IsLightThemeActive() ? Colors.White : Color.FromRgb(0x25, 0x25, 0x25);
+        return ResourceColor("AppMainBackgroundColor", fallback);
+    }
+
+    private static Color ResourceColor(string key, Color fallback)
+    {
+        var app = Avalonia.Application.Current;
+        if (app != null && app.TryGetResource(key, app.ActualThemeVariant, out var value))
+        {
+            if (value is Color c) return c;
+            if (value is ISolidColorBrush b) return b.Color;
+        }
+        return fallback;
+    }
+
+    /// <summary>Applies a cover edge colour (or clears it) and derives the page foreground family.
+    /// The page colour is the edge colour blended into the theme page by the Tint strength
+    /// setting (100 = the edge colour as is). Public for tests; callers on the UI thread only.</summary>
+    public void ApplyTint(Color? tint)
+    {
+        _tintEdgeColor = tint;
+        bool light;
+        if (tint is not { } edge)
+        {
+            // No tint: the page sits on the theme surface, so the text follows the theme
+            // variant (white text on the Light theme was invisible, 09-17).
+            BackgroundBrush = null;
+            IsLightTint = false;
+            light = IsLightThemeActive();
+        }
+        else
+        {
+            var strength = TintStrength;
+            var color = AlbumTintPalette.PageColor(edge, ThemePageColor(), strength);
+            BackgroundBrush = BuildTintBrush(color);
+            light = AlbumTintPalette.UsesDarkText(color, strength, LightTintThreshold);
+            IsLightTint = light;
+            ApplyTintHeaderColours(color);
+        }
+        PageForegroundBrush = light ? new SolidColorBrush(Color.FromRgb(0x11, 0x11, 0x11)) : Brushes.White;
+        PageSubtleForegroundBrush = new SolidColorBrush(light
+            ? Color.FromArgb(0x66, 0x00, 0x00, 0x00)
+            : Color.FromArgb(0xB0, 0xFF, 0xFF, 0xFF));
+        PageDividerBrush = new SolidColorBrush(light
+            ? Color.FromArgb(0x1F, 0x00, 0x00, 0x00)
+            : Color.FromArgb(0x1F, 0xFF, 0xFF, 0xFF));
+    }
+
+    /// <summary>The album block's fill for a tint: the cover's edge colour, flat, the way
+    /// iTunes' expanded album view painted it (user ask 2026-09-07: no gradient).</summary>
+    public static SolidColorBrush BuildTintBrush(Color color) => new(color);
+
+    /// <summary>Header pill / heart / "…" colours for a tinted page colour: the live accent
+    /// where it already stands apart from the page, a lighter or darker shade of it where it
+    /// would melt in (the accent may BE the cover colour with "Accent follows album art").</summary>
+    private void ApplyTintHeaderColours(Color page)
+    {
+        var accent = ResourceColor("AccentButtonBackground", AlbumTintPalette.HeartRed);
+        var c = AlbumTintPalette.ForPage(
+            page,
+            accent,
+            ResourceColor("AccentForegroundBrush", Colors.White),
+            ResourceColor("AccentBorderBrush", Colors.Transparent),
+            ResourceColor("AccentTextExactBrush", accent));
+        TintButtonBackground = new SolidColorBrush(c.Fill);
+        TintButtonForeground = new SolidColorBrush(c.Label);
+        TintButtonBorder = new SolidColorBrush(c.Border);
+        TintIconBrush = new SolidColorBrush(c.Icon);
+        TintHeartBrush = new SolidColorBrush(c.Heart);
+    }
+
+    private void BuildRelatedSections()
+    {
+        var currentArtist = Album?.Artist;
+        var currentId = Album?.Id ?? Guid.Empty;
+        if (string.IsNullOrWhiteSpace(currentArtist) || currentId == Guid.Empty)
+        {
+            OtherVersions.Clear();
+            MoreByArtist.Clear();
+            OnPropertyChanged(nameof(HasOtherVersions));
+            OnPropertyChanged(nameof(HasMoreByArtist));
+            OnPropertyChanged(nameof(MoreByArtistTitle));
+            return;
+        }
+
+        var artistAlbums = _library.GetAlbumsByArtist(currentArtist)
+            .Where(a => a.Id != currentId)
+            .ToList();
+
+        var currentNormalized = AlbumTitle.NormalizeForEdition(Album!.Name);
+
+        var versions = artistAlbums
+            .Where(a => string.Equals(AlbumTitle.NormalizeForEdition(a.Name), currentNormalized, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        OtherVersions.Clear();
+        foreach (var a in versions)
+            OtherVersions.Add(a);
+
+        var versionIds = versions.Select(v => v.Id).ToHashSet();
+        var pool = artistAlbums.Where(a => !versionIds.Contains(a.Id)).ToList();
+
+        // Stable picks: sample once per (artist, albumId) and reuse on subsequent
+        // rebuilds (e.g. metadata save → LibraryUpdated) so the section doesn't
+        // reshuffle while the user is viewing the same album.
+        var key = $"{currentArtist}\0{currentId}";
+        var poolById = pool.ToDictionary(a => a.Id);
+        List<Album> picks;
+        if (_moreByArtistKey == key && _moreByArtistOrder != null)
+        {
+            picks = _moreByArtistOrder
+                .Where(id => poolById.ContainsKey(id))
+                .Select(id => poolById[id])
+                .ToList();
+        }
+        else
+        {
+            picks = pool
+                .OrderBy(_ => Random.Shared.Next())
+                .Take(20)
+                .ToList();
+            _moreByArtistKey = key;
+            _moreByArtistOrder = picks.Select(a => a.Id).ToList();
+        }
+
+        MoreByArtist.Clear();
+        foreach (var a in picks)
+            MoreByArtist.Add(a);
+
+        OnPropertyChanged(nameof(HasOtherVersions));
+        OnPropertyChanged(nameof(HasMoreByArtist));
+        OnPropertyChanged(nameof(MoreByArtistTitle));
+    }
+
+    /// <summary>
+    /// Rows the page realizes synchronously on open; anything beyond streams in
+    /// on background dispatcher passes. The track list is non-virtualized (see
+    /// AlbumDetailView's ItemsPanel comment), so every row is real layout work —
+    /// degenerate track sets like the shared Unknown-Album bucket (every untagged
+    /// file in the library in one pseudo-album) froze the UI thread for minutes
+    /// and ran the app out of memory when realized in one pass. Real albums
+    /// almost never exceed this and keep their single-pass behavior.
+    /// </summary>
+    private const int TrackRealizeChunk = 200;
+
+    // Cancels an in-flight incremental fill when the groups are rebuilt
+    // (library update, album re-key) or the page is disposed.
+    private int _discFillGeneration;
+
+    // Each row's disc when the groups were built: a disc edit is made in place, so it can
+    // regroup the rows without changing their order.
+    private int[] _groupedDiscNumbers = Array.Empty<int>();
+
+    /// <summary>True when <paramref name="next"/> is what the rows already show: the same
+    /// Track instances in the same order, each still on the disc it was grouped under.
+    /// Reference equality on purpose: a rescan's fresh Track instances must re-bind.</summary>
+    private bool IsShownTrackList(IReadOnlyList<Track> next)
+    {
+        if (next.Count != Tracks.Count || next.Count != _groupedDiscNumbers.Length) return false;
+        for (int i = 0; i < next.Count; i++)
+        {
+            if (!ReferenceEquals(Tracks[i], next[i]) || next[i].DiscNumber != _groupedDiscNumbers[i])
+                return false;
+        }
+        return true;
+    }
+
+    private void BuildDiscGroups()
+    {
+        var generation = ++_discFillGeneration;
+        _groupedDiscNumbers = Tracks.Select(t => t.DiscNumber).ToArray();
+        DiscGroups.Clear();
+        var pending = new List<(ObservableCollection<Track> Target, List<Track> Remainder)>();
+        // Disc 0 (untagged) is disc 1, as in InAlbumOrder and the library's album sort: a
+        // separate "Disc 0" group sat above disc 1 while play order ran 1, 2, … across both,
+        // so Play on a row there skipped the disc-1 rows shown below it.
+        foreach (var g in Tracks.GroupBy(t => t.DiscNumber <= 0 ? 1 : t.DiscNumber).OrderBy(g => g.Key))
+        {
+            var all = g.ToList();
+            var visible = new ObservableCollection<Track>(all.Take(TrackRealizeChunk));
+            DiscGroups.Add(new DiscGroup(g.Key, $"Disc {g.Key}", visible));
+            if (all.Count > visible.Count)
+                pending.Add((visible, all.GetRange(visible.Count, all.Count - visible.Count)));
+        }
+        if (pending.Count > 0)
+            Dispatcher.UIThread.Post(
+                () => FillNextTrackChunk(pending, 0, 0, generation),
+                DispatcherPriority.Background);
+        OnPropertyChanged(nameof(HasMultipleDiscs));
+    }
+
+    private void FillNextTrackChunk(
+        List<(ObservableCollection<Track> Target, List<Track> Remainder)> pending,
+        int groupIndex, int offset, int generation)
+    {
+        if (generation != _discFillGeneration || groupIndex >= pending.Count)
+            return;
+
+        var (target, remainder) = pending[groupIndex];
+        var end = Math.Min(offset + TrackRealizeChunk, remainder.Count);
+        for (var i = offset; i < end; i++)
+            target.Add(remainder[i]);
+
+        var (nextGroup, nextOffset) = end >= remainder.Count ? (groupIndex + 1, 0) : (groupIndex, end);
+        if (nextGroup < pending.Count)
+            Dispatcher.UIThread.Post(
+                () => FillNextTrackChunk(pending, nextGroup, nextOffset, generation),
+                DispatcherPriority.Background);
+    }
+
+    private static List<Track> InAlbumOrder(IEnumerable<Track> tracks) =>
+        tracks
+            .OrderBy(t => t.DiscNumber <= 0 ? 1 : t.DiscNumber)
+            .ThenBy(t => t.TrackNumber <= 0 ? int.MaxValue : t.TrackNumber)
+            .ThenBy(t => t.Title, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    private void UpdateCurrentPlayingTrack()
+    {
+        CurrentPlayingTrackId = _player.CurrentTrack?.Id;
+    }
+
+    [RelayCommand]
+    private void PlayAll()
+    {
+        if (Tracks.Count == 0) return;
+        var tracks = InAlbumOrder(Tracks);
+        DebugLogger.Info(DebugLogger.Category.Queue, "Album.Play", $"tracks={tracks.Count}, startIdx=0");
+        _player.ReplaceQueueAndPlay(tracks, 0);
+    }
+
+    [RelayCommand]
+    private void ShufflePlay()
+    {
+        if (Tracks.Count == 0) return;
+        _player.PlayShuffled(InAlbumOrder(Tracks));
+    }
+
+    [RelayCommand]
+    private void PlayFrom(Track track)
+    {
+        var tracks = InAlbumOrder(Tracks);
+        var idx = tracks.FindIndex(t => t.Id == track.Id);
+        if (idx < 0) idx = 0;
+        DebugLogger.Info(DebugLogger.Category.Queue, "Album.PlayFrom", $"tracks={tracks.Count}, startIdx={idx}, track={track.Title}");
+        _player.ReplaceQueueAndPlay(tracks, idx);
+    }
+
+    /// <summary>Navigates to a related album shown in Other Versions / More By Artist.</summary>
+    [RelayCommand]
+    private void OpenRelatedAlbum(Album? album)
+    {
+        if (album == null || album.Tracks.Count == 0) return;
+        // Reuse the existing track-driven album-navigation event so MainWindow's
+        // history/back-button wiring stays in one place.
+        ViewAlbumRequested?.Invoke(this, album.Tracks[0]);
+    }
+
+    [RelayCommand]
+    private void ViewArtist()
+    {
+        var artist = Album.Artist;
+        if (!string.IsNullOrWhiteSpace(artist))
+            _viewArtistAction?.Invoke(artist);
+    }
+
+    /// <summary>Opens the dedicated "More By {Artist}" grid page with the carousel's albums.</summary>
+    [RelayCommand]
+    private void OpenMoreByArtistPage()
+    {
+        var artist = Album?.Artist;
+        if (string.IsNullOrWhiteSpace(artist) || MoreByArtist.Count == 0) return;
+        // Snapshot the collection so the new page is independent of subsequent rebuilds.
+        _openMoreByArtistAction?.Invoke(artist, MoreByArtist.ToArray());
+    }
+
+    [RelayCommand]
+    private void ViewArtistFromTrack(string artistName)
+    {
+        if (!string.IsNullOrWhiteSpace(artistName))
+            _viewArtistAction?.Invoke(artistName);
+    }
+
+    [RelayCommand]
+    private void ViewIndividualArtist(string artistName)
+    {
+        if (!string.IsNullOrWhiteSpace(artistName))
+            _viewArtistAction?.Invoke(artistName);
+    }
+
+    [RelayCommand]
+    private void GoBack()
+    {
+        IsAlbumDescriptionOpen = false;
+        BackRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    [RelayCommand]
+    private async Task OpenAlbumDescription()
+    {
+        if (!HasAlbumDescription) return;
+        AlbumDescriptionEditorText = !string.IsNullOrWhiteSpace(AlbumDescriptionFull)
+            ? AlbumDescriptionFull
+            : AlbumDescription;
+        IsAlbumDescriptionEditing = false;
+        await Views.AlbumDescriptionDialog.ShowAsync(this);
+        // Dialog closed — clean up state
+        IsAlbumDescriptionEditing = false;
+    }
+
+    /// <summary>Opens the header cover full size. The async command stays disabled while the
+    /// viewer is up, so a double-click on the cover opens one viewer, not two.</summary>
+    [RelayCommand(CanExecute = nameof(CanViewArtwork))]
+    private Task ViewArtwork()
+        => HeaderArtPath is { Length: > 0 } path ? ShowArtworkViewer(path) : Task.CompletedTask;
+
+    [RelayCommand]
+    private async Task EditAlbumDescription()
+    {
+        AlbumDescriptionEditorText = !string.IsNullOrWhiteSpace(AlbumDescriptionFull)
+            ? AlbumDescriptionFull
+            : AlbumDescription;
+        IsAlbumDescriptionEditing = true;
+        await Views.AlbumDescriptionDialog.ShowAsync(this);
+        // Dialog closed — clean up state
+        IsAlbumDescriptionEditing = false;
+    }
+
+    [RelayCommand]
+    private void CloseAlbumDescription()
+    {
+        IsAlbumDescriptionEditing = false;
+        IsAlbumDescriptionOpen = false;
+    }
+
+    [RelayCommand]
+    private void StartAlbumDescriptionEdit()
+    {
+        AlbumDescriptionEditorText = !string.IsNullOrWhiteSpace(AlbumDescriptionFull)
+            ? AlbumDescriptionFull
+            : AlbumDescription;
+        IsAlbumDescriptionEditing = true;
+    }
+
+    /// <summary>Raised once a description edit has been saved; the pop-up closes on it.</summary>
+    public event EventHandler? AlbumDescriptionSaved;
+
+    /// <summary>Saves the edited description. Only when the text really changed: the pop-up's
+    /// Ctrl+Enter reaches this without the Save button's disabled state, and saving the shown
+    /// Last.fm text unchanged would pin it as the user's own override.</summary>
+    [RelayCommand(CanExecute = nameof(HasAlbumDescriptionChanges))]
+    private async Task SaveAlbumDescriptionEdit()
+    {
+        if (!HasAlbumDescriptionChanges) return;
+        var edited = (AlbumDescriptionEditorText ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(edited))
+        {
+            await _lastFm.SetAlbumDescriptionOverrideAsync(Album.Artist, Album.Name, string.Empty);
+            AlbumDescription = string.Empty;
+            AlbumDescriptionFull = string.Empty;
+            AlbumDescriptionEditorText = string.Empty;
+        }
+        else
+        {
+            await _lastFm.SetAlbumDescriptionOverrideAsync(Album.Artist, Album.Name, edited);
+            AlbumDescription = edited;
+            AlbumDescriptionFull = edited;
+            AlbumDescriptionEditorText = edited;
+        }
+
+        IsAlbumDescriptionEditing = false;
+        AlbumDescriptionSaved?.Invoke(this, EventArgs.Empty);
+    }
+
+    [RelayCommand]
+    private void CancelAlbumDescriptionEdit()
+    {
+        AlbumDescriptionEditorText = !string.IsNullOrWhiteSpace(AlbumDescriptionFull)
+            ? AlbumDescriptionFull
+            : AlbumDescription;
+        IsAlbumDescriptionEditing = false;
+    }
+
+    [RelayCommand]
+    private void PlayNext(Track track) => _player.AddNext(track);
+
+    [RelayCommand]
+    private void AddToQueue(Track track) => _player.AddToQueue(track);
+
+    [RelayCommand]
+    private void StartRadio(Track track) => _player.StartRadioCommand.Execute(track);
+
+    /// <summary>The row, or the Ctrl-selection it is in (owner 10-10), in one snooze write.</summary>
+    [RelayCommand]
+    private Task SnoozeForMonth(Track track) => _player.SnoozeTracksForMonthAsync(TakeSelectionOr(track));
+
+    [RelayCommand]
+    private void SnoozeRelatedAlbumForMonth(Album album) => _player.SnoozeAlbumForMonthCommand.Execute(album);
+
+    /// <summary>Star click on a row or Rate ▸ in its menu. Rates the whole Ctrl-selection when
+    /// the row is in it, like the Songs and playlist pages (it used to rate the one row).</summary>
+    public Task RateAsync(Track track, int stars) => _library.SetTracksRatingAsync(SelectionOr(track), stars);
+
+    [RelayCommand]
+    private Task RateTrack(RateRequest request) => RateAsync(request.Track, request.Stars);
+
+    [RelayCommand]
+    private Task FetchLyrics(Track track) => MetadataHelper.OpenBulkLyricsDialog(TakeSelectionOr(track), remove: false);
+
+    [RelayCommand]
+    private Task RemoveLyrics(Track track) => MetadataHelper.OpenBulkLyricsDialog(TakeSelectionOr(track), remove: true);
+
+    [RelayCommand]
+    private Task OpenLyricsStudio(Track track) => MetadataHelper.OpenLyricsStudio(TakeSelectionOr(track));
+
+    [RelayCommand]
+    private Task SendToFolder(Track track) => MetadataHelper.OpenSendToFolderDialog(TakeSelectionOr(track));
+
+    /// <summary>Whole album → folder / Lyrics Studio (header menu).</summary>
+    [RelayCommand]
+    private Task SendAlbumToFolder() => Tracks.Count == 0 ? Task.CompletedTask : MetadataHelper.OpenSendToFolderDialog(Tracks.ToList());
+
+    [RelayCommand]
+    private Task OpenAlbumInLyricsStudio() => Tracks.Count == 0 ? Task.CompletedTask : MetadataHelper.OpenLyricsStudio(Tracks.ToList());
+
+    /// <summary>True for a moment after the header's Add to Queue: the button reads
+    /// "Added" so the click visibly did something (the queue panel may be closed).</summary>
+    [ObservableProperty] private bool _albumAddedToQueue;
+    private int _albumAddedGeneration;
+
+    [RelayCommand]
+    private async Task AddAlbumToQueue()
+    {
+        if (Tracks.Count == 0) return;
+        _player.AddRangeToQueue(InAlbumOrder(Tracks), Album.Name);
+
+        var generation = ++_albumAddedGeneration;
+        AlbumAddedToQueue = true;
+        await Task.Delay(1500);
+        if (generation == _albumAddedGeneration)
+            AlbumAddedToQueue = false;
+    }
+
+    /// <summary>Tracks Ctrl-selected in the album track list. Set by the view's code-behind.</summary>
+    public List<Track> CtrlSelectedTracks { get; set; } = new();
+
+    /// <summary>The Ctrl-selection when the acted-on row is part of it, else just that row.</summary>
+    private List<Track> SelectionOr(Track track) =>
+        CtrlSelectedTracks.Contains(track) ? CtrlSelectedTracks.ToList() : new List<Track> { track };
+
+    /// <summary><see cref="SelectionOr"/>, then the selection is used up (as the bulk actions do).</summary>
+    private List<Track> TakeSelectionOr(Track track)
+    {
+        var tracks = SelectionOr(track);
+        CtrlSelectedTracks.Clear();
+        return tracks;
+    }
+
+    [RelayCommand]
+    private async Task OpenMetadata(Track track)
+    {
+        var selection = SelectionOr(track);
+        if (selection.Count > 1)
+        {
+            CtrlSelectedTracks.Clear();
+            await MetadataHelper.OpenMultiTrackMetadataWindow(selection);
+            return;
+        }
+        await MetadataHelper.OpenMetadataWindow(track);
+    }
+
+    [RelayCommand]
+    private async Task OpenAlbumMetadata()
+    {
+        if (Tracks.Count == 0) return;
+        await MetadataHelper.OpenMetadataWindow(Tracks[0], albumScoped: true);
+    }
+
+    [RelayCommand]
+    private async Task ConvertTrack(Track track)
+    {
+        var tracks = SelectionOr(track);
+        CtrlSelectedTracks.Clear();
+        await MetadataHelper.OpenAudioConverterDialog(tracks);
+    }
+
+    [RelayCommand]
+    private async Task ScanTrackReplayGain(Track track)
+    {
+        var tracks = SelectionOr(track);
+        CtrlSelectedTracks.Clear();
+        await MetadataHelper.OpenReplayGainScannerDialog(tracks);
+    }
+
+    [RelayCommand]
+    private async Task ConvertAlbum()
+    {
+        if (Tracks.Count == 0) return;
+        await MetadataHelper.OpenAudioConverterDialog(Tracks.ToList());
+    }
+
+    [RelayCommand]
+    private async Task ScanAlbumReplayGain()
+    {
+        if (Tracks.Count == 0) return;
+        await MetadataHelper.OpenReplayGainScannerDialog(Tracks.ToList());
+    }
+
+    [RelayCommand]
+    private async Task BatchEditAlbum()
+    {
+        if (Tracks.Count == 0) return;
+        await MetadataHelper.OpenBatchMetadataWindow(Tracks.ToList());
+    }
+
+    [RelayCommand]
+    private async Task ToggleFavorite(Track track)
+    {
+        // The whole Ctrl-selection when the row is in it, all set the way the clicked
+        // row's entry reads ("Favorites" / "Remove from Favorites").
+        var tracks = TakeSelectionOr(track);
+        var newState = !track.IsFavorite;
+        foreach (var t in tracks)
+            t.IsFavorite = newState;
+        await _library.SaveTrackUserStateAsync(tracks);
+        _library.NotifyFavoritesChanged(tracks);
+        // Refresh hearts visibility
+        OnPropertyChanged(nameof(IsAlbumFavorited));
+    }
+
+    [RelayCommand]
+    private async Task ToggleAlbumFavorites()
+    {
+        if (Tracks.Count == 0) return;
+
+        var newState = !Album.IsAllTracksFavorite;
+        foreach (var track in Tracks)
+            track.IsFavorite = newState;
+
+        await _library.SaveTrackUserStateAsync(Tracks.ToList());
+        _library.NotifyFavoritesChanged(Tracks);
+        // Refresh hearts visibility
+        OnPropertyChanged(nameof(IsAlbumFavorited));
+    }
+
+    [RelayCommand]
+    private async Task AddToNewPlaylist(Track track)
+    {
+        await _sidebar.CreatePlaylistWithTracksAsync(TakeSelectionOr(track));
+    }
+
+    [RelayCommand]
+    private async Task AddAlbumToNewPlaylist()
+    {
+        if (Tracks.Count == 0) return;
+        await _sidebar.CreatePlaylistWithTracksAsync(InAlbumOrder(Tracks));
+    }
+
+    [RelayCommand]
+    private async Task RemoveFromLibrary(Track track)
+    {
+        var tracks = SelectionOr(track);
+        if (!await Helpers.LibraryRemovalHelper.RemoveWithPromptAsync(_library, tracks))
+            return;
+        CtrlSelectedTracks.Clear();
+        foreach (var removed in tracks)
+        {
+            var idx = Tracks.IndexOf(removed);
+            if (idx >= 0)
+                Tracks.RemoveAt(idx);
+        }
+    }
+
+    [RelayCommand]
+    private async Task RemoveAlbumFromLibrary()
+    {
+        if (Tracks.Count == 0) return;
+        var tracks = Tracks.ToList();
+        if (!await Helpers.LibraryRemovalHelper.RemoveWithPromptAsync(_library, tracks))
+            return;
+        Tracks.Clear();
+        BackRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    [RelayCommand]
+    private void ShowInExplorer(Track track)
+    {
+        if (track == null || !File.Exists(track.FilePath)) return;
+        Helpers.PlatformHelper.ShowInFileManager(track.FilePath);
+    }
+
+    [RelayCommand]
+    private void OpenWithExternalApp(Track track) => Helpers.ExternalOpenApp.Open(track);
+
+    /// <summary>Header/visibility for the "Open in …" menu item. XAML bindings read these
+    /// when the view loads; the label can lag a mid-session Settings change until the album
+    /// is reopened, but the command itself always reads the current setting.</summary>
+    public string ExternalOpenHeader => Helpers.ExternalOpenApp.MenuHeader;
+    public bool ExternalOpenVisible => Helpers.ExternalOpenApp.IsAvailable;
+
+    [RelayCommand]
+    private void ShowAlbumInExplorer()
+    {
+        if (Tracks.Count == 0) return;
+        var track = Tracks[0];
+        if (!File.Exists(track.FilePath)) return;
+        Helpers.PlatformHelper.ShowInFileManager(track.FilePath);
+    }
+
+    [RelayCommand]
+    private void SearchLyrics(Track track) => _searchLyricsAction?.Invoke(track);
+    [RelayCommand]
+    private void ViewAlbum(Track track) => ViewAlbumRequested?.Invoke(this, track);
+
+    [RelayCommand]
+    private void ViewCurrentAlbum()
+    {
+        if (Tracks.Count == 0) return;
+        ViewAlbumRequested?.Invoke(this, Tracks[0]);
+    }
+
+    // ----- Related album commands (Other Versions / More By Artist context menu) -----
+    // These act on a specified Album (the right-clicked tile), not the currently displayed one.
+
+    [RelayCommand]
+    private void PlayRelatedAlbum(Album? album)
+    {
+        if (album == null || album.Tracks.Count == 0) return;
+        _player.ReplaceQueueAndPlay(InAlbumOrder(album.Tracks), 0);
+    }
+
+    /// <summary>Related tile hover button: Pause/resume when this album is the loaded one,
+    /// else play it from track 1 (the Albums grid's TogglePlayAlbum).</summary>
+    [RelayCommand]
+    private void TogglePlayRelatedAlbum(Album? album)
+    {
+        if (album == null) return;
+        if (album.IsCurrent) { _player.PlayPauseCommand.Execute(null); return; }
+        PlayRelatedAlbum(album);
+    }
+
+    [RelayCommand]
+    private void ShuffleRelatedAlbum(Album? album)
+    {
+        if (album == null || album.Tracks.Count == 0) return;
+        _player.PlayShuffled(InAlbumOrder(album.Tracks));
+    }
+
+    [RelayCommand]
+    private void PlayNextRelatedAlbum(Album? album)
+    {
+        if (album == null || album.Tracks.Count == 0) return;
+        // AddNextRange keeps album order when the batch goes in up front.
+        _player.AddNextRange(InAlbumOrder(album.Tracks), album.Name);
+    }
+
+    [RelayCommand]
+    private void AddRelatedAlbumToQueue(Album? album)
+    {
+        if (album == null || album.Tracks.Count == 0) return;
+        _player.AddRangeToQueue(InAlbumOrder(album.Tracks), album.Name);
+    }
+
+    [RelayCommand]
+    private async Task AddRelatedAlbumToNewPlaylist(Album? album)
+    {
+        if (album == null || album.Tracks.Count == 0) return;
+        await _sidebar.CreatePlaylistWithTracksAsync(InAlbumOrder(album.Tracks));
+    }
+
+    [RelayCommand]
+    private async Task AddRelatedAlbumToExistingPlaylist(object[] parameters)
+    {
+        if (parameters == null || parameters.Length != 2) return;
+        if (parameters[0] is not Album album || parameters[1] is not Playlist playlist) return;
+        if (album.Tracks.Count == 0) return;
+        await _sidebar.AddTracksToPlaylist(playlist.Id, InAlbumOrder(album.Tracks));
+    }
+
+    [RelayCommand]
+    private async Task ToggleRelatedAlbumFavorites(Album? album)
+    {
+        if (album == null || album.Tracks.Count == 0) return;
+        var newState = !album.IsAllTracksFavorite;
+        foreach (var track in album.Tracks)
+            track.IsFavorite = newState;
+        await _library.SaveTrackUserStateAsync(album.Tracks.ToList());
+        _library.NotifyFavoritesChanged(album.Tracks);
+    }
+
+    [RelayCommand]
+    private async Task OpenRelatedAlbumMetadata(Album? album)
+    {
+        if (album == null || album.Tracks.Count == 0) return;
+        await MetadataHelper.OpenMetadataWindow(album.Tracks[0], albumScoped: true);
+    }
+
+    [RelayCommand]
+    private async Task ConvertRelatedAlbum(Album? album)
+    {
+        if (album == null || album.Tracks.Count == 0) return;
+        await MetadataHelper.OpenAudioConverterDialog(InAlbumOrder(album.Tracks));
+    }
+
+    [RelayCommand]
+    private async Task ScanRelatedAlbumReplayGain(Album? album)
+    {
+        if (album == null || album.Tracks.Count == 0) return;
+        await MetadataHelper.OpenReplayGainScannerDialog(InAlbumOrder(album.Tracks));
+    }
+
+    [RelayCommand]
+    private void ShowRelatedAlbumInExplorer(Album? album)
+    {
+        if (album == null || album.Tracks.Count == 0) return;
+        var track = album.Tracks[0];
+        if (!File.Exists(track.FilePath)) return;
+        Helpers.PlatformHelper.ShowInFileManager(track.FilePath);
+    }
+
+    [RelayCommand]
+    private async Task RemoveRelatedAlbumFromLibrary(Album? album)
+    {
+        if (album == null || album.Tracks.Count == 0) return;
+        await Helpers.LibraryRemovalHelper.RemoveWithPromptAsync(_library, album.Tracks.ToList());
+    }
+
+    public void Dispose()
+    {
+        _discFillGeneration++; // halt any in-flight track streaming
+        _player.PropertyChanged -= _playerPropertyChangedHandler;
+        _library.LibraryUpdated -= _libraryUpdatedHandler;
+        _library.FavoritesChanged -= _favoritesChangedHandler;
+        if (_settings != null && _settingsPropertyChangedHandler != null)
+            _settings.PropertyChanged -= _settingsPropertyChangedHandler;
+        if (_settings != null && _themeChangedHandler != null)
+            _settings.ThemeChanged -= _themeChangedHandler;
+        App.AccentApplied -= _accentAppliedHandler;
+        AlbumArt?.Dispose();
+        AlbumArt = null;
+    }
+}
+
+/// <summary>Display item for an individual artist name in a multi-artist album header.</summary>
+public record ArtistTokenItem(string Name, bool IsLast);
+
+/// <summary>A group of tracks belonging to a single disc within an album.
+/// Observable so large albums can stream rows in after first paint.</summary>
+public record DiscGroup(int DiscNumber, string Header, ObservableCollection<Track> Tracks);

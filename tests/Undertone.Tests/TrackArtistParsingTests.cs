@@ -1,0 +1,19 @@
+using Undertone.Models;
+using Xunit;
+
+namespace Undertone.Tests;
+
+public class TrackArtistParsingTests
+{
+    [Theory]
+    [InlineData("Bad Bunny & Bomba Estéreo", "Bad Bunny & Bomba Estéreo")]   // "&" is not a default separator
+    [InlineData("Bad Bunny feat. Bryant Myers", "Bad Bunny")]
+    [InlineData("Bad Bunny featuring Bomba Estéreo, Buscabulla", "Bad Bunny")]
+    [InlineData("  Bad Bunny  ", "Bad Bunny")]
+    [InlineData("", "")]
+    [InlineData(null, "")]
+    public void GetPrimaryArtist_ReturnsFirstCreditedArtist(string? artist, string expected)
+    {
+        Assert.Equal(expected, Track.GetPrimaryArtist(artist));
+    }
+}

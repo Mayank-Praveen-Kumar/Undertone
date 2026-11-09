@@ -1,0 +1,463 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:loc="using:Undertone.Localization"
+        xmlns:vm="using:Undertone.ViewModels"
+        xmlns:controls="using:Undertone.Controls"
+        x:Class="Undertone.Views.LyricShareDialog"
+        x:DataType="vm:LyricShareViewModel"
+        Title="{loc:T LyricShare.ShareLyrics}"
+        CanResize="False"
+        WindowDecorations="None"
+        TransparencyLevelHint="Transparent"
+        Background="Transparent"
+        ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner">
+
+    <Window.Styles>
+        <!-- Small muted label above a group, as the other pill pop-ups'. -->
+        <Style Selector="TextBlock.sl-label">
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="Opacity" Value="0.5" />
+            <Setter Property="Margin" Value="4,0,0,0" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+        </Style>
+
+        <!-- ── Lyric line rows: a tap picks a line. Picked lines sit on a soft accent tint with
+             the app's small round tick, and picked neighbours join into one block (owner 10-12:
+             the filled bars with an edge stripe read heavy). Hover is the menus' quiet pill. ── -->
+        <Style Selector="Panel.sl-line">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Margin" Value="0,0,0,2" />
+        </Style>
+        <Style Selector="Panel.sl-line > Border.sl-hover, Panel.sl-line > Border.sl-fill">
+            <Setter Property="CornerRadius" Value="18" />
+            <Setter Property="Opacity" Value="0" />
+        </Style>
+        <Style Selector="Panel.sl-line > Border.sl-hover">
+            <Setter Property="Background" Value="{DynamicResource MenuV2HoverBrush}" />
+            <Setter Property="Transitions">
+                <Transitions>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.12" />
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Panel.sl-line:not(.selected):pointerover > Border.sl-hover">
+            <Setter Property="Opacity" Value="1" />
+        </Style>
+        <!-- Picked: the accent at a seventh of its strength (the strength of the menus' tinted
+             danger hover), a little more under the pointer. -->
+        <Style Selector="Panel.sl-line > Border.sl-fill">
+            <Setter Property="Background" Value="{DynamicResource AccentColorBrush}" />
+            <Setter Property="Transitions">
+                <Transitions>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.18" Easing="CubicEaseOut" />
+                    <CornerRadiusTransition Property="CornerRadius" Duration="0:0:0.18" Easing="CubicEaseOut" />
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Panel.sl-line.selected > Border.sl-fill">
+            <Setter Property="Opacity" Value="0.14" />
+        </Style>
+        <Style Selector="Panel.sl-line.selected:pointerover > Border.sl-fill">
+            <Setter Property="Opacity" Value="0.2" />
+        </Style>
+        <!-- The row the keyboard is on reads as hovered (no ring: the rows join into blocks). -->
+        <Style Selector="Panel.sl-line:not(.selected):focus-visible > Border.sl-hover">
+            <Setter Property="Opacity" Value="1" />
+        </Style>
+        <Style Selector="Panel.sl-line.selected:focus-visible > Border.sl-fill">
+            <Setter Property="Opacity" Value="0.2" />
+        </Style>
+        <!-- A run of picked neighbours reads as one block: the inner corners square off and
+             the fill bridges the 2 px gap to the row below (JoinsPrevious / JoinsNext). -->
+        <Style Selector="Panel.sl-line.join-up > Border.sl-fill">
+            <Setter Property="CornerRadius" Value="0,0,18,18" />
+        </Style>
+        <Style Selector="Panel.sl-line.join-down > Border.sl-fill">
+            <Setter Property="CornerRadius" Value="18,18,0,0" />
+            <Setter Property="Margin" Value="0,0,0,-2" />
+        </Style>
+        <Style Selector="Panel.sl-line.join-up.join-down > Border.sl-fill">
+            <Setter Property="CornerRadius" Value="0" />
+        </Style>
+        <Style Selector="Panel.sl-line TextBlock.sl-text">
+            <Setter Property="FontSize" Value="14" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="Opacity" Value="0.7" />
+            <Setter Property="Transitions">
+                <Transitions>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.18" />
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Panel.sl-line.selected TextBlock.sl-text">
+            <Setter Property="Opacity" Value="1" />
+        </Style>
+        <!-- The line playing now (Follow playback): a small accent dot in the row's margin. -->
+        <Style Selector="Border.sl-now">
+            <Setter Property="Width" Value="6" />
+            <Setter Property="Height" Value="6" />
+            <Setter Property="CornerRadius" Value="3" />
+            <Setter Property="Margin" Value="5,0,0,0" />
+            <Setter Property="HorizontalAlignment" Value="Left" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="Background" Value="{DynamicResource AccentColorBrush}" />
+            <Setter Property="Opacity" Value="0" />
+            <Setter Property="Transitions">
+                <Transitions>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.18" />
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Panel.sl-line.now > Border.sl-now">
+            <Setter Property="Opacity" Value="1" />
+        </Style>
+        <!-- The tick: the round accent check of the app's pill checkboxes, popped in when the
+             line is picked. Always laid out, so picking a line never re-wraps its text. -->
+        <Style Selector="Border.sl-tick">
+            <Setter Property="Width" Value="18" />
+            <Setter Property="Height" Value="18" />
+            <Setter Property="CornerRadius" Value="9" />
+            <Setter Property="Margin" Value="10,0,0,0" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="Background" Value="{DynamicResource AccentColorBrush}" />
+            <Setter Property="Opacity" Value="0" />
+            <Setter Property="RenderTransform" Value="scale(0.6)" />
+            <Setter Property="Transitions">
+                <Transitions>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.16" Easing="CubicEaseOut" />
+                    <TransformOperationsTransition Property="RenderTransform" Duration="0:0:0.2" Easing="CubicEaseOut" />
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Panel.sl-line.selected Border.sl-tick">
+            <Setter Property="Opacity" Value="1" />
+            <Setter Property="RenderTransform" Value="scale(1)" />
+        </Style>
+        <!-- A stray white glyph (the Fluent scrollbar's line-up arrow) showed at the top of
+             the line list at rest: the bar stays hidden until the list is hovered.
+             The thumb is what fades, not the whole bar, so a held thumb stays: :pointerover
+             follows the pointer even while the thumb has it captured, and dragging the thumb
+             sideways off the list (onto the card) faded the bar out mid-drag (owner 10-24).
+             The RenderTransform transition repeats the app-wide thumb style's, which this
+             Transitions setter replaces. -->
+        <Style Selector="ScrollViewer.sl-lines /template/ ScrollBar:vertical /template/ Thumb">
+            <Setter Property="Opacity" Value="0" />
+            <Setter Property="Transitions">
+                <Transitions>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.12" />
+                    <TransformOperationsTransition Property="RenderTransform" Duration="0:0:0.10" />
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="ScrollViewer.sl-lines:pointerover /template/ ScrollBar:vertical /template/ Thumb">
+            <Setter Property="Opacity" Value="1" />
+        </Style>
+        <Style Selector="ScrollViewer.sl-lines /template/ ScrollBar:vertical /template/ Thumb:pressed">
+            <Setter Property="Opacity" Value="1" />
+        </Style>
+
+        <!-- The option lists open upward, into the card. Opened below, they hung under the
+             card from its foot (Background's: 233 px) and ran past the window's bottom edge,
+             cut off there: on Windows a list is its own popup bounded by the screen, not by
+             this dialog. Same template-part style as Lyrics Studio's ComboBox.open-up. -->
+        <Style Selector="ComboBox.pill-field /template/ Popup#PART_Popup">
+            <Setter Property="Placement" Value="TopEdgeAlignedLeft" />
+        </Style>
+
+        <!-- Quiet pills fade when off instead of Fluent's grey box. -->
+        <Style Selector="Button.pill-secondary:disabled /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="{DynamicResource PillFieldBackground}" />
+            <Setter Property="Foreground" Value="{DynamicResource SystemControlForegroundBaseHighBrush}" />
+        </Style>
+        <Style Selector="Button.pill-secondary:disabled">
+            <Setter Property="Opacity" Value="0.45" />
+        </Style>
+
+        <!-- Same rotating-arc spinner as the drop-import pill and Settings' background
+             work indicator — shown in the footer while a clip export is in flight. -->
+        <Style Selector="Ellipse.loading-spinner">
+            <Setter Property="Width" Value="14" />
+            <Setter Property="Height" Value="14" />
+            <Setter Property="Stroke" Value="{DynamicResource AccentColorBrush}" />
+            <Setter Property="StrokeThickness" Value="2" />
+            <Setter Property="StrokeDashArray" Value="11,5" />
+            <Setter Property="StrokeLineCap" Value="Round" />
+            <Setter Property="RenderTransformOrigin" Value="50%,50%" />
+        </Style>
+        <!-- Animation keyed on [IsVisible=True] (same pattern as LyricsView's search
+             dots): selector matching ignores visibility, so an ungated INFINITE
+             clock would keep ticking on the hidden spinner. -->
+        <Style Selector="Ellipse.loading-spinner[IsVisible=True]">
+            <Style.Animations>
+                <Animation Duration="0:0:0.85" IterationCount="INFINITE" Easing="LinearEasing">
+                    <KeyFrame Cue="0%"><Setter Property="RotateTransform.Angle" Value="0" /></KeyFrame>
+                    <KeyFrame Cue="100%"><Setter Property="RotateTransform.Angle" Value="360" /></KeyFrame>
+                </Animation>
+            </Style.Animations>
+        </Style>
+    </Window.Styles>
+
+    <!-- Owner 10-08: the rounded pill pop-up of the Metadata editor, with the blurred app
+         behind. PillDialogHost draws the blurred, dimmed owner, the card with its shadow, and
+         plays the open/close animation (every close path — the X, Esc, Alt+F4 — animates out
+         once). Closing cancels a running video export (OnClosing). -->
+    <controls:PillDialogHost>
+
+    <Grid Width="960" Height="640" RowDefinitions="Auto,*,Auto,Auto">
+
+        <!-- Header: icon, title, the song; the round X closes. -->
+        <Border Grid.Row="0"
+                Padding="28,20,20,16"
+                BorderBrush="{DynamicResource SystemControlForegroundBaseLowBrush}"
+                BorderThickness="0,0,0,1">
+            <Grid ColumnDefinitions="56,16,*,Auto">
+                <Border Grid.Column="0" Width="56" Height="56" CornerRadius="18" Classes="pill-well">
+                    <controls:LineIcon x:Name="HeaderIcon" Data="{StaticResource MenuLineCamera}" Width="22" Height="22" Opacity="0.6"
+                              HorizontalAlignment="Center" VerticalAlignment="Center" />
+                </Border>
+                <StackPanel Grid.Column="2" Spacing="2" VerticalAlignment="Center">
+                    <TextBlock Text="{loc:T LyricShare.ShareLyrics}" FontSize="18" FontWeight="Bold" />
+                    <TextBlock Text="{Binding Subtitle}"
+                               FontSize="13" Opacity="0.7" TextTrimming="CharacterEllipsis" />
+                </StackPanel>
+                <!-- Solid accent like the Settings sheet's X (owner 10-09: "match that"). -->
+                <Button x:Name="CloseButton"
+                        Grid.Column="3"
+                        Classes="pill-primary"
+                        Width="36" Height="36" MinHeight="36" Padding="0"
+                        VerticalAlignment="Top"
+                        ToolTip.Tip="{loc:T ShareLyrics.Close}"
+                        AutomationProperties.Name="{loc:T ShareLyrics.Close}"
+                        Click="OnCloseClick">
+                    <controls:LineIcon Data="{StaticResource MenuLineClose}" Width="20" Height="20" />
+                </Button>
+            </Grid>
+        </Border>
+
+        <!-- Body: the lines (left, full column width) and the card preview (right). -->
+        <Grid Grid.Row="1" Margin="28,16,28,0" ColumnDefinitions="*,24,340">
+            <Grid Grid.Column="0" RowDefinitions="Auto,8,*">
+                <Grid ColumnDefinitions="Auto,*,Auto,10,Auto">
+                    <TextBlock Classes="sl-label" Text="{loc:T ShareLyrics.Lines}" />
+                    <CheckBox x:Name="FollowBox"
+                              Grid.Column="1"
+                              Classes="metadata-pill-checkbox"
+                              Margin="14,0,0,0"
+                              FontSize="12.5"
+                              IsVisible="{Binding SyncAvailable}"
+                              IsChecked="{Binding SyncEnabled, Mode=TwoWay}"
+                              Content="{loc:T ShareLyrics.FollowPlayback}" />
+                    <TextBlock Grid.Column="2"
+                               Text="{Binding SelectionSummary}"
+                               FontSize="12" Opacity="0.55"
+                               VerticalAlignment="Center" />
+                    <Button x:Name="ClearButton"
+                            Grid.Column="4"
+                            Classes="pill-secondary"
+                            MinHeight="28" Padding="14,0" FontSize="12"
+                            Content="{loc:T ShareLyrics.Clear}"
+                            Command="{Binding ClearSelectionCommand}"
+                            IsEnabled="{Binding HasSelection}" />
+                </Grid>
+
+                <!-- Each row: the line wrapped to the column's full width, the accent tick
+                     when picked. A tap picks; a double-click edits the text in place. -->
+                <ScrollViewer Grid.Row="2"
+                              Classes="sl-lines"
+                              HorizontalScrollBarVisibility="Disabled"
+                              VerticalScrollBarVisibility="Auto">
+                    <ItemsControl x:Name="LineItems" ItemsSource="{Binding Lines}" Margin="0,0,12,0"
+                                  KeyboardNavigation.TabNavigation="Once">
+                        <!-- The edit box keeps the line where it was: its padding cancels its
+                             margin. Here, not in Window.Styles: PillDialogHost's own pill-area
+                             style (Padding 18,14, MinHeight 40) sits nearer and won there. -->
+                        <ItemsControl.Styles>
+                            <Style Selector="TextBox.sl-edit">
+                                <Setter Property="MinHeight" Value="0" />
+                                <Setter Property="Padding" Value="12,6" />
+                                <Setter Property="Margin" Value="-12,-6,0,-6" />
+                                <Setter Property="FontSize" Value="14" />
+                                <Setter Property="TextWrapping" Value="Wrap" />
+                                <Setter Property="AcceptsReturn" Value="False" />
+                            </Style>
+                        </ItemsControl.Styles>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="vm:SelectableLyricLine">
+                                <!-- Focusable: Tab reaches the list, Up/Down move along it,
+                                     Space/Enter pick, F2 edits (code-behind OnLineKeyDown). -->
+                                <Panel Classes="sl-line"
+                                       Classes.selected="{Binding IsSelected}"
+                                       Classes.join-up="{Binding JoinsPrevious}"
+                                       Classes.join-down="{Binding JoinsNext}"
+                                       Classes.now="{Binding IsCurrent}"
+                                       Focusable="True"
+                                       AutomationProperties.Name="{Binding Text}"
+                                       ToolTip.Tip="{loc:T ShareLyrics.LineTip}">
+                                    <Border Classes="sl-hover" />
+                                    <Border Classes="sl-fill" />
+                                    <Border Classes="sl-now" />
+                                    <Grid ColumnDefinitions="*,Auto" Margin="16,9,10,9">
+                                        <TextBlock Classes="sl-text"
+                                                   Text="{Binding Text}"
+                                                   IsVisible="{Binding !IsEditing}" />
+                                        <TextBox Classes="pill-area sl-edit"
+                                                 Text="{Binding Text, Mode=TwoWay}"
+                                                 IsVisible="{Binding IsEditing}" />
+                                        <Border Grid.Column="1" Classes="sl-tick">
+                                            <Path Data="M 0 3.5 L 3 7 L 9 0"
+                                                  Stroke="{DynamicResource AccentForegroundBrush}"
+                                                  StrokeThickness="1.5"
+                                                  StrokeLineCap="Round"
+                                                  HorizontalAlignment="Center"
+                                                  VerticalAlignment="Center" />
+                                        </Border>
+                                    </Grid>
+                                </Panel>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </ScrollViewer>
+            </Grid>
+
+            <!-- The card, fitted into the well whatever its format. -->
+            <Border x:Name="PreviewWell" Grid.Column="2" Classes="pill-well" CornerRadius="24">
+                <Panel Margin="16">
+                    <TextBlock Text="{loc:T LyricShare.SelectLinesPreview}"
+                               FontSize="13" Opacity="0.5"
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Center"
+                               TextWrapping="Wrap"
+                               TextAlignment="Center"
+                               IsVisible="{Binding !HasSelection}" />
+                    <Image x:Name="PreviewImage"
+                           Source="{Binding Preview}"
+                           IsVisible="{Binding HasSelection}"
+                           Stretch="Uniform"
+                           RenderOptions.BitmapInterpolationMode="HighQuality" />
+                    <!-- Live karaoke sweep, drawn over the static card while word timings
+                         animate. Same aspect, so it covers the still exactly; hidden (null)
+                         when not animating. -->
+                    <Image x:Name="AnimatedPreviewImage"
+                           Source="{Binding AnimatedPreview}"
+                           IsVisible="{Binding AnimatedPreview, Converter={x:Static ObjectConverters.IsNotNull}}"
+                           Stretch="Uniform"
+                           RenderOptions.BitmapInterpolationMode="HighQuality" />
+                </Panel>
+            </Border>
+        </Grid>
+
+        <!-- Card options: every choice the two outlined summary pills held, as labelled
+             pill drop-downs. -->
+        <Grid Grid.Row="2" Margin="28,16,28,18" ColumnDefinitions="*,12,*,12,*,12,*,Auto">
+            <StackPanel Grid.Column="0" Spacing="6">
+                <TextBlock Classes="sl-label" Text="{loc:T LyricShare.Layout}" />
+                <ComboBox x:Name="LayoutBox" Classes="pill-field"
+                          AutomationProperties.Name="{loc:T LyricShare.Layout}"
+                          SelectedIndex="{Binding LayoutIndex, Mode=TwoWay}">
+                    <ComboBoxItem Content="{loc:T LyricShare.Card}" ToolTip.Tip="{loc:T LyricShare.RoundedCardArtworkHeaderTip}" />
+                    <ComboBoxItem Content="{loc:T LyricShare.Poster}" ToolTip.Tip="{loc:T LyricShare.BigCenteredArtworkCenteredTip}" />
+                </ComboBox>
+            </StackPanel>
+            <StackPanel Grid.Column="2" Spacing="6">
+                <TextBlock Classes="sl-label" Text="{loc:T LyricShare.Format}" />
+                <ComboBox x:Name="FormatBox" Classes="pill-field"
+                          AutomationProperties.Name="{loc:T LyricShare.Format}"
+                          SelectedIndex="{Binding FormatIndex, Mode=TwoWay}">
+                    <ComboBoxItem Content="{loc:T ShareLyrics.Square}" />
+                    <ComboBoxItem Content="{loc:T ShareLyrics.Story}" />
+                </ComboBox>
+            </StackPanel>
+            <StackPanel Grid.Column="4" Spacing="6">
+                <TextBlock Classes="sl-label" Text="{loc:T LyricShare.Text}" />
+                <ComboBox x:Name="TextColorBox" Classes="pill-field"
+                          AutomationProperties.Name="{loc:T LyricShare.Text}"
+                          SelectedIndex="{Binding TextColorIndex, Mode=TwoWay}">
+                    <ComboBoxItem Content="{loc:T LyricShare.Auto}" />
+                    <ComboBoxItem Content="{loc:T LyricShare.White}" />
+                    <ComboBoxItem Content="{loc:T LyricShare.Black}" />
+                </ComboBox>
+            </StackPanel>
+            <StackPanel Grid.Column="6" Spacing="6">
+                <TextBlock Classes="sl-label" Text="{loc:T LyricShare.Background}" />
+                <ComboBox x:Name="BackgroundBox" Classes="pill-field"
+                          AutomationProperties.Name="{loc:T LyricShare.Background}"
+                          ItemsSource="{Binding BackgroundChoices}"
+                          SelectedItem="{Binding SelectedBackground, Mode=TwoWay}"
+                          ToolTip.Tip="{loc:T LyricShare.CardBackgroundBlurredArtworkTip}"
+                          MaxDropDownHeight="320">
+                    <ComboBox.ItemTemplate>
+                        <DataTemplate x:DataType="vm:ShareBackgroundChoice">
+                            <!-- The ring follows the theme: a fixed white one vanished with the
+                                 pale swatches (Mist, Cream) on the Light theme's pale list. -->
+                            <StackPanel Orientation="Horizontal" Spacing="9">
+                                <Border Width="16" Height="16" CornerRadius="8"
+                                        Background="{Binding Preview}"
+                                        BorderBrush="{DynamicResource GlassPillBorder}" BorderThickness="1"
+                                        VerticalAlignment="Center" />
+                                <TextBlock Text="{Binding Name}" VerticalAlignment="Center"
+                                           TextTrimming="CharacterEllipsis" />
+                            </StackPanel>
+                        </DataTemplate>
+                    </ComboBox.ItemTemplate>
+                </ComboBox>
+            </StackPanel>
+            <!-- Word-by-word sweep on Save Video, only when the picked lines carry word timings. -->
+            <StackPanel Grid.Column="7" Spacing="6" Margin="18,0,0,0" IsVisible="{Binding KaraokeAvailable}">
+                <TextBlock Classes="sl-label" Text="{loc:T ShareLyrics.Video}" />
+                <CheckBox x:Name="KaraokeBox"
+                          Classes="metadata-pill-checkbox"
+                          MinHeight="40"
+                          FontSize="13"
+                          IsChecked="{Binding KaraokeEnabled, Mode=TwoWay}"
+                          Content="{loc:T LyricShare.KaraokeVideo}"
+                          ToolTip.Tip="{loc:T LyricShare.SaveVideoRendersMovingTip}" />
+            </StackPanel>
+        </Grid>
+
+        <!-- Footer: export progress/status on the left; Copy, Save Video, Save Card. -->
+        <Border Grid.Row="3"
+                Padding="28,14"
+                BorderBrush="{DynamicResource SystemControlForegroundBaseLowBrush}"
+                BorderThickness="0,1,0,0">
+            <Grid ColumnDefinitions="*,Auto">
+                <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                    <Ellipse Classes="loading-spinner"
+                             IsVisible="{Binding IsRendering}"
+                             VerticalAlignment="Center" />
+                    <TextBlock Text="{Binding StatusText}"
+                               FontSize="12.5" Opacity="0.65"
+                               VerticalAlignment="Center"
+                               MaxWidth="380"
+                               TextTrimming="CharacterEllipsis" />
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="10">
+                    <!-- Copy puts the full-resolution PNG on the clipboard so it can be
+                         pasted straight into Discord/chat without a save dialog. -->
+                    <Button x:Name="CopyButton"
+                            Classes="pill-secondary"
+                            MinWidth="96"
+                            Content="{loc:T LyricShare.Copy}"
+                            ToolTip.Tip="{loc:T LyricShare.CopyImageTip}"
+                            IsEnabled="{Binding HasSelection}"
+                            Click="OnCopyClick" />
+                    <Button x:Name="SaveVideoButton"
+                            Classes="pill-secondary"
+                            Content="{loc:T LyricShare.SaveVideo}"
+                            ToolTip.Tip="{loc:T LyricShare.SaveMP4ClipLyricTip}"
+                            IsEnabled="{Binding CanExportVideo}"
+                            Click="OnSaveVideoClick" />
+                    <Button x:Name="SaveCardButton"
+                            Classes="pill-primary"
+                            MinWidth="120"
+                            Content="{loc:T LyricShare.SaveCard}"
+                            IsEnabled="{Binding HasSelection}"
+                            Click="OnSaveClick" />
+                </StackPanel>
+            </Grid>
+        </Border>
+    </Grid>
+    </controls:PillDialogHost>
+</Window>

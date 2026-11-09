@@ -1,0 +1,170 @@
+using System;
+using System.Text.RegularExpressions;
+using CommunityToolkit.Mvvm.ComponentModel;
+using Undertone.Services;
+
+namespace Undertone.ViewModels;
+
+/// <summary>
+/// One editable line in the Metadata → Synced Lyrics manual editor: a lyric with
+/// an optional [mm:ss.xx] timestamp the user types or nudges by hand.
+///
+/// Unlike the lyrics-page LRC editor there is no live "stamp from playback" — the
+/// Metadata dialog has no player and may be editing a track that isn't the one
+/// playing — so timestamps are set manually (typed) and fine-tuned with nudges.
+/// </summary>
+public partial class SyncedLyricEditorLine : ObservableObject
+{
+    /// <summary>Raised on any user edit so the owner can regenerate the LRC text.</summary>
+    public event Action? Changed;
+
+    /// <param name="wordAnchor">The time the word tags in <paramref name="text"/> were written
+    /// for, when not <paramref name="timestamp"/> (a later stamp of a stack).</param>
+    public SyncedLyricEditorLine(TimeSpan? timestamp, string text, TimeSpan? wordAnchor = null)
+    {
+        _timestamp = timestamp;
+        _wordAnchor = wordAnchor ?? timestamp;
+        Text = text;
+        // Duet voice markers ("v1:"/"v2:"/"v3:") are layout syntax, not lyric text —
+        // strip them for display like the word tags; Save round-trips the raw Text.
+        var (body, _) = EnhancedLrcParser.StripVoiceMarker(text);
+        var untagged = StripWordTags(body);
+        HasWordTiming = untagged != body;
+        DisplayText = untagged.TrimStart();
+    }
+
+    public string Text { get; }
+
+    /// <summary>The "[bg: …]" background-vocal lines written under this line. They have no row
+    /// of their own; the text rebuilt from the rows writes them back after this line.</summary>
+    public IReadOnlyList<string>? BackgroundLines { get; init; }
+
+    /// <summary>The rows written at this line's stamp as its romanization / translation
+    /// (GitHub #116, <see cref="LrcEditorViewModel.CompanionOwners"/>); null when none.</summary>
+    internal List<SyncedLyricEditorLine>? Companions { get; set; }
+
+    // The stamp the row's word tags were timed against: a re-stamp moves them by the difference.
+    private readonly TimeSpan? _wordAnchor;
+
+    /// <summary><see cref="Text"/> as written back: its word tags moved as far as its stamp was.</summary>
+    public string SavedText => Timestamp is null ? LrcEditorViewModel.UntimedText(Text) : LrcEditorViewModel.WordsAtStamp(Text, _wordAnchor, Timestamp);
+
+    /// <summary><see cref="BackgroundLines"/> as written back: their word tags moved with the line.</summary>
+    public IReadOnlyList<string>? SavedBackgroundLines =>
+        BackgroundLines?.Select(b => Timestamp is null ? LrcEditorViewModel.UntimedBackground(b) : LrcEditorViewModel.WordsAtStamp(b, _wordAnchor, Timestamp)).ToList();
+
+    /// <summary>
+    /// Lyric text with inline enhanced-LRC word tags (&lt;mm:ss.xx&gt;) stripped, so
+    /// display rows show the words instead of the markup. Save round-trips the raw
+    /// Text, so word timing is never lost by viewing.
+    /// </summary>
+    public string DisplayText { get; }
+
+    /// <summary>True when the raw text carries inline word-timing tags.</summary>
+    public bool HasWordTiming { get; }
+
+    // Kept in sync with the ELRC parser's accepted forms: up to 3 minute digits, 2 or 3
+    // second digits, and either '.' or ':' before the fraction — narrower here left raw tags
+    // visible in the editor rows for files the parser reads fine.
+    private static readonly Regex WordTagRegex = new(@"<\d{1,3}:\d{2,3}(?:[.:]\d{1,3})?>", RegexOptions.Compiled);
+
+    private static string StripWordTags(string text)
+    {
+        if (!text.Contains('<')) return text;
+        var stripped = WordTagRegex.Replace(text, string.Empty);
+        if (ReferenceEquals(stripped, text) || stripped == text) return text;
+        return Regex.Replace(stripped, @"\s{2,}", " ").Trim();
+    }
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasTimestamp))]
+    [NotifyPropertyChangedFor(nameof(TimestampText))]
+    private TimeSpan? _timestamp;
+
+    public bool HasTimestamp => Timestamp.HasValue;
+
+    /// <summary>
+    /// Two-way bound to the row's timestamp box. Accepts m:ss, m:ss.x, m:ss.xx;
+    /// blank or unparseable input clears the timestamp.
+    /// </summary>
+    public string TimestampText
+    {
+        get => Timestamp is { } t ? LrcEditorViewModel.FormatTimestamp(t) : string.Empty;
+        set
+        {
+            var parsed = ParseTimestamp(value);
+            if (parsed == Timestamp)
+            {
+                // Snap the box back to the stored value when the entry was a no-op
+                // (e.g. invalid text, or re-typing the same time).
+                OnPropertyChanged();
+                return;
+            }
+            Timestamp = parsed; // raises HasTimestamp + TimestampText + Changed
+        }
+    }
+
+    partial void OnTimestampChanged(TimeSpan? value) => Changed?.Invoke();
+
+    // Re-timing the line takes its companions along while they still share its stamp: left
+    // behind, they came back from the save as separate sung lines. One moved on its own stays put.
+    partial void OnTimestampChanged(TimeSpan? oldValue, TimeSpan? newValue)
+    {
+        if (Companions is null) return;
+        foreach (var companion in Companions)
+            if (companion.Timestamp == oldValue) companion.Timestamp = newValue;
+    }
+
+    private static readonly TimeSpan NudgeStep = TimeSpan.FromMilliseconds(100);
+
+    /// <summary>Shifts an existing timestamp by ±0.1s; no-op on un-timestamped lines.</summary>
+    public void Nudge(bool forward)
+    {
+        if (Timestamp is not { } t) return;
+        var next = forward ? t + NudgeStep : t - NudgeStep;
+        Timestamp = next < TimeSpan.Zero ? TimeSpan.Zero : next;
+    }
+
+    public void ClearTimestamp() => Timestamp = null;
+
+    /// <summary>Parses "m:ss.fff" / "mm:ss" into a TimeSpan; null when malformed.</summary>
+    /// <remarks>Internal for tests (InternalsVisibleTo Undertone.Tests).</remarks>
+    internal static TimeSpan? ParseTimestamp(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+
+        var s = raw.Trim().Trim('[', ']');
+        var colon = s.IndexOf(':');
+        if (colon <= 0) return null;
+        if (!int.TryParse(s[..colon], out var minutes) || minutes < 0) return null;
+
+        var rest = s[(colon + 1)..];
+        var dot = rest.IndexOfAny(new[] { '.', ':' });
+        int seconds, ms = 0;
+        if (dot < 0)
+        {
+            if (!int.TryParse(rest, out seconds)) return null;
+        }
+        else
+        {
+            if (!int.TryParse(rest[..dot], out seconds)) return null;
+            var frac = rest[(dot + 1)..];
+            if (frac.Length > 0)
+            {
+                // Digits only, and truncated to milliseconds.
+                //
+                // The old `_ => f` branch fed any longer fraction through unscaled, so
+                // "1:23.4567" produced 4567 ms and silently turned a 1:23.45 line into
+                // 1:27.567 rather than rejecting or truncating the extra digits.
+                foreach (var c in frac)
+                    if (!char.IsAsciiDigit(c)) return null;
+
+                var millisDigits = frac.Length <= 3 ? frac.PadRight(3, '0') : frac[..3];
+                if (!int.TryParse(millisDigits, out ms) || ms < 0) return null;
+            }
+        }
+
+        if (seconds is < 0 or > 59) return null;
+        return new TimeSpan(0, 0, minutes, seconds, ms);
+    }
+}

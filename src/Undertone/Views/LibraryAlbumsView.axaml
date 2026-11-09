@@ -1,0 +1,350 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:loc="using:Undertone.Localization"
+             xmlns:vm="using:Undertone.ViewModels"
+             xmlns:m="using:Undertone.Models"
+             xmlns:ctrl="using:Undertone.Controls"
+             xmlns:controls="using:Undertone.Controls"
+             xmlns:conv="using:Undertone.Converters"
+             xmlns:helpers="using:Undertone.Helpers"
+             x:Class="Undertone.Views.LibraryAlbumsView"
+             x:DataType="vm:LibraryAlbumsViewModel"
+             Focusable="True"
+             Background="{DynamicResource AppMainBackground}">
+
+    <UserControl.Resources>
+        <conv:ArtworkPathConverter x:Key="ArtworkConverter" />
+    </UserControl.Resources>
+
+    <UserControl.Styles>
+        <!-- Rank numerals for the artist page's Songs pills (local copy of HomeView's style) -->
+        <Style Selector="TextBlock.rank-num">
+            <Setter Property="FontSize" Value="20"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="Opacity" Value="0.32"/>
+        </Style>
+        <!-- Podium: #1 gold, #2 silver, #3 bronze (brushes in Styles.axaml). -->
+        <Style Selector="TextBlock.rank-num.gold">
+            <Setter Property="Foreground" Value="{DynamicResource RankGoldBrush}"/>
+            <Setter Property="Opacity" Value="1"/>
+        </Style>
+        <Style Selector="TextBlock.rank-num.silver">
+            <Setter Property="Foreground" Value="{DynamicResource RankSilverBrush}"/>
+            <Setter Property="Opacity" Value="1"/>
+        </Style>
+        <Style Selector="TextBlock.rank-num.bronze">
+            <Setter Property="Foreground" Value="{DynamicResource RankBronzeBrush}"/>
+            <Setter Property="Opacity" Value="1"/>
+        </Style>
+    </UserControl.Styles>
+
+    <Grid RowDefinitions="*">
+        <!-- Right margin trimmed to 2 so the vertical scrollbar sits near the window
+             edge (Apple Music style) instead of being inset ~12px from it. -->
+        <DockPanel Grid.Row="0" Margin="12,8,2,8">
+
+        <!-- Content area with overlay for empty state -->
+        <Grid>
+            <!-- Album grid: outer ListBox virtualizes rows, inner UniformGrid lays out GridColumns per row -->
+            <ListBox x:Name="AlbumListBox"
+                     IsVisible="{Binding IsGridView}"
+                     ItemsSource="{Binding FilteredAlbumRows}"
+                     Background="Transparent"
+                     BorderThickness="0"
+                     Padding="0,0,0,115"
+                     ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                     ScrollViewer.VerticalScrollBarVisibility="Visible"
+                     ScrollViewer.AllowAutoHide="False"
+                     SelectionMode="Single"
+                     AutoScrollToSelectedItem="False">
+                <ListBox.Styles>
+                    <Style Selector="ListBoxItem">
+                        <Setter Property="Focusable" Value="False" />
+                    </Style>
+                </ListBox.Styles>
+                <ListBox.DataTemplates>
+                    <!-- Section header ("Songs" / "Albums") on artist pages -->
+                    <DataTemplate DataType="m:ArtistSectionHeader">
+                        <TextBlock Text="{Binding Title}"
+                                   FontSize="22"
+                                   FontWeight="Bold"
+                                   Margin="2,10,0,8" />
+                    </DataTemplate>
+
+                    <!-- Artist page Songs section: ranked pills, same look as the
+                         Home tab's "Most Listened To" grid (3 per row) -->
+                    <DataTemplate DataType="m:ArtistSongsRow">
+                        <ItemsControl ItemsSource="{Binding Songs}">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <UniformGrid Columns="3" Rows="1" />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:DataType="m:TopSongRow">
+                                    <Button Classes="browse-item"
+                                            Background="{DynamicResource HomeCardBackground}"
+                                            BorderThickness="0"
+                                            CornerRadius="6"
+                                            Padding="0"
+                                            Height="56"
+                                            Margin="3,3"
+                                            Cursor="Hand"
+                                            HorizontalAlignment="Stretch"
+                                            HorizontalContentAlignment="Stretch"
+                                            helpers:DragFileBehavior.EnableFileDrag="True"
+                                            ContextRequested="OnArtistSongContextRequested"
+                                            Command="{Binding $parent[UserControl].((vm:LibraryAlbumsViewModel)DataContext).PlayArtistSongCommand}"
+                                            CommandParameter="{Binding Track}">
+                                        <Button.Styles>
+                                            <Style Selector="Button:pointerover">
+                                                <Setter Property="Background" Value="{DynamicResource HomeCardHoverBackground}" />
+                                            </Style>
+                                        </Button.Styles>
+
+                                        <!-- Pill content: artwork + rank + title + heart + play count -->
+                                        <Grid ColumnDefinitions="56,38,*,Auto">
+                                            <Border Grid.Column="0"
+                                                    Width="56" Height="56"
+                                                    CornerRadius="6,0,0,6"
+                                                    ClipToBounds="True"
+                                                    Background="{DynamicResource SystemControlBackgroundBaseLowBrush}">
+                                                <Panel>
+                                                    <TextBlock Text="{loc:T LibraryAlbums.Text}"
+                                                               FontSize="16"
+                                                               HorizontalAlignment="Center"
+                                                               VerticalAlignment="Center"
+                                                               Opacity="0.2"
+                                                               IsVisible="{Binding Track.AlbumArtworkPath, Converter={x:Static StringConverters.IsNullOrEmpty}}" />
+                                                    <ctrl:CachedImage SourcePath="{Binding Track.AlbumArtworkPath}"
+                                                                      Stretch="UniformToFill"
+                                                                      RenderOptions.BitmapInterpolationMode="HighQuality"
+                                                                      IsVisible="{Binding Track.AlbumArtworkPath, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                                                </Panel>
+                                            </Border>
+                                            <TextBlock Grid.Column="1"
+                                                       Classes="rank-num"
+                                                       Classes.gold="{Binding IsTop}"
+                                                       Classes.silver="{Binding IsSecond}"
+                                                       Classes.bronze="{Binding IsThird}"
+                                                       Text="{Binding Rank}"
+                                                       HorizontalAlignment="Center"
+                                                       VerticalAlignment="Center" />
+                                            <!-- Heart is a sibling of the whole text stack, not a member of the
+                                                 title line: nested inside the title it centred on that line and
+                                                 rode high against the two-line row (Home's rows are one line, so
+                                                 the same nesting reads centred there). Mirrors Home's *,Auto
+                                                 split so the 10px gap to the play count matches too. -->
+                                            <Grid Grid.Column="2"
+                                                  ColumnDefinitions="*,Auto"
+                                                  VerticalAlignment="Center"
+                                                  Margin="0,0,10,0">
+                                                <StackPanel Grid.Column="0" Spacing="1">
+                                                    <TextBlock FontSize="13"
+                                                               FontWeight="SemiBold"
+                                                               TextTrimming="CharacterEllipsis"
+                                                               MaxLines="1">
+                                                        <Run Text="{Binding Track.Title}" />
+                                                        <InlineUIContainer BaselineAlignment="Center">
+                                                            <Border Classes="explicit-badge compact"
+                                                                    Margin="6,0,0,0"
+                                                                    IsVisible="{Binding Track.IsExplicit}"
+                                                                    ToolTip.Tip="{loc:T LibraryAlbums.ExplicitTip}">
+                                                                <TextBlock Text="E"
+                                                                           Classes="explicit-badge-text compact"
+                                                                           FontSize="8"
+                                                                           Opacity="0.9" />
+                                                            </Border>
+                                                        </InlineUIContainer>
+                                                    </TextBlock>
+                                                    <!-- Album credit so strays filed under the wrong album are spottable -->
+                                                    <TextBlock Text="{Binding Track.Album}"
+                                                               FontSize="11"
+                                                               Opacity="0.55"
+                                                               TextTrimming="CharacterEllipsis"
+                                                               MaxLines="1" />
+                                                </StackPanel>
+                                                <ctrl:HeartIcon Grid.Column="1" Size="14" ShowWhenOff="False"
+                                                Margin="6,0,0,0" VerticalAlignment="Center"
+                                                IsFavorite="{Binding Track.IsFavorite}" />
+                                            </Grid>
+                                            <StackPanel Grid.Column="3"
+                                                        Orientation="Horizontal"
+                                                        Spacing="3"
+                                                        VerticalAlignment="Center"
+                                                        Margin="0,0,14,0"
+                                                        ToolTip.Tip="{loc:T LibraryAlbums.ListenCountTip}">
+                                                <TextBlock Text="{Binding Track.PlayCount}"
+                                                           FontSize="11"
+                                                           FontWeight="SemiBold"
+                                                           Opacity="0.75"
+                                                           VerticalAlignment="Center" />
+                                                <TextBlock Text="{loc:T LibraryAlbums.Plays}"
+                                                           IsVisible="{Binding Track.PlayCount, Converter={x:Static conv:PlayCountConverters.IsNotOne}}"
+                                                           FontSize="11"
+                                                           FontWeight="SemiBold"
+                                                           Opacity="0.55"
+                                                           VerticalAlignment="Center" />
+                                                <TextBlock Text="{loc:T Common.Play}"
+                                                           IsVisible="{Binding Track.PlayCount, Converter={x:Static conv:PlayCountConverters.IsOne}}"
+                                                           FontSize="11"
+                                                           FontWeight="SemiBold"
+                                                           Opacity="0.55"
+                                                           VerticalAlignment="Center" />
+                                            </StackPanel>
+                                        </Grid>
+                                    </Button>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </DataTemplate>
+
+                    <DataTemplate DataType="m:AlbumRow">
+                        <ItemsControl ItemsSource="{Binding Albums}"
+                                      Height="{Binding $parent[UserControl].((vm:LibraryAlbumsViewModel)DataContext).TileRowHeight}">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <!-- Column count mirrors the VM's row chunk size (cover-size setting) -->
+                                    <UniformGrid Columns="{Binding $parent[UserControl].((vm:LibraryAlbumsViewModel)DataContext).GridColumns}" Rows="1" />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:DataType="m:Album">
+                                    <Button Classes="album-tile"
+                                            AutomationProperties.Name="{Binding Name}"
+                                            Focusable="False"
+                                            Margin="2"
+                                            HorizontalAlignment="Stretch"
+                                            VerticalAlignment="Top"
+                                            helpers:DragFileBehavior.EnableFileDrag="True"
+                                            Loaded="OnAlbumTileLoaded"
+                                            ContextRequested="OnAlbumTileContextRequested"
+                                            Command="{Binding $parent[UserControl].((vm:LibraryAlbumsViewModel)DataContext).OpenAlbumCommand}"
+                                            CommandParameter="{Binding}">
+
+                                        <!-- Right-click / dots: one shared v2 menu built in code (OnAlbumTileContextRequested). -->
+
+                                        <StackPanel Classes="tile-text" Spacing="0" HorizontalAlignment="Stretch">
+                                            <!-- Album artwork: size computed once in code-behind, no per-tile Bounds binding -->
+                                            <Border Width="{Binding $parent[UserControl].((vm:LibraryAlbumsViewModel)DataContext).TileArtworkSize}"
+                                                    Height="{Binding $parent[UserControl].((vm:LibraryAlbumsViewModel)DataContext).TileArtworkSize}"
+                                                    CornerRadius="6"
+                                                    ClipToBounds="True"
+                                                    Background="#1AFFFFFF">
+                                                <Panel>
+                                                    <!-- Placeholder -->
+                                                    <TextBlock Text="{loc:T LibraryAlbums.Text}"
+                                                               FontSize="40"
+                                                               HorizontalAlignment="Center"
+                                                               VerticalAlignment="Center"
+                                                               Opacity="0.15"
+                                                               IsVisible="{Binding ArtworkPath, Converter={x:Static StringConverters.IsNullOrEmpty}}" />
+                                                    <!-- Async artwork loading: cache hits instant, misses load on background thread -->
+                                                    <ctrl:CachedImage SourcePath="{Binding ArtworkPath}"
+                                                                      DecodeWidth="768"
+                                                                      Stretch="UniformToFill"
+                                                                      RenderOptions.BitmapInterpolationMode="HighQuality"
+                                                                      IsVisible="{Binding ArtworkPath, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                                                    <!-- Hover overlay (09-13): dim + Play/Pause + dots; styles in Styles.axaml -->
+                                                    <Border Classes="tile-dim" />
+                                                    <Button Classes="tile-play"
+                                                            Command="{Binding $parent[UserControl].((vm:LibraryAlbumsViewModel)DataContext).TogglePlayAlbumCommand}"
+                                                            CommandParameter="{Binding}">
+                                                        <Panel>
+                                                            <Viewbox Width="12" Height="12" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="1,0,0,0" IsVisible="{Binding !IsNowPlaying}"><Path Data="{StaticResource PlayIcon}" Fill="White" /></Viewbox>
+                                                            <Viewbox Width="12" Height="12" HorizontalAlignment="Center" VerticalAlignment="Center" IsVisible="{Binding IsNowPlaying}"><Path Data="{StaticResource PauseIcon}" Fill="White" /></Viewbox>
+                                                        </Panel>
+                                                    </Button>
+                                                    <Button Classes="tile-more" Click="OnTileMoreClick">
+                                                        <Viewbox Width="14" Height="14" HorizontalAlignment="Center" VerticalAlignment="Center"><Path Data="{StaticResource MoreDotsIcon}" Fill="White" /></Viewbox>
+                                                    </Button>
+                                                </Panel>
+                                            </Border>
+                                            <!-- Title + explicit badge; the heart sits at the line's right end (09-13) -->
+                                            <Grid ColumnDefinitions="*,Auto" Margin="0,5,0,0">
+                                                <ctrl:HighlightTextBlock Grid.Column="0"
+                                                                         helpers:TitleWrap.Watch="True"
+                                                                         DisplayText="{Binding Name}"
+                                                                         HighlightText="{Binding $parent[UserControl].((vm:LibraryAlbumsViewModel)DataContext).SearchText}"
+                                                                         IsExplicit="{Binding IsExplicit}"
+                                                                         FontSize="13"
+                                                                         FontWeight="SemiBold"
+                                                                         TextWrapping="Wrap"
+                                                                         TextTrimming="CharacterEllipsis"
+                                                                         MaxLines="2" />
+                                                <Panel Grid.Column="1" Classes="heart-title" VerticalAlignment="Top" Margin="6,2,0,0">
+                                                    <ctrl:HeartIcon Size="14" ShowWhenOff="False" IsFavorite="{Binding HasFavoriteTrack}" />
+                                                </Panel>
+                                            </Grid>
+                                            <!-- Subtitle; the heart lands here instead when the title wraps -->
+                                            <Grid ColumnDefinitions="*,Auto" Margin="0,1,0,0">
+                                                <ctrl:HighlightTextBlock Grid.Column="0"
+                                                                         DisplayText="{Binding TileSubtitle}"
+                                                                         HighlightText="{Binding $parent[UserControl].((vm:LibraryAlbumsViewModel)DataContext).SearchText}"
+                                                                         FontSize="12"
+                                                                         FontWeight="Bold"
+                                                                         Opacity="0.55"
+                                                                         TextTrimming="CharacterEllipsis"
+                                                                         MaxLines="1" />
+                                                <Panel Grid.Column="1" Classes="heart-sub" VerticalAlignment="Center" Margin="6,0,0,0">
+                                                    <ctrl:HeartIcon Size="14" ShowWhenOff="False" IsFavorite="{Binding HasFavoriteTrack}" />
+                                                </Panel>
+                                            </Grid>
+                                        </StackPanel>
+                                    </Button>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </DataTemplate>
+                </ListBox.DataTemplates>
+            </ListBox>
+
+            <!-- Carousel layout (GitHub #149, top-bar View menu): the same filtered, sorted
+                 albums one at a time, Cover Flow style. Clicking the centred album opens it,
+                 like a grid tile. Bottom margin clears the floating playback bar. -->
+            <ctrl:AlbumCarousel x:Name="AlbumCarousel"
+                                IsVisible="{Binding IsCarouselView}"
+                                Albums="{Binding CarouselAlbums}"
+                                CaseStyle="{Binding CarouselStyle}"
+                                CenterAlbum="{Binding CarouselCenterAlbum}"
+                                OpenCommand="{Binding OpenAlbumCommand}"
+                                Margin="0,4,10,110" />
+
+            <!-- Empty state overlay. With a search or a Type / Quality filter on, the library is
+                 not empty: say nothing matches instead of "add music folders" (live check 10-10:
+                 Type → Live Albums on a library without any read "Add music folders in Settings"). -->
+            <StackPanel IsVisible="{Binding !FilteredAlbumRows.Count}"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Spacing="8">
+                <TextBlock Text="{loc:T LibraryAlbums.NoAlbumsFound}"
+                           IsVisible="{Binding !HasActiveFilter}"
+                           FontSize="18"
+                           Opacity="0.5"
+                           HorizontalAlignment="Center"
+                           TextAlignment="Center" />
+                <TextBlock Text="{loc:T LibraryAlbums.AddMusicFoldersSettings}"
+                           IsVisible="{Binding !HasActiveFilter}"
+                           FontSize="13"
+                           Opacity="0.3"
+                           HorizontalAlignment="Center"
+                           TextAlignment="Center" />
+                <TextBlock Text="{loc:T LibraryAlbums.NoFilterMatches}"
+                           IsVisible="{Binding HasActiveFilter}"
+                           FontSize="18"
+                           Opacity="0.5"
+                           HorizontalAlignment="Center"
+                           TextAlignment="Center" />
+                <TextBlock Text="{loc:T LibraryAlbums.NoFilterMatchesHint}"
+                           IsVisible="{Binding HasActiveFilter}"
+                           FontSize="13"
+                           Opacity="0.3"
+                           HorizontalAlignment="Center"
+                           TextAlignment="Center" />
+            </StackPanel>
+        </Grid>
+
+        </DockPanel>
+    </Grid>
+
+</UserControl>

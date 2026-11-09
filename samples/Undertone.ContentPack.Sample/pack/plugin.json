@@ -1,0 +1,15 @@
+{
+  "id": "dev.undertone.samples.contentpack",
+  "name": "Sample Content Pack",
+  "version": "1.0.0",
+  "author": "Undertone",
+  "description": "Two themes (Dusk and Paper), a lyrics-page preset and an English pseudo-locale. Reference content pack.",
+  "type": "content",
+  "minAppVersion": "1.5.3",
+  "homepage": "https://github.com/Mayank-Praveen-Kumar/Undertone/tree/main/samples/Undertone.ContentPack.Sample",
+  "contents": {
+    "themes": ["themes/dusk.json", "themes/paper.json"],
+    "lyricsPresets": ["lyrics/karaoke.json"],
+    "languages": ["languages/en-XA.json"]
+  }
+}

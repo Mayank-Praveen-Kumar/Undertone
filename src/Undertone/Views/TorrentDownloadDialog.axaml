@@ -1,0 +1,108 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:Undertone.ViewModels"
+        xmlns:search="using:Undertone.Services.MetadataSearch"
+        xmlns:services="using:Undertone.Services"
+        x:Class="Undertone.Views.TorrentDownloadDialog"
+        x:DataType="vm:TorrentDownloadViewModel"
+        Title="Find album torrents · Undertone"
+        Width="760" Height="740" MinWidth="600" MinHeight="480"
+        WindowStartupLocation="CenterOwner"
+        Background="{DynamicResource AppMainBackground}">
+    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Margin="28" Spacing="16">
+            <TextBlock Text="Find album torrents" FontSize="24" FontWeight="SemiBold"/>
+            <TextBlock Text="Find album opens EXT.to in your browser with your search. Paste a magnet link or choose a downloaded torrent file below to send it to qBittorrent."
+                       TextWrapping="Wrap" Opacity="0.7"/>
+            <TextBox Text="{Binding Query}" PlaceholderText="Song and artist, or album name"
+                     AutomationProperties.Name="Song or album search"/>
+            <StackPanel Orientation="Horizontal" Spacing="10">
+                <Button Content="Find album" Command="{Binding FindAlbumsCommand}"/>
+                <Button Content="Open browser ↗" Command="{Binding SearchTorrentsCommand}"/>
+                <TextBlock Text="Searching…" IsVisible="{Binding IsSearching}" VerticalAlignment="Center"/>
+            </StackPanel>
+            <TextBlock Text="Torrent listings · source, size, seeders and links" FontSize="17" FontWeight="SemiBold" TextWrapping="Wrap"/>
+            <TextBlock Text="{Binding TorrentStatus}" TextWrapping="Wrap"/>
+            <TextBlock Text="Searching torrents…" IsVisible="{Binding IsSearchingTorrents}" Opacity="0.65"/>
+            <ListBox ItemsSource="{Binding Torrents}" IsVisible="{Binding Torrents.Count}" MaxHeight="300"
+                     ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                     AutomationProperties.Name="FLAC torrent listings">
+                <ListBox.ItemTemplate>
+                    <DataTemplate x:DataType="services:TorrentSearchItem">
+                        <StackPanel Spacing="7" Margin="8">
+                            <TextBlock Text="{Binding Name}" TextWrapping="Wrap" FontWeight="SemiBold"/>
+                            <WrapPanel Orientation="Horizontal">
+                                <TextBlock Text="{Binding Source}" Margin="0,0,16,0"/>
+                                <TextBlock Text="{Binding SizeDisplay}" Margin="0,0,16,0"/>
+                                <TextBlock Text="{Binding SeedersDisplay}"/>
+                            </WrapPanel>
+                            <TextBlock Text="{Binding SourceUrl}" FontSize="11" Opacity="0.65"/>
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button Content="Get magnet link" CommandParameter="{Binding}"
+                                        Command="{Binding $parent[Window].((vm:TorrentDownloadViewModel)DataContext).UseTorrentLinkCommand}"/>
+                                <Button Content="Copy link" CommandParameter="{Binding}" Click="CopyTorrentLink"/>
+                                <Button Content="Source ↗" CommandParameter="{Binding}" Click="OpenTorrentSource"/>
+                            </StackPanel>
+                        </StackPanel>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+            <Border Height="1" Background="{DynamicResource AccentColorBrush}" Opacity="0.3"/>
+            <TextBlock Text="Download with qBittorrent" FontSize="18" FontWeight="SemiBold"/>
+            <TextBox Text="{Binding MagnetLinks}" AcceptsReturn="True" MinHeight="90" MaxHeight="150"
+                     TextWrapping="Wrap" PlaceholderText="Paste magnet links here, one per line"
+                     AutomationProperties.Name="Magnet links"/>
+            <StackPanel Orientation="Horizontal" Spacing="10">
+                <Button Content="Choose .torrent files…" Click="ChooseTorrentFiles"/>
+                <Button Content="Clear files" Command="{Binding ClearTorrentFilesCommand}"/>
+                <TextBlock Text="{Binding TorrentFileSummary}" VerticalAlignment="Center" Opacity="0.7"/>
+            </StackPanel>
+            <TextBlock Text="Download folder" FontWeight="SemiBold"/>
+            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+                <TextBox Text="{Binding SaveFolder}" AutomationProperties.Name="Download folder"/>
+                <Button Grid.Column="1" Content="Browse…" Click="ChooseFolder"/>
+            </Grid>
+            <TextBlock Text="qBittorrent app" FontWeight="SemiBold"/>
+            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+                <TextBox Text="{Binding Executable}" AutomationProperties.Name="qBittorrent app path"/>
+                <Button Grid.Column="1" Content="Browse…" Click="ChooseExecutable"/>
+            </Grid>
+            <StackPanel Orientation="Horizontal" Spacing="10">
+                <Button Content="Show downloads" Command="{Binding ShowDownloadsCommand}"/>
+                <Button Content="Show native" Command="{Binding ShowNativeCommand}" ToolTip.Tip="Open the qBittorrent desktop window"/>
+            </StackPanel>
+            <Border IsVisible="{Binding DownloadPanelVisible}" BorderBrush="{DynamicResource AccentColorBrush}" BorderThickness="1" CornerRadius="10" Padding="14">
+                <StackPanel Spacing="10">
+                    <TextBlock Text="qBittorrent downloads" FontSize="18" FontWeight="SemiBold"/>
+                    <TextBlock Text="{Binding DownloadPanelStatus}" TextWrapping="Wrap" Opacity="0.7"/>
+                    <ScrollViewer MaxHeight="260" HorizontalScrollBarVisibility="Disabled">
+                        <ItemsControl ItemsSource="{Binding Downloads}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:DataType="services:QBitDownloadItem">
+                                    <StackPanel Spacing="6" Margin="0,8">
+                                        <TextBlock Text="{Binding Name}" TextWrapping="Wrap" FontWeight="SemiBold"/>
+                                        <ProgressBar Minimum="0" Maximum="100" Value="{Binding Percent}" Height="7"/>
+                                        <TextBlock Text="{Binding ProgressLabel}"/>
+                                        <WrapPanel>
+                                            <TextBlock Text="{Binding StateLabel}" Margin="0,0,16,0"/>
+                                            <TextBlock Text="{Binding EtaLabel}" Opacity="0.65"/>
+                                        </WrapPanel>
+                                        <StackPanel Orientation="Horizontal" Spacing="8">
+                                            <Button Content="Pause" CommandParameter="{Binding}" Command="{Binding $parent[Window].((vm:TorrentDownloadViewModel)DataContext).PauseDownloadCommand}"/>
+                                            <Button Content="Resume" CommandParameter="{Binding}" Command="{Binding $parent[Window].((vm:TorrentDownloadViewModel)DataContext).ResumeDownloadCommand}"/>
+                                        </StackPanel>
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </ScrollViewer>
+                    <TextBlock Text="Closing this window leaves downloads running in qBittorrent." TextWrapping="Wrap" FontSize="11" Opacity="0.65"/>
+                </StackPanel>
+            </Border>
+            <TextBlock Text="{Binding Status}" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite"/>
+            <Button Content="Download in qBittorrent" Command="{Binding DownloadCommand}"
+                    Background="{DynamicResource AccentColorBrush}"
+                    Foreground="{DynamicResource AccentForegroundBrush}" HorizontalAlignment="Right"/>
+        </StackPanel>
+    </ScrollViewer>
+</Window>

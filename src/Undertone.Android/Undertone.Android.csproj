@@ -1,0 +1,128 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- The Android head: an Avalonia 12 activity hosting the shared Undertone.UI look over
+         Undertone.Core. Nothing from the desktop project (Windows TFM, LibVLC, WASAPI,
+         Whisper) is referenced here. Build with the Android Studio JDK and SDK:
+           dotnet build src/Undertone.Android/Undertone.Android.csproj -c Debug
+             -p:JavaSdkDirectory="C:/Program Files/Android/Android Studio/jbr"
+             -p:AndroidSdkDirectory="%LOCALAPPDATA%/Android/Sdk"  -->
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-android</TargetFramework>
+    <SupportedOSPlatformVersion>26</SupportedOSPlatformVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Undertone.Android</RootNamespace>
+    <AssemblyName>Undertone.Android</AssemblyName>
+    <ApplicationId>com.heartached.undertone</ApplicationId>
+    <!-- Play versioning. ApplicationVersion is android:versionCode, an integer that must be
+         higher on every upload to Play (a repeat is rejected); ApplicationDisplayVersion is
+         android:versionName, the text users see. Bump both per release without editing this
+         file: scripts/android/build-release.ps1 -VersionCode 2 -VersionName 1.0.1 passes
+         -p:ApplicationVersion / -p:ApplicationDisplayVersion, and MSBuild global properties
+         override these defaults. -->
+    <ApplicationVersion>1</ApplicationVersion>
+    <ApplicationDisplayVersion>1.0.0</ApplicationDisplayVersion>
+    <!-- 64-bit only, pinned rather than inherited (the SDK default is the same pair today):
+         arm64 for phones, x64 for the emulator and x86 Chromebooks. No armeabi-v7a: Play
+         does not require 32-bit, and every ABI is another full AOT compile and split. -->
+    <RuntimeIdentifiers>android-arm64;android-x64</RuntimeIdentifiers>
+    <!-- Release precompiles every method (full AOT), not just a profile. Measured on the
+         Undertone_API35 emulator 2026-09-22, cold start (am start -W): full AOT 3.3-3.6 s,
+         profiled AOT with the SDK's stock profile 6.4-6.8 s, Debug interpreter 4.2-4.6 s.
+         The stock profile records a generic .NET Android startup, not Avalonia's, so
+         profiled AOT left Avalonia's startup path to the JIT. Cost: AAB 60 MB, not 42 MB.
+         A Undertone-recorded profile (AndroidAotProfile) is the follow-up. Debug has no AOT. -->
+    <AndroidEnableProfiledAot>false</AndroidEnableProfiledAot>
+    <!-- Debug builds default to Fast Deployment (assemblies pushed over adb by the
+         Install target, not packed into the APK). We install the APK with adb ourselves,
+         so pack them; without this the runtime aborts with "No assemblies found". -->
+    <EmbedAssembliesIntoApk>true</EmbedAssembliesIntoApk>
+    <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <NoWarn>CS0067;MVVMTK0039;CA1416</NoWarn>
+  </PropertyGroup>
+
+  <!-- Debug: an APK, installed with adb in the dev loop. -->
+  <PropertyGroup Condition="'$(Configuration)' != 'Release'">
+    <AndroidPackageFormat>apk</AndroidPackageFormat>
+  </PropertyGroup>
+
+  <!-- Release: the Android App Bundle Google Play takes. Signing is not configured here:
+       scripts/android/build-release.ps1 passes AndroidKeyStore/AndroidSigningKeyStore and an
+       env: password; a plain `dotnet build -c Release` signs with the debug keystore. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <AndroidPackageFormat>aab</AndroidPackageFormat>
+    <!-- Only the AAB. The SDK default (aab;apk) also builds a universal APK, and that step
+         (BuildApkSet) resolves an env: password itself and hands it to bundletool as
+         pass:<value> on a command line. jarsigner, which signs the AAB, gets
+         -storepass:env NAME instead. Test APKs come from build-release.ps1 -UseDebugKey. -->
+    <AndroidPackageFormats>aab</AndroidPackageFormats>
+    <!-- The SDK's Release default, made explicit. partial trims only assemblies that declare
+         IsTrimmable (the BCL, Avalonia, AndroidX bindings); Undertone.* and anything else without
+         the attribute stay whole. Trimming cannot simply be turned off: AOT requires it (XA1030
+         is an error). If a Release run shows a trimming crash, keep that one assembly whole
+         with a Release-only <TrimmerRootAssembly Include="Name" RootMode="All" /> item. -->
+    <TrimMode>partial</TrimMode>
+    <!-- Merged into the bundle's BundleConfig.pb. Asks every bundletool that splits this AAB,
+         Play's included, to store native libraries uncompressed at 16 KB-aligned offsets
+         (PAGE_ALIGNMENT_16K), which Play requires of apps targeting Android 15+. The ELF side
+         is already 16 KB aligned in every .so we ship (scripts/android/check-16kb.py). The SDK
+         skips this file silently if it is missing; build-release.ps1 checks dump config. -->
+    <AndroidBundleConfigurationFile>$(MSBuildThisFileDirectory)BundleConfig.json</AndroidBundleConfigurationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <AndroidResource Include="Icon.png">
+      <Link>Resources\drawable\Icon.png</Link>
+    </AndroidResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia.Android" Version="12.1.3" />
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="12.1.3" />
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
+    <PackageReference Include="Xamarin.AndroidX.Core.SplashScreen" Version="1.0.1.15" />
+    <PackageReference Include="Xamarin.AndroidX.Media3.ExoPlayer" Version="1.11.0" />
+    <PackageReference Include="Xamarin.AndroidX.Media3.Session" Version="1.11.0" />
+    <PackageReference Include="Xamarin.AndroidX.DocumentFile" Version="1.1.0.4" />
+    <!-- Media3.Session pulls AndroidX.Core 1.19.0.1; SplashScreen's chain leaves
+         AndroidX.Core.Core.Ktx pinned at 1.17.0.2. NuGet does not cross-bump sibling
+         package ids, so the two AARs ship duplicate compiled Kotlin extension classes
+         (AnimatorKt$addListener$1) and R8 fails with "defined multiple times". Pin
+         Core.Ktx to the same 1.19.0.1 release to keep the pair in lockstep. -->
+    <PackageReference Include="Xamarin.AndroidX.Core.Core.Ktx" Version="1.19.0.1" />
+    <!-- Sign in by QR code (AndroidQrScanner): Google's code scanner. Google Play services
+         runs the camera and the decoder in its own process and hands back only the decoded
+         text, so the app needs no CAMERA permission and never sees a camera frame. -->
+    <PackageReference Include="Xamarin.GooglePlayServices.Code.Scanner" Version="116.1.0.17" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Media3's FFmpeg audio extension (androidx/media 1.11.0, Apache-2.0) over an LGPL FFmpeg
+         built with only the ALAC decoder: most phones (the owner's S23 included) ship no
+         audio/alac MediaCodec. Not bound (Libs/FfmpegMetadata.xml): DefaultRenderersFactory finds FfmpegAudioRenderer by
+         reflection, Media3AudioPlayer asks FfmpegLibrary through JNI. Built by
+         scripts/android/build-ffmpeg-decoder.sh; notice in Libs/FFMPEG-NOTICE.txt. -->
+    <AndroidLibrary Include="Libs\media3-decoder-ffmpeg-1.11.0.aar" />
+    <TransformFile Include="Libs\FfmpegMetadata.xml" />
+  </ItemGroup>
+
+  <!-- Artist logos (ArtistLogoService): the API keys come from the build, never from the
+       repository. Pass -p:UndertoneFanartApiKey=... (fanart.tv project key, free at
+       https://fanart.tv/get-an-api-key/), optionally -p:UndertoneFanartClientKey=... (a personal
+       key) and -p:UndertoneTheAudioDbApiKey=... (a paid TheAudioDB key: its free test key may not be
+       used in a store app), or set environment variables of those names (CI: repository
+       secrets). Without any, the artist page shows the name as before. -->
+  <ItemGroup>
+    <AssemblyMetadata Include="UndertoneFanartApiKey" Value="$(UndertoneFanartApiKey)" Condition="'$(UndertoneFanartApiKey)' != ''" />
+    <AssemblyMetadata Include="UndertoneFanartClientKey" Value="$(UndertoneFanartClientKey)" Condition="'$(UndertoneFanartClientKey)' != ''" />
+    <AssemblyMetadata Include="UndertoneTheAudioDbApiKey" Value="$(UndertoneTheAudioDbApiKey)" Condition="'$(UndertoneTheAudioDbApiKey)' != ''" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Undertone.Core\Undertone.Core.csproj" />
+    <ProjectReference Include="..\Undertone.UI\Undertone.UI.csproj" />
+    <ProjectReference Include="..\Undertone.Mobile\Undertone.Mobile.csproj" />
+  </ItemGroup>
+
+</Project>

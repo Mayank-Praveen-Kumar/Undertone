@@ -1,0 +1,619 @@
+name: Build
+
+# website/ is the marketing site, built and deployed by deploy-website.yml. It
+# shares no code with the solution, so a commit that only touches it has
+# nothing for this five-platform matrix to build — including the automated
+# "refresh release data" commits, which land on main every time a download
+# count moves.
+on:
+  push:
+    branches: [main, cross-platform]
+    paths-ignore:
+      - 'website/**'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'website/**'
+
+# Least privilege. Without this the workflow inherits the repository default
+# GITHUB_TOKEN scope, which on older repos is read/write across contents, packages and
+# actions — granted to a workflow that also runs on pull_request.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runs-on }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            runs-on: windows-latest
+            rid: win-x64
+            artifact: Undertone-windows-x64
+            run-tests: true
+            audit: true
+
+          - name: macos-arm64
+            runs-on: macos-14
+            rid: osx-arm64
+            artifact: Undertone-macos-arm64
+            run-tests: true
+            audit: true
+
+          - name: macos-x64
+            runs-on: macos-14
+            rid: osx-x64
+            artifact: Undertone-macos-x64
+            run-tests: false
+            audit: false
+
+          - name: linux-x64
+            runs-on: ubuntu-latest
+            rid: linux-x64
+            artifact: Undertone-linux-x64
+            run-tests: true
+            audit: true
+
+          - name: linux-arm64
+            runs-on: ubuntu-latest
+            rid: linux-arm64
+            artifact: Undertone-linux-arm64
+            run-tests: false
+            audit: false
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: '10.0.x'
+
+      # NU1603 (approximate package match) as error: a pinned version that no longer
+      # resolves exactly must fail the restore loudly instead of silently floating to
+      # the nearest available version.
+      - name: Restore
+        run: dotnet restore src/Undertone/Undertone.csproj -r ${{ matrix.rid }} -warnaserror:NU1603
+
+      # Fails the build on a known-vulnerable package anywhere in the graph, including
+      # transitives (which is where the shipped native SQLite advisory lived).
+      #
+      # One leg per OS: the graph only varies by host OS (the OS-conditional native
+      # libVLC reference — only a Windows run evaluates VideoLAN.LibVLC.Windows; the
+      # Mac payload is bundled from videolan.org at packaging time, not via NuGet), so
+      # auditing win-x64, osx-arm64 and linux-x64 covers every shipped package graph.
+      - name: Audit dependencies
+        if: matrix.audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          report=$(dotnet list src/Undertone/Undertone.csproj package --vulnerable --include-transitive)
+          echo "$report"
+          if echo "$report" | grep -qE '\b(Moderate|High|Critical)\b'; then
+            echo "::error::Vulnerable package(s) found in the dependency graph."
+            exit 1
+          fi
+
+      - name: Build
+        run: dotnet build src/Undertone/Undertone.csproj -c Release -r ${{ matrix.rid }} --no-restore
+
+      # The headless UI suite is authored and kept green on Windows. The macOS and
+      # Linux headless harnesses lay out and time the same views differently, so their
+      # results are informational until those tests are made platform-neutral: the
+      # step still runs and reports, but only the Windows leg gates the build.
+      - name: Run tests
+        if: matrix.run-tests
+        continue-on-error: ${{ matrix.rid != 'win-x64' }}
+        run: dotnet test tests/Undertone.Tests/Undertone.Tests.csproj -c Release -v minimal
+
+      - name: Publish self-contained
+        run: >
+          dotnet publish src/Undertone/Undertone.csproj
+          -c Release
+          -r ${{ matrix.rid }}
+          --self-contained true
+          -p:PublishSingleFile=false
+          -o publish/${{ matrix.rid }}
+
+      # Bundle ffmpeg for the Audio Converter feature so users don't need a
+      # system install. Every download is version-PINNED and SHA-256-verified,
+      # and a failure FAILS the build: the old continue-on-error meant an
+      # outage (or a tampered/changed upstream binary, since "latest" was a
+      # moving tag) shipped a release silently missing or altering ffmpeg.
+      # To bump a pin: update the URL + hash together (sha256sum the download).
+      - name: Bundle ffmpeg (Windows)
+        if: matrix.rid == 'win-x64'
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/GyanD/codexffmpeg/releases/download/7.1/ffmpeg-7.1-essentials_build.zip'
+          $expected = 'fa7d4d7e795db0e2503f49f105f46ed5852386f0cfdd819899be3b65ebde24fc'
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          $actual = (Get-FileHash ffmpeg.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "ffmpeg.zip SHA-256 mismatch: got $actual" }
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-extract
+          Copy-Item (Get-ChildItem -Recurse ffmpeg-extract -Filter ffmpeg.exe | Select-Object -First 1).FullName "publish/${{ matrix.rid }}/ffmpeg.exe"
+          if (-not (Test-Path "publish/${{ matrix.rid }}/ffmpeg.exe")) { throw "ffmpeg.exe missing from payload" }
+
+      - name: Bundle ffmpeg (macOS x64)
+        if: matrix.rid == 'osx-x64'
+        run: |
+          set -euo pipefail
+          # evermeet.cx builds are Intel-only (thin x86_64 Mach-O, not
+          # universal2), so they ship in the osx-x64 package only.
+          curl -sSL https://evermeet.cx/ffmpeg/ffmpeg-8.1.2.zip -o ffmpeg.zip
+          echo "e91df72a1ee7c26606f90dd2dd4dcccc6a75140ff9ea6fdd50faae828b82ba69  ffmpeg.zip" | shasum -a 256 -c -
+          unzip -q ffmpeg.zip -d ffmpeg-extract
+          cp ffmpeg-extract/ffmpeg "publish/${{ matrix.rid }}/ffmpeg"
+          chmod +x "publish/${{ matrix.rid }}/ffmpeg"
+          test -x "publish/${{ matrix.rid }}/ffmpeg"
+          lipo "publish/${{ matrix.rid }}/ffmpeg" -verify_arch x86_64
+
+      - name: Bundle ffmpeg (macOS arm64)
+        if: matrix.rid == 'osx-arm64'
+        run: |
+          set -euo pipefail
+          # Native arm64 static build of the same 8.1.2 release (links only
+          # system frameworks, minimum macOS 12). An x86_64 ffmpeg here fails
+          # with "Bad CPU type in executable" on Apple Silicon without
+          # Rosetta 2, and the bundled copy wins over any PATH/Homebrew ffmpeg.
+          curl -sSL https://ffmpeg.martin-riedl.de/download/macos/arm64/1783011502_8.1.2/ffmpeg.zip -o ffmpeg.zip
+          echo "ef1aa60006c7b77ce170c1608c08d8e4ba1c30c5746f2ac986ded932d0ac2c3c  ffmpeg.zip" | shasum -a 256 -c -
+          unzip -q ffmpeg.zip -d ffmpeg-extract
+          cp ffmpeg-extract/ffmpeg "publish/${{ matrix.rid }}/ffmpeg"
+          chmod +x "publish/${{ matrix.rid }}/ffmpeg"
+          test -x "publish/${{ matrix.rid }}/ffmpeg"
+          lipo "publish/${{ matrix.rid }}/ffmpeg" -verify_arch arm64
+
+      - name: Bundle ffmpeg (Linux x64)
+        if: matrix.rid == 'linux-x64'
+        run: |
+          set -euo pipefail
+          # BtbN's GitHub-hosted static build, pinned to a dated autobuild tag
+          # (the "latest" tag is rewritten daily). johnvansickle.com was dropped
+          # after going unreachable during the v1.2.6 release.
+          # NOTE: BtbN prunes dated autobuild releases after ~2 weeks, so this
+          # pin rots — when the download 404s (curl saves an HTML page and the
+          # checksum fails), re-pin to the newest autobuild + fresh hashes.
+          curl -sSL https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-02-12-51/ffmpeg-N-128293-gb034eb5e7e-linux64-gpl.tar.xz -o ffmpeg.tar.xz
+          echo "2c3a505d35f78566310f6997e7a02ccda4e03112b63dab266ce439c5c719f661  ffmpeg.tar.xz" | sha256sum -c -
+          tar -xf ffmpeg.tar.xz
+          cp ffmpeg-*-linux64-gpl/bin/ffmpeg "publish/${{ matrix.rid }}/ffmpeg"
+          chmod +x "publish/${{ matrix.rid }}/ffmpeg"
+          test -x "publish/${{ matrix.rid }}/ffmpeg"
+
+      - name: Bundle ffmpeg (Linux arm64)
+        if: matrix.rid == 'linux-arm64'
+        run: |
+          set -euo pipefail
+          # Same pinned BtbN autobuild as linux-x64 (arm64 asset).
+          curl -sSL https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-02-12-51/ffmpeg-N-128293-gb034eb5e7e-linuxarm64-gpl.tar.xz -o ffmpeg.tar.xz
+          echo "9711e7d8eec415f72c2a8fd207ef752cadb87c93878fa945525d210460395d68  ffmpeg.tar.xz" | sha256sum -c -
+          tar -xf ffmpeg.tar.xz
+          cp ffmpeg-*-linuxarm64-gpl/bin/ffmpeg "publish/${{ matrix.rid }}/ffmpeg"
+          chmod +x "publish/${{ matrix.rid }}/ffmpeg"
+          test -e "publish/${{ matrix.rid }}/ffmpeg"
+
+      # ── macOS: bundle as Undertone.app, wrap in a .dmg ─────────────────
+      - name: Package macOS .app + .dmg
+        if: startsWith(matrix.rid, 'osx-')
+        run: |
+          set -euo pipefail
+          APP="dist/Undertone.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+          # Copy the published binary + all dependencies into the bundle
+          cp -R publish/${{ matrix.rid }}/. "$APP/Contents/MacOS/"
+          chmod +x "$APP/Contents/MacOS/Undertone"
+
+          # ── Bundle libvlc (AUDIT H7/H8) ───────────────────────────────
+          # The VideoLAN.LibVLC.Mac NuGet was dropped: its 3.0.21 pin never
+          # existed on nuget.org, so restore silently floated to the abandoned
+          # 2019-era 3.1.3.1 payload (x86_64-only, no plugins). Bundle the
+          # official universal (arm64+x86_64) VLC 3.0.23 dylibs + plugins at
+          # Contents/MacOS/libvlc/{lib,plugins} — the same sibling layout as
+          # VLC.app, which the plugins' @loader_path/../lib install names
+          # require. VlcAudioPlayer probes this path before a user-installed
+          # VLC.app. Pinned + SHA-256-verified like the ffmpeg bundles above;
+          # any failure FAILS the build.
+          curl -sSL https://download.videolan.org/pub/videolan/vlc/3.0.23/macosx/vlc-3.0.23-universal.dmg -o vlc.dmg
+          echo "56ee657c3aaf5c71b4ab7d6e4f4a77f6eca54633e0bf42a93b8116eb1d1f6ec9  vlc.dmg" | shasum -a 256 -c -
+          VLC_MOUNT=$(hdiutil attach vlc.dmg -nobrowse -readonly | awk -F$'\t' '/\/Volumes\//{print $NF}')
+          mkdir -p "$APP/Contents/MacOS/libvlc"
+          cp -R "$VLC_MOUNT/VLC.app/Contents/MacOS/lib" "$APP/Contents/MacOS/libvlc/lib"
+          cp -R "$VLC_MOUNT/VLC.app/Contents/MacOS/plugins" "$APP/Contents/MacOS/libvlc/plugins"
+          hdiutil detach "$VLC_MOUNT" -quiet
+          # Stale plugin cache pins absolute build-machine paths — delete it so
+          # libvlc rescans the bundled directory at runtime (AppImage precedent).
+          find "$APP/Contents/MacOS/libvlc" -name plugins.dat -delete
+          test -f "$APP/Contents/MacOS/libvlc/lib/libvlc.dylib"
+          test -d "$APP/Contents/MacOS/libvlc/plugins"
+
+          # Build .icns from the canonical Windows .ico so the macOS dock icon
+          # matches the Windows taskbar icon.
+          brew install --quiet imagemagick
+          ICONSET=Undertone.iconset
+          mkdir -p "$ICONSET"
+          SRC_ICO="src/Undertone/Assets/Icons/Undertone.ico"
+          BASE_PNG=Undertone-base.png
+          # .ico files contain multiple frames at different sizes. Pick the
+          # largest frame so sips downsamples cleanly instead of upscaling
+          # a tiny 16x16/32x32 frame and producing a blurry dock icon.
+          LARGEST_IDX=$(magick identify "$SRC_ICO" \
+            | awk '{print NR-1, $3}' \
+            | awk -F'[ x]' '{print $1, $2}' \
+            | sort -k2 -n | tail -1 | awk '{print $1}')
+          magick "${SRC_ICO}[${LARGEST_IDX}]" -background none -resize 1024x1024 "${BASE_PNG}"
+          for SIZE in 16 32 64 128 256 512; do
+            DOUBLE=$((SIZE * 2))
+            sips -z $SIZE  $SIZE  "$BASE_PNG" --out "$ICONSET/icon_${SIZE}x${SIZE}.png"
+            sips -z $DOUBLE $DOUBLE "$BASE_PNG" --out "$ICONSET/icon_${SIZE}x${SIZE}@2x.png"
+          done
+          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/Undertone.icns"
+
+          VERSION=$(grep -oE '<Version>[0-9.]+</Version>' src/Undertone/Undertone.csproj | grep -oE '[0-9.]+')
+
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Undertone</string>
+            <key>CFBundleDisplayName</key><string>Undertone</string>
+            <key>CFBundleIdentifier</key><string>com.heartached.undertone</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleExecutable</key><string>Undertone</string>
+            <key>CFBundleIconFile</key><string>Undertone</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>LSMinimumSystemVersion</key><string>12.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>NSAppleEventsUsageDescription</key><string>Undertone asks Finder to move deleted music files to the Trash.</string>
+            <key>CFBundleDocumentTypes</key>
+            <array>
+              <dict>
+                <key>CFBundleTypeName</key><string>Audio</string>
+                <key>CFBundleTypeRole</key><string>Viewer</string>
+                <key>LSHandlerRank</key><string>Alternate</string>
+                <key>LSItemContentTypes</key>
+                <array>
+                  <string>public.audio</string>
+                  <string>public.mp3</string>
+                  <string>org.xiph.flac</string>
+                  <string>com.apple.m4a-audio</string>
+                  <string>public.aiff-audio</string>
+                  <string>com.microsoft.waveform-audio</string>
+                </array>
+              </dict>
+            </array>
+          </dict>
+          </plist>
+          PLIST
+
+          # ── Ad-hoc code-sign the bundle ───────────────────────────────
+          # Apple Silicon refuses to launch Mach-O code that isn't validly
+          # signed: the kernel SIGKILLs it at exec, which presents as "the app
+          # bounces in the dock once and immediately quits" with no crash log
+          # (the kill happens before any managed code runs). Stripping the
+          # quarantine xattr does NOT bypass this — that only silences the
+          # Gatekeeper prompt. We have no Apple Developer ID, so we ad-hoc sign
+          # (`-`). Every nested Mach-O (the .NET host, helper executables, and
+          # all dylibs incl. libvlc/Skia/Avalonia) must be signed before the
+          # bundle is sealed. Sign nested Mach-O depth-first, then seal the
+          # whole bundle with --deep (which signs the main binary and seals the
+          # managed .dll assemblies as resources). Signing the main executable
+          # by its direct path instead trips "code object is not signed at all /
+          # In subcomponent: *.dll", because codesign then treats the flat
+          # managed assemblies in Contents/MacOS as unsigned nested code.
+          echo "Ad-hoc code-signing ${APP}"
+          find "$APP/Contents/MacOS" -type f \
+            \( -name "*.dylib" -o -name "ffmpeg" -o -name "createdump" \) \
+            -exec codesign --force --timestamp=none --sign - {} +
+          codesign --force --deep --timestamp=none --sign - "$APP"
+          # Hard-fail, do not warn. On Apple Silicon an invalidly signed Mach-O is
+          # SIGKILLed at exec (the "bounces in the dock and quits" failure this repo has
+          # already shipped once), and this is the only gate between a signing regression
+          # and a dead macOS release. Swallowing the exit code shipped the broken bundle.
+          codesign --verify --deep --verbose=2 "$APP"
+
+          # Build .dmg (uses macOS built-in hdiutil — no extra deps)
+          DMG_NAME="Undertone-${{ matrix.rid }}.dmg"
+          mkdir -p dist/dmg-staging
+          cp -R "$APP" dist/dmg-staging/
+          ln -s /Applications dist/dmg-staging/Applications
+          # macOS runners intermittently fail here with
+          # "hdiutil: create failed - Resource busy" when the staging volume is
+          # still held by Spotlight/another process. Retry a few times.
+          for attempt in 1 2 3 4 5; do
+            if hdiutil create -volname "Undertone" \
+                 -srcfolder dist/dmg-staging \
+                 -ov -format UDZO \
+                 "dist/${DMG_NAME}"; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "hdiutil create failed after 5 attempts" >&2
+              exit 1
+            fi
+            echo "hdiutil create failed (attempt $attempt/5) — retrying in 5s…"
+            sleep 5
+          done
+
+          mkdir -p packaged
+          mv "dist/${DMG_NAME}" packaged/
+
+          # Also ship a portable .zip of the .app bundle. Use ditto so the
+          # executable bit, symlinks, and xattrs survive — `zip`/`tar` would
+          # strip the executable bit on Contents/MacOS/Undertone.
+          ZIP_NAME="Undertone-${{ matrix.rid }}.zip"
+          ditto -c -k --keepParent "$APP" "packaged/${ZIP_NAME}"
+
+      # ── Linux: build an AppImage ────────────────────────────────────
+      - name: Package Linux AppImage
+        if: startsWith(matrix.rid, 'linux-')
+        run: |
+          set -euo pipefail
+          # Skip ARM64 packaging on x64 host — AppImage tools are arch-specific
+          # and cross-architecture AppImage assembly is non-trivial. ARM64 ships
+          # as a self-contained tarball instead.
+          if [ "${{ matrix.rid }}" = "linux-arm64" ]; then
+            VERSION=$(grep -oE '<Version>[0-9.]+</Version>' src/Undertone/Undertone.csproj | grep -oE '[0-9.]+')
+            mkdir -p packaged
+            tar -czf "packaged/Undertone-linux-arm64.tar.gz" -C publish/${{ matrix.rid }} .
+            exit 0
+          fi
+
+          VERSION=$(grep -oE '<Version>[0-9.]+</Version>' src/Undertone/Undertone.csproj | grep -oE '[0-9.]+')
+
+          # Assemble AppDir
+          APPDIR=Undertone.AppDir
+          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+          cp -R publish/${{ matrix.rid }}/. "$APPDIR/usr/bin/"
+          chmod +x "$APPDIR/usr/bin/Undertone"
+
+          # ── Bundle libvlc + its plugins (issue #26) ─────────────────
+          # Through v1.3.8 the AppImage shipped NO libvlc and silently relied
+          # on the host's VLC install. On distros that split VLC's plugins
+          # into optional packages (Arch: avformat/avcodec live in
+          # vlc-plugin-ffmpeg, an optdepend of vlc) playback then failed on
+          # every file with "VLC is unable to open the MRL …". Bundle the
+          # core libs + Ubuntu's vlc-plugin-base set (filesystem access, all
+          # audio demux/codecs incl. avformat, pulse/alsa outputs) so the
+          # AppImage is self-contained. Note: bundling from ubuntu-latest
+          # sets the AppImage's glibc floor (currently 2.38); older distros
+          # keep the tarball + system VLC path.
+          sudo apt-get install -y --no-install-recommends libvlc5 libvlccore9 vlc-plugin-base vlc-data
+          LIBDIR=/usr/lib/x86_64-linux-gnu
+          cp -a "$LIBDIR"/libvlc.so.5* "$LIBDIR"/libvlccore.so.9* "$APPDIR/usr/lib/"
+          # Whole vlc/ dir: plugins/ plus the private helper libs beside it
+          # (libvlc_pulse.so.0 etc.) that plugins reference via an absolute
+          # RUNPATH on Debian/Ubuntu — AppRun adds usr/lib/vlc to
+          # LD_LIBRARY_PATH so they resolve from the bundle instead.
+          cp -a "$LIBDIR/vlc" "$APPDIR/usr/lib/vlc"
+          # The plugin cache records absolute build-host paths; drop it and
+          # let libvlc rescan the bundled directory at runtime.
+          find "$APPDIR/usr/lib/vlc" -name plugins.dat -delete
+          # .NET's DllImport("libvlc") probes the UNVERSIONED soname
+          # (libvlc.so), which distro packages only ship in -dev packages —
+          # provide the symlinks ourselves.
+          ln -sf libvlc.so.5 "$APPDIR/usr/lib/libvlc.so"
+          ln -sf libvlccore.so.9 "$APPDIR/usr/lib/libvlccore.so"
+
+          # CoreCLR's optional LTTng tracepoint provider hard-links
+          # liblttng-ust.so.0, a soname modern distros/runners no longer ship
+          # (24.04 carries .so.1), and linuxdeploy's AppDir scan hard-fails on
+          # the unresolvable dependency. The runtime dlopen-probes the provider
+          # and runs fine without it — drop it from the AppImage payload only
+          # (the tarball keeps it).
+          rm -f "$APPDIR/usr/bin/libcoreclrtraceptprovider.so"
+
+          # linuxdeploy copies the ELF dependency closure of the bundled
+          # plugins/libs (libavformat, libavcodec & friends) into usr/lib,
+          # minus its denylist of assumed-system libraries, so the plugins
+          # load on distros with different library versions. Runs BEFORE the
+          # desktop file exists: with one in place its desktop-integration
+          # phase errors on the Exec entry (no executable was deployed via
+          # -e); without one it deploys dependencies and exits 0. Pinned
+          # release + SHA-256, same policy as appimagetool below. NO_STRIP:
+          # stripping has broken bundled libs before, and squashfs compresses
+          # the payload anyway.
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage -O linuxdeploy
+          echo "c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d  linuxdeploy" | sha256sum -c -
+          chmod +x linuxdeploy
+          NO_STRIP=1 ./linuxdeploy --appimage-extract-and-run --appdir "$APPDIR" \
+            --deploy-deps-only "$APPDIR/usr/lib/vlc/plugins" \
+            --deploy-deps-only "$APPDIR/usr/lib"
+
+          # Postconditions: fail the build if the payload regresses to the
+          # v1.3.8 "no VLC inside" state (the exact issue #26 failure mode).
+          test -e "$APPDIR/usr/lib/vlc/plugins/access/libfilesystem_plugin.so"
+          test -e "$APPDIR/usr/lib/vlc/plugins/demux/libavformat_plugin.so"
+          test -e "$APPDIR/usr/lib/vlc/plugins/audio_output/libpulse_plugin.so"
+          # The keep-alive's endless silence is callback media (GitHub #70).
+          test -e "$APPDIR/usr/lib/vlc/plugins/access/libaccess_imem_plugin.so"
+          ls "$APPDIR"/usr/lib/libavformat.so.* > /dev/null
+          # Use the canonical Windows .ico (extracted to PNG) so the Linux
+          # icon matches the Windows app icon. Ubuntu ships ImageMagick 6, so
+          # we use the legacy `convert`/`identify` binaries (the unified
+          # `magick` command is IM7+ only). Pick the largest frame in the .ico
+          # so we downsample to 256 instead of upscaling a tiny frame.
+          sudo apt-get install -y --no-install-recommends imagemagick
+          SRC_ICO="src/Undertone/Assets/Icons/Undertone.ico"
+          LARGEST_IDX=$(identify "$SRC_ICO" \
+            | awk '{print NR-1, $3}' \
+            | awk -F'[ x]' '{print $1, $2}' \
+            | sort -k2 -n | tail -1 | awk '{print $1}')
+          convert "${SRC_ICO}[${LARGEST_IDX}]" -background none -resize 256x256 undertone.png
+          cp undertone.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/undertone.png"
+          cp undertone.png "$APPDIR/undertone.png"
+
+          # AppRun: a real script instead of the old bare symlink, so the
+          # loader and libvlc find the bundled payload. UNDERTONE_BUNDLED_VLC=1
+          # tells the app the full plugin set is guaranteed — it then forces
+          # the avformat demuxer (O(1) MP3/M4A seek fix), which is unsafe to
+          # force against unknown system VLCs (see VlcAudioPlayer).
+          cat > "$APPDIR/AppRun" <<'APPRUN'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          export LD_LIBRARY_PATH="${HERE}/usr/lib:${HERE}/usr/lib/vlc${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export VLC_PLUGIN_PATH="${HERE}/usr/lib/vlc/plugins"
+          export UNDERTONE_BUNDLED_VLC=1
+          exec "${HERE}/usr/bin/Undertone" "$@"
+          APPRUN
+          chmod +x "$APPDIR/AppRun"
+
+          cat > "$APPDIR/undertone.desktop" <<DESKTOP
+          [Desktop Entry]
+          Type=Application
+          Name=Undertone
+          Comment=A music player that respects what's yours
+          Exec=Undertone
+          Icon=undertone
+          Categories=AudioVideo;Audio;Player;
+          Terminal=false
+          DESKTOP
+          cp "$APPDIR/undertone.desktop" "$APPDIR/usr/share/applications/"
+
+          # Fetch appimagetool — pinned release + SHA-256 (the "continuous" tag
+          # is rewritten on every upstream commit). Pinned to the successor repo
+          # AppImage/appimagetool: the old AppImageKit release assets were removed.
+          wget -q https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage -O appimagetool
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool" | sha256sum -c -
+          chmod +x appimagetool
+
+          mkdir -p packaged
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run "$APPDIR" "packaged/Undertone-x86_64.AppImage"
+
+          # Also ship a plain tarball alongside the AppImage so users on
+          # distros without FUSE (or who prefer not to use AppImage) have a
+          # portable archive option.
+          tar -czf "packaged/Undertone-linux-x64.tar.gz" -C publish/${{ matrix.rid }} .
+
+      - name: Upload artifact (raw publish folder)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: publish/${{ matrix.rid }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload packaged artifact
+        if: hashFiles('packaged/**') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.artifact }}-installer
+          path: packaged
+          if-no-files-found: error
+          retention-days: 14
+
+  # Headless undertone-server (Undertone.Core + console host): Linux builds for a NAS or a
+  # VPS, and the Docker image built from the same tree to prove the Dockerfile.
+  server:
+    name: undertone-server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish (linux-x64, linux-arm64)
+        run: |
+          set -euo pipefail
+          for rid in linux-x64 linux-arm64; do
+            dotnet publish src/Undertone.Server/Undertone.Server.csproj -c Release -r "$rid" \
+              --self-contained true -p:PublishSingleFile=false -o "publish/server/$rid"
+            tar -C "publish/server/$rid" -czf "undertone-server-$rid.tar.gz" .
+          done
+          ls -la undertone-server-*.tar.gz
+
+      - name: Docker build (no push)
+        run: docker build -t undertone-server:ci .
+
+      - name: Docker smoke
+        run: |
+          set -euo pipefail
+          docker run --rm undertone-server:ci --help
+          docker run --rm -e UNDERTONE_PASSWORD=ci-smoke-password undertone-server:ci user add ci --admin
+
+      - name: Upload server artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: undertone-server-linux
+          path: undertone-server-*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # Compile-only leg for the Android head. Nothing else in this workflow touches
+  # src/Undertone.Android, so a Core or Undertone.UI change that breaks the phone app would
+  # otherwise go unnoticed until someone built it by hand on a machine with the Android
+  # SDK — and Undertone.Android has no automated tests of its own, so the compiler is the
+  # only check it currently gets. Debug and no signing on purpose: producing a shippable
+  # APK (keystore, ABI split, R8 tuning) is Phase 5 work, and this job only has to prove
+  # the tree still builds. It is a separate job, so it neither slows nor gates the
+  # desktop matrix; a break here shows as its own red check.
+  android:
+    name: android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: '10.0.x'
+
+      # The ubuntu-latest image ships the Android SDK and a JDK but not the .NET android
+      # workload, and this is the job's slow step (a few minutes). Nothing here is cached:
+      # every action in this workflow is SHA-pinned, and the workload lands in the dotnet
+      # root rather than in a path a cache action could restore, so the install is paid on
+      # every run. If that ever becomes a problem the answer is a pinned actions/cache over
+      # ~/.nuget/packages, which only shaves the restore, not the workload.
+      - name: Restore workloads
+        run: dotnet workload restore src/Undertone.Android/Undertone.Android.csproj
+
+      # Debug, and the SDK is found through the runner's ANDROID_HOME — the local recipe
+      # passes -p:AndroidSdkDirectory only because a dev box may have several SDKs.
+      - name: Build Undertone.Android
+        run: dotnet build src/Undertone.Android/Undertone.Android.csproj -c Debug
+
+  # Produces the integrity manifest from the artifacts CI actually built, so it can
+  # never drift from what ships. It used to be generated by hand during the manual
+  # release step — the in-app updater verifies against it before running an installer
+  # with UAC elevation, so a hand-made manifest is the weakest link in that chain.
+  checksums:
+    name: SHA256SUMS
+    runs-on: ubuntu-latest
+    needs: build
+    if: always() && needs.build.result == 'success'
+    steps:
+      - name: Download all packaged artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: '*-installer'
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate manifest
+        run: |
+          set -euo pipefail
+          cd artifacts
+          # Basenames only: the manifest is consumed by asset name, not by path.
+          find . -type f ! -name 'SHA256SUMS' -printf '%P\n' \
+            | sort \
+            | while read -r f; do sha256sum "$f"; done > SHA256SUMS
+          echo "── SHA256SUMS ──"
+          cat SHA256SUMS
+
+      - name: Upload manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: SHA256SUMS
+          path: artifacts/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Kawarp for Undertone: fluid, warped album-art background behind the lyrics (after the
+    better-lyrics/shaders effect of the same name). Undertone now ships Kawarp built in
+    (Controls/KawarpBackground.cs); this project stays as the realistic visual-layer plugin
+    sample (Skia shader, data-folder settings) and its tests. Install the Release zip, or copy
+    the DLL + plugin.json to <Undertone data>/plugins/dev.undertone.plugins.kawarp/ — Avalonia, Skia
+    and the SDK come from the app.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Undertone.Plugins.Kawarp</RootNamespace>
+    <Version>1.0.0</Version>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Undertone.Plugins.Abstractions\Undertone.Plugins.Abstractions.csproj">
+      <Private>false</Private>
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </ProjectReference>
+    <!-- Compile-time only: the host already carries these exact versions and shares them. -->
+    <PackageReference Include="Avalonia.Skia" Version="12.1.3" ExcludeAssets="runtime" />
+    <PackageReference Include="SkiaSharp" Version="3.119.4" ExcludeAssets="runtime" />
+  </ItemGroup>
+  <!-- Release builds also write bin/Release/Undertone.Plugins.Kawarp-<version>.zip (DLL + plugin.json). -->
+  <Import Project="..\..\samples\PluginPackage.targets" />
+</Project>

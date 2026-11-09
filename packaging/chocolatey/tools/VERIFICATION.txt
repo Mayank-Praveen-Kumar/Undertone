@@ -1,0 +1,22 @@
+VERIFICATION
+
+Verification is intended to assist the Chocolatey moderators and any user in
+verifying that this package's contents are trustworthy.
+
+This package downloads the official installer published by the Undertone author on
+GitHub Releases:
+
+  https://github.com/Mayank-Praveen-Kumar/Undertone/releases
+
+The installer URL embedded in tools\chocolateyInstall.ps1 is:
+
+  https://github.com/Mayank-Praveen-Kumar/Undertone/releases/download/v<version>/Undertone-v<version>-Setup.exe
+
+To verify the SHA256 checksum of the downloaded installer:
+
+  PowerShell:  Get-FileHash .\Undertone-v<version>-Setup.exe -Algorithm SHA256
+
+Compare the result with the `checksum64` value in tools\chocolateyInstall.ps1.
+
+The file tools\LICENSE.txt is a verbatim copy of the project's MIT license,
+also available at https://github.com/Mayank-Praveen-Kumar/Undertone/blob/main/LICENSE

@@ -1,0 +1,131 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:helpers="using:Undertone.Helpers"
+             xmlns:loc="using:Undertone.Localization"
+             xmlns:vm="using:Undertone.ViewModels"
+             xmlns:m="using:Undertone.Models"
+             xmlns:ctrl="using:Undertone.Controls"
+             x:Class="Undertone.Views.MoreByArtistView"
+             x:DataType="vm:MoreByArtistViewModel"
+             Background="{DynamicResource AppMainBackground}"
+             ClipToBounds="True">
+
+    <DockPanel LastChildFill="True">
+
+        <!-- Title is rendered next to the Back button in the global top bar -->
+
+        <!-- Album grid -->
+        <ScrollViewer x:Name="AlbumScrollViewer"
+                      HorizontalScrollBarVisibility="Disabled"
+                      VerticalScrollBarVisibility="Auto"
+                      Padding="12,16,2,0">
+            <!-- Bottom margin (not ScrollViewer padding) so the last row scrolls clear of
+                 the floating playback island, matching AlbumDetailView's breathing room. -->
+            <ItemsControl ItemsSource="{Binding Albums}"
+                          Margin="0,0,0,115">
+                <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <UniformGrid Columns="5" />
+                    </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="m:Album">
+                        <Button Classes="album-tile"
+                                AutomationProperties.Name="{Binding Name}"
+                                Focusable="False"
+                                Margin="2"
+                                MinHeight="{Binding $parent[UserControl].((vm:MoreByArtistViewModel)DataContext).TileHeight}"
+                                HorizontalAlignment="Stretch"
+                                VerticalAlignment="Top"
+                                Command="{Binding $parent[UserControl].((vm:MoreByArtistViewModel)DataContext).OpenAlbumCommand}"
+                                CommandParameter="{Binding}"
+                                ContextRequested="OnAlbumTileContextRequested">
+
+                            <!-- Right-click / dots: one shared v2 menu built in code (OnAlbumTileContextRequested);
+                                 commands are routed through the shared LibraryAlbumsVm -->
+
+                            <Grid RowDefinitions="Auto,64"
+                                  Height="{Binding $parent[UserControl].((vm:MoreByArtistViewModel)DataContext).TileHeight}"
+                                  HorizontalAlignment="Stretch">
+                                <Border Width="{Binding $parent[UserControl].((vm:MoreByArtistViewModel)DataContext).TileArtworkSize}"
+                                        Height="{Binding $parent[UserControl].((vm:MoreByArtistViewModel)DataContext).TileArtworkSize}"
+                                        CornerRadius="6"
+                                        ClipToBounds="True"
+                                        Background="#1AFFFFFF">
+                                    <Panel>
+                                        <TextBlock Text="{loc:T MoreByArtist.Text}"
+                                                   FontSize="40"
+                                                   HorizontalAlignment="Center"
+                                                   VerticalAlignment="Center"
+                                                   Opacity="0.15"
+                                                   IsVisible="{Binding ArtworkPath, Converter={x:Static StringConverters.IsNullOrEmpty}}" />
+                                        <ctrl:CachedImage SourcePath="{Binding ArtworkPath}"
+                                                          Stretch="UniformToFill"
+                                                          RenderOptions.BitmapInterpolationMode="HighQuality"
+                                                          IsVisible="{Binding ArtworkPath, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                                                    <!-- Hover overlay (09-13): dim + Play/Pause + dots; styles in Styles.axaml -->
+                                                    <Border Classes="tile-dim" />
+                                                    <Button Classes="tile-play"
+                                                            Command="{Binding $parent[UserControl].((vm:MoreByArtistViewModel)DataContext).LibraryAlbumsVm.TogglePlayAlbumCommand}"
+                                                            CommandParameter="{Binding}">
+                                                        <Panel>
+                                                            <Viewbox Width="12" Height="12" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="1,0,0,0" IsVisible="{Binding !IsNowPlaying}"><Path Data="{StaticResource PlayIcon}" Fill="White" /></Viewbox>
+                                                            <Viewbox Width="12" Height="12" HorizontalAlignment="Center" VerticalAlignment="Center" IsVisible="{Binding IsNowPlaying}"><Path Data="{StaticResource PauseIcon}" Fill="White" /></Viewbox>
+                                                        </Panel>
+                                                    </Button>
+                                                    <Button Classes="tile-more" Click="OnTileMoreClick">
+                                                        <Viewbox Width="14" Height="14" HorizontalAlignment="Center" VerticalAlignment="Center"><Path Data="{StaticResource MoreDotsIcon}" Fill="White" /></Viewbox>
+                                                    </Button>
+                                    </Panel>
+                                </Border>
+                                        <StackPanel Grid.Row="1" Classes="tile-text" Spacing="0">
+                                            <!-- Title + explicit badge; the heart sits at the line's right end (09-13) -->
+                                            <Grid ColumnDefinitions="*,Auto" Margin="0,5,0,0">
+                                                <TextBlock Grid.Column="0"
+                                                           helpers:TitleWrap.Watch="True"
+                                                           FontSize="13"
+                                                           FontWeight="SemiBold"
+                                                           TextWrapping="Wrap"
+                                                           TextTrimming="CharacterEllipsis"
+                                                           MaxLines="2">
+                                                    <Run Text="{Binding Name}" />
+                                                    <InlineUIContainer BaselineAlignment="Center">
+                                                        <Border Classes="explicit-badge compact"
+                                                                Margin="4,0,0,0"
+                                                                IsVisible="{Binding IsExplicit}"
+                                                                ToolTip.Tip="{loc:T MoreByArtist.ExplicitTip}">
+                                                            <TextBlock Text="E"
+                                                                       Classes="explicit-badge-text compact"
+                                                                       FontSize="8"
+                                                                       Opacity="0.9" />
+                                                        </Border>
+                                                    </InlineUIContainer>
+                                                </TextBlock>
+                                                <Panel Grid.Column="1" Classes="heart-title" VerticalAlignment="Top" Margin="6,2,0,0">
+                                                    <ctrl:HeartIcon Size="14" ShowWhenOff="False" IsFavorite="{Binding HasFavoriteTrack}" />
+                                                </Panel>
+                                            </Grid>
+                                            <!-- Subtitle; the heart lands here instead when the title wraps -->
+                                            <Grid ColumnDefinitions="*,Auto" Margin="0,1,0,0">
+                                                <TextBlock Grid.Column="0"
+                                                           Text="{Binding TileSubtitle}"
+                                                           FontSize="12"
+                                                           FontWeight="Bold"
+                                                           Opacity="0.55"
+                                                           TextTrimming="CharacterEllipsis"
+                                                           MaxLines="1" />
+                                                <Panel Grid.Column="1" Classes="heart-sub" VerticalAlignment="Center" Margin="6,0,0,0">
+                                                    <ctrl:HeartIcon Size="14" ShowWhenOff="False" IsFavorite="{Binding HasFavoriteTrack}" />
+                                                </Panel>
+                                            </Grid>
+                                        </StackPanel>
+                            </Grid>
+                        </Button>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </ScrollViewer>
+
+    </DockPanel>
+
+</UserControl>

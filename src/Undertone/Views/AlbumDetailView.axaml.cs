@@ -1,0 +1,617 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Linq;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Input;
+using Avalonia.Interactivity;
+using Avalonia.Controls.Presenters;
+using Avalonia.VisualTree;
+using Undertone.Helpers;
+using Undertone.Models;
+using Undertone.Services;
+using Undertone.ViewModels;
+
+namespace Undertone.Views;
+
+public partial class AlbumDetailView : UserControl, ITrackSelectionSource
+{
+    private EventHandler? _pendingScrollRestore;
+    private System.ComponentModel.PropertyChangedEventHandler? _bgHandler;
+    private AlbumDetailViewModel? _trackedVm;
+    // Multi-select tracked by Track (data) so it survives container recycling.
+    private readonly HashSet<Track> _selectedTracks = new();
+
+    /// <summary>The Ctrl-selection, for window shortcuts (GitHub #131 ReplayGain).</summary>
+    public IReadOnlyList<Track> GetSelectedTracks() => _selectedTracks.ToList();
+
+    // One shared track menu for the whole page, bound to a row on open — the
+    // per-row XAML menus (context menu + 3-dot flyout, ~35 items and ~14 bitmap
+    // decodes per row) were the dominant cost of realizing this non-virtualized
+    // list: the shared Unknown-Album bucket froze the app for minutes and ran
+    // it out of memory at WAV-rip library scale. Same pattern as LibrarySongsView.
+    private TrackContextMenuBuilder? _menuBuilder;
+    /// <summary>Culture the menu's strings were read in (they are read once, at Build).</summary>
+    private string? _menuCulture;
+    private ListBoxItem? _menuOwnerItem;
+
+    public AlbumDetailView()
+    {
+        InitializeComponent();
+
+        DiscGroupList.ContainerPrepared += OnDiscGroupContainerPrepared;
+        DiscGroupList.ContainerClearing += OnDiscGroupContainerClearing;
+
+        DataContextChanged += OnAlbumDataContextChanged;
+        TrackScrollViewer.PropertyChanged += (_, e) =>
+        {
+            if (e.Property == ScrollViewer.ViewportProperty) UpdateAlbumBlockLayout();
+        };
+
+        OtherVersionsScroll.ScrollChanged += (_, _) => UpdateHScrollArrows(OtherVersionsScroll, OtherVersionsLeft, OtherVersionsRight);
+        OtherVersionsScroll.LayoutUpdated += (_, _) => UpdateHScrollArrows(OtherVersionsScroll, OtherVersionsLeft, OtherVersionsRight);
+        MoreByArtistScroll.ScrollChanged += (_, _) => UpdateHScrollArrows(MoreByArtistScroll, MoreByArtistLeft, MoreByArtistRight);
+        MoreByArtistScroll.LayoutUpdated += (_, _) => UpdateHScrollArrows(MoreByArtistScroll, MoreByArtistLeft, MoreByArtistRight);
+
+        AddHandler(InputElement.PointerPressedEvent, OnOptionsFlyoutButtonPointerPressed, RoutingStrategies.Tunnel);
+        // Forward Ctrl+A from the window so it works without first clicking a row.
+        _ = new WindowKeyForwarder(this, OnViewKeyDown);
+    }
+
+    /// <summary>Space the floating player bar covers at the bottom of the page.</summary>
+    private const double PlayerBarClearance = 115;
+    /// <summary>The footer's own bottom margin (XAML), already part of that clearance.</summary>
+    private const double FooterBottomMargin = 28;
+
+    /// <summary>
+    /// A tinted album block is at least one viewport tall, so the colour runs to the
+    /// bottom of the window and the docked footer facts sit at its foot (Discord NJZ
+    /// 09-22: the colour stopping mid-screen looked awkward). The block also carries the
+    /// player-bar clearance whenever it is tinted or ends the page, so the footer never
+    /// sits under the bar and the colour never gives way to a strip of app background.
+    /// With Tint whole page (Discord "Album Page Redesign") the colour runs on under the
+    /// related sections instead, which follow the tracks directly — the viewport-tall
+    /// block left a screen of empty colour above them on short albums.
+    /// </summary>
+    private void UpdateAlbumBlockLayout()
+    {
+        if (DataContext is not AlbumDetailViewModel vm) return;
+        var hasRelated = vm.HasOtherVersions || vm.HasMoreByArtist;
+        var wholePage = vm.HasTint && vm.TintWholePage && hasRelated;
+        var viewport = TrackScrollViewer.Viewport.Height;
+        Grid.SetRowSpan(AlbumTintBg, wholePage ? 2 : 1);
+        RelatedSections.Classes.Set("page-tint", wholePage);
+        PageLayout.MinHeight = wholePage ? viewport : 0;
+        AlbumBlock.MinHeight = vm.HasTint && !wholePage ? viewport : 0;
+        AlbumBlockContent.Margin = new Thickness(0, 0, 0,
+            (vm.HasTint && !wholePage) || !hasRelated ? PlayerBarClearance - FooterBottomMargin : 0);
+    }
+
+    /// <summary>Ctrl+Click toggles a track row's selection; a plain click clears it.</summary>
+    private void OnTrackRowPointerPressed(PointerPressedEventArgs e)
+    {
+        var src = e.Source as Control;
+        while (src != null && src is not ListBoxItem)
+            src = src.Parent as Control;
+        if (src is not ListBoxItem item) return;
+        if (item.DataContext is not Track track) return;
+
+        MultiSelectHelper.HandleTrackRowClickByData(item, track, e, _selectedTracks);
+        if (_selectedTracks.Count > 0)
+            Focus();
+    }
+
+    /// <summary>GitHub #114: a click on the header cover opens it full size; no cover, no viewer.</summary>
+    private void OnHeaderCoverTapped(object? sender, TappedEventArgs e)
+    {
+        if (DataContext is not AlbumDetailViewModel vm || !vm.ViewArtworkCommand.CanExecute(null)) return;
+        e.Handled = true;
+        vm.ViewArtworkCommand.Execute(null);
+    }
+
+    /// <summary>Ctrl+A selects all album tracks (toggles to deselect when all are selected).</summary>
+    private void OnViewKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Escape && _selectedTracks.Count > 0)
+        {
+            ClearTrackSelection();
+            e.Handled = true;
+            return;
+        }
+
+        if (e.Key != Key.A || !e.KeyModifiers.HasFlag(PlatformHelper.PrimaryModifier)) return;
+        if (DataContext is not AlbumDetailViewModel vm) return;
+        e.Handled = true;
+
+        var all = vm.Tracks.ToList();
+        var allSelected = all.Count > 0 && all.All(t => _selectedTracks.Contains(t));
+        _selectedTracks.Clear();
+        if (!allSelected)
+            foreach (var t in all) _selectedTracks.Add(t);
+
+        foreach (var li in DiscGroupList.GetVisualDescendants().OfType<ListBoxItem>())
+        {
+            if (li.DataContext is Track t && _selectedTracks.Contains(t))
+                li.Classes.Add("ctrl-selected");
+            else
+                li.Classes.Remove("ctrl-selected");
+        }
+    }
+
+    private void ClearTrackSelection()
+    {
+        _selectedTracks.Clear();
+        foreach (var li in DiscGroupList.GetVisualDescendants().OfType<ListBoxItem>())
+            li.Classes.Remove("ctrl-selected");
+        if (DataContext is AlbumDetailViewModel vm)
+            vm.CtrlSelectedTracks = new List<Track>();
+    }
+
+    private static void UpdateHScrollArrows(ScrollViewer sv, Button left, Button right)
+    {
+        var maxOffset = Math.Max(0, sv.Extent.Width - sv.Viewport.Width);
+        left.IsVisible = sv.Offset.X > 1;
+        right.IsVisible = sv.Offset.X < maxOffset - 1;
+    }
+
+    private static void ScrollHorizontal(ScrollViewer sv, double delta)
+    {
+        var maxOffset = Math.Max(0, sv.Extent.Width - sv.Viewport.Width);
+        var target = Math.Clamp(sv.Offset.X + delta, 0, maxOffset);
+        sv.Offset = new Vector(target, sv.Offset.Y);
+    }
+
+    private void OnOtherVersionsLeftClick(object? sender, RoutedEventArgs e)
+        => ScrollHorizontal(OtherVersionsScroll, -OtherVersionsScroll.Viewport.Width * 0.9);
+
+    private void OnOtherVersionsRightClick(object? sender, RoutedEventArgs e)
+        => ScrollHorizontal(OtherVersionsScroll, OtherVersionsScroll.Viewport.Width * 0.9);
+
+    private void OnMoreByArtistLeftClick(object? sender, RoutedEventArgs e)
+        => ScrollHorizontal(MoreByArtistScroll, -MoreByArtistScroll.Viewport.Width * 0.9);
+
+    private void OnMoreByArtistRightClick(object? sender, RoutedEventArgs e)
+        => ScrollHorizontal(MoreByArtistScroll, MoreByArtistScroll.Viewport.Width * 0.9);
+
+    private void OnDiscGroupContainerPrepared(object? sender, ContainerPreparedEventArgs e)
+    {
+        if (e.Container is not ContentPresenter cp) return;
+        cp.Loaded += OnDiscGroupPresenterLoaded;
+    }
+
+    private void OnDiscGroupContainerClearing(object? sender, ContainerClearingEventArgs e)
+    {
+        if (e.Container is not ContentPresenter cp) return;
+        cp.Loaded -= OnDiscGroupPresenterLoaded;
+        UnwireListBox(cp);
+    }
+
+    private void OnDiscGroupPresenterLoaded(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not ContentPresenter cp) return;
+        cp.Loaded -= OnDiscGroupPresenterLoaded;
+        WireListBox(cp);
+    }
+
+    private void WireListBox(ContentPresenter cp)
+    {
+        var lb = cp.FindDescendantOfType<ListBox>();
+        if (lb == null) return;
+        lb.DoubleTapped += OnTrackDoubleTapped;
+        lb.ContainerPrepared += OnTrackContainerPrepared;
+        lb.ContainerClearing += OnTrackContainerClearing;
+
+        // Non-virtualizing StackPanel realizes all items before this Loaded handler
+        // runs, so ContainerPrepared has already fired for existing rows. Wire the
+        // ContextRequested handler on those existing containers so right-click works
+        // anywhere on the row (including ListBoxItem padding outside the inner Grid).
+        foreach (var container in lb.GetRealizedContainers())
+        {
+            if (container is ListBoxItem item)
+            {
+                item.ContextRequested -= OnTrackItemContextRequested;
+                item.ContextRequested += OnTrackItemContextRequested;
+            }
+        }
+    }
+
+    private void UnwireListBox(ContentPresenter cp)
+    {
+        var lb = cp.FindDescendantOfType<ListBox>();
+        if (lb == null) return;
+        lb.DoubleTapped -= OnTrackDoubleTapped;
+        lb.ContainerPrepared -= OnTrackContainerPrepared;
+        lb.ContainerClearing -= OnTrackContainerClearing;
+
+        foreach (var container in lb.GetRealizedContainers())
+        {
+            if (container is ListBoxItem item)
+                item.ContextRequested -= OnTrackItemContextRequested;
+        }
+    }
+
+    private void OnTrackContainerPrepared(object? sender, ContainerPreparedEventArgs e)
+    {
+        if (e.Container is ListBoxItem item)
+        {
+            item.ContextRequested += OnTrackItemContextRequested;
+            MultiSelectHelper.SyncContainerVisual(item, _selectedTracks);
+        }
+    }
+
+    private void OnTrackContainerClearing(object? sender, ContainerClearingEventArgs e)
+    {
+        if (e.Container is ListBoxItem item)
+        {
+            item.ContextRequested -= OnTrackItemContextRequested;
+            item.Classes.Remove("ctrl-selected");
+        }
+    }
+
+    private ContextMenu GetOrCreateTrackMenu()
+    {
+        var culture = Undertone.Localization.Loc.Instance.Culture.Name;
+        if (_menuBuilder != null && _menuCulture == culture) return _menuBuilder.Menu;
+        // A live language switch while this page is open: rebuild so the menu follows it.
+        if (_menuBuilder != null)
+        {
+            DetachMenuFromOwner();
+            _menuBuilder = null;
+        }
+
+        if (DataContext is not AlbumDetailViewModel) return new ContextMenu();
+
+        // v2 layout (10-09 redesign): header, quick tiles, grouped rows, Tools ▸.
+        _menuBuilder = new TrackContextMenuBuilder();
+        _menuCulture = culture;
+        return _menuBuilder.Build(Undertone.Localization.Loc.T("LibraryAlbums.RemoveFromLibrary"), null, this, v2: true, removeIsDanger: true);
+    }
+
+    private void BindTrackMenuToTrack(Track track)
+    {
+        GetOrCreateTrackMenu();
+        if (DataContext is not AlbumDetailViewModel vm || _menuBuilder == null) return;
+
+        _menuBuilder.Bind(
+            track,
+            playCommand: vm.PlayFromCommand,
+            shuffleCommand: vm.ShufflePlayCommand,
+            playNextCommand: vm.PlayNextCommand,
+            addToQueueCommand: vm.AddToQueueCommand,
+            addToPlaylistCommand: vm.AddToNewPlaylistCommand,
+            toggleFavoriteCommand: vm.ToggleFavoriteCommand,
+            openMetadataCommand: vm.OpenMetadataCommand,
+            searchLyricsCommand: vm.SearchLyricsCommand,
+            showInExplorerCommand: vm.ShowInExplorerCommand,
+            removeCommand: vm.RemoveFromLibraryCommand,
+            convertCommand: vm.ConvertTrackCommand,
+            scanReplayGainCommand: vm.ScanTrackReplayGainCommand,
+            startRadioCommand: vm.StartRadioCommand,
+            snoozeCommand: vm.SnoozeForMonthCommand,
+            rateCommand: vm.RateTrackCommand,
+            fetchLyricsCommand: vm.FetchLyricsCommand,
+            lyricsStudioCommand: vm.OpenLyricsStudioCommand,
+            removeLyricsCommand: vm.RemoveLyricsCommand,
+            sendToFolderCommand: vm.SendToFolderCommand,
+            // Featured artists: View Artist (a submenu when the song credits several).
+            viewArtistCommand: vm.ViewArtistFromTrackCommand);
+    }
+
+    /// <summary>Click on a row's stars rates that track (or the Ctrl-selection it is in). The
+    /// live selection is handed over first: the view model's copy is the one taken when a
+    /// menu last opened, and rating from it would hit rows no longer selected.</summary>
+    private void OnRowRated(object? sender, int stars)
+    {
+        if (sender is Undertone.Controls.RatingStars control && control.DataContext is Track track && DataContext is AlbumDetailViewModel vm)
+        {
+            vm.CtrlSelectedTracks = _selectedTracks.ToList();
+            _ = vm.RateAsync(track, stars);
+        }
+    }
+
+    private void DetachMenuFromOwner()
+    {
+        if (_menuOwnerItem != null)
+        {
+            _menuOwnerItem.ContextMenu = null;
+            _menuOwnerItem = null;
+        }
+        // Also detach from any button that previously owned the menu
+        if (_menuBuilder?.Menu?.Parent is Control parent)
+        {
+            parent.ContextMenu = null;
+        }
+    }
+
+    private void OnTrackItemContextRequested(object? sender, ContextRequestedEventArgs e)
+    {
+        if (e.Handled) return;
+        if (sender is not ListBoxItem item) return;
+        if (item.DataContext is not Track track) return;
+
+        if (DataContext is AlbumDetailViewModel vm)
+            vm.CtrlSelectedTracks = _selectedTracks.ToList();
+
+        BindTrackMenuToTrack(track);
+        var menu = GetOrCreateTrackMenu();
+        MenuOpenAnimation.CloseNow(menu);
+
+        DetachMenuFromOwner();
+        _menuOwnerItem = item;
+        item.ContextMenu = menu;
+        menu.Placement = PlacementMode.Pointer;
+        menu.Open(item);
+        e.Handled = true;
+    }
+
+    private void OnTrackOptionsButtonClick(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not Button btn) return;
+        if (btn.Tag is not Track track) return;
+        if (DataContext is AlbumDetailViewModel vm)
+            vm.CtrlSelectedTracks = _selectedTracks.ToList();
+
+        BindTrackMenuToTrack(track);
+        var menu = GetOrCreateTrackMenu();
+
+        if (menu.IsOpen) { menu.Close(); return; }
+
+        // Detach from previous owner and attach to the button so Open() doesn't
+        // throw "Cannot show ContextMenu on a different control".
+        DetachMenuFromOwner();
+        btn.ContextMenu = menu;
+        _menuOwnerItem = null;
+
+        menu.Placement = PlacementMode.BottomEdgeAlignedRight;
+        menu.Open(btn);
+        e.Handled = true;
+    }
+
+    // ── Related albums (Other Versions / More By): one shared v2 album menu ──
+    // Replaces the per-tile XAML ContextMenu: same Related* commands and parameters.
+
+    private AlbumContextMenuBuilder? _relatedMenuBuilder;
+    /// <summary>Culture the related-album menu's strings were read in (read once, at Build).</summary>
+    private string? _relatedMenuCulture;
+    private Control? _relatedMenuOwner;
+
+    private void OnRelatedAlbumContextRequested(object? sender, ContextRequestedEventArgs e)
+    {
+        if (sender is Button tile && OpenRelatedAlbumMenu(tile))
+            e.Handled = true;
+    }
+
+    private bool OpenRelatedAlbumMenu(Button tile)
+    {
+        if (tile.DataContext is not Album album) return false;
+        if (DataContext is not AlbumDetailViewModel vm) return false;
+
+        var culture = Undertone.Localization.Loc.Instance.Culture.Name;
+        if (_relatedMenuBuilder == null || _relatedMenuCulture != culture)
+        {
+            _relatedMenuCulture = culture;
+            _relatedMenuBuilder = new AlbumContextMenuBuilder();
+            _relatedMenuBuilder.Build(Undertone.Localization.Loc.T("LibraryAlbums.RemoveFromLibrary"), this, v2: true, removeIsDanger: true);
+        }
+
+        _relatedMenuBuilder.Bind(
+            album,
+            playCommand: vm.PlayRelatedAlbumCommand,
+            shuffleCommand: vm.ShuffleRelatedAlbumCommand,
+            playNextCommand: vm.PlayNextRelatedAlbumCommand,
+            addToQueueCommand: vm.AddRelatedAlbumToQueueCommand,
+            addToPlaylistCommand: vm.AddRelatedAlbumToNewPlaylistCommand,
+            toggleFavoritesCommand: vm.ToggleRelatedAlbumFavoritesCommand,
+            openMetadataCommand: vm.OpenRelatedAlbumMetadataCommand,
+            showInExplorerCommand: vm.ShowRelatedAlbumInExplorerCommand,
+            removeCommand: vm.RemoveRelatedAlbumFromLibraryCommand,
+            convertCommand: vm.ConvertRelatedAlbumCommand,
+            scanReplayGainCommand: vm.ScanRelatedAlbumReplayGainCommand,
+            snoozeCommand: vm.SnoozeRelatedAlbumForMonthCommand);
+
+        // Close any menu still open from a previous rapid right-click so menus
+        // don't stack on top of each other.
+        var menu = _relatedMenuBuilder.Menu;
+        ContextMenuCoordinator.NotifyOpening(menu);
+        MenuOpenAnimation.CloseNow(menu);
+        // Detach from the previous owner so Open() doesn't throw
+        // "Cannot show ContextMenu on a different control".
+        if (_relatedMenuOwner != null && !ReferenceEquals(_relatedMenuOwner, tile))
+            _relatedMenuOwner.ContextMenu = null;
+        if (menu.Parent is Control prev && !ReferenceEquals(prev, tile))
+            prev.ContextMenu = null;
+        _relatedMenuOwner = tile;
+        tile.ContextMenu = menu;
+        menu.Placement = PlacementMode.Pointer;
+        menu.Open(tile);
+        return true;
+    }
+
+    /// <summary>Tile hover dots: the same menu a right-click on the tile opens, bound afresh.</summary>
+    private void OnTileMoreClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        for (var c = sender as Control; c != null; c = c.Parent as Control)
+        {
+            if (c is Button tile && tile.Classes.Contains("album-tile"))
+            {
+                OpenRelatedAlbumMenu(tile);
+                break;
+            }
+        }
+        e.Handled = true;
+    }
+
+    private void OnAlbumFlyoutOpened(object? sender, EventArgs e) { }
+
+    private void OnOptionsFlyoutButtonPointerPressed(object? sender, PointerPressedEventArgs e)
+        => OnTrackRowPointerPressed(e);
+
+    private void OnTrackDoubleTapped(object? sender, TappedEventArgs e)
+    {
+        if (e.Source is Control source && source.FindAncestorOfType<Button>() != null)
+            return;
+        if (DataContext is not AlbumDetailViewModel vm) return;
+        if (sender is ListBox lb && lb.SelectedItem is Track track)
+        {
+            DebugLogger.Info(DebugLogger.Category.UI, "AlbumDetail.DoubleTapped", $"track={track.Title}");
+            vm.PlayFromCommand.Execute(track);
+        }
+    }
+
+    protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
+    {
+        CancelPendingScrollRestore();
+
+        // Unhook from _trackedVm (the VM the handler is actually subscribed to):
+        // after an in-place VM swap the subscription follows the DataContext via
+        // OnAlbumDataContextChanged, and _trackedVm is kept in step with it.
+        if (_bgHandler != null)
+        {
+            if (_trackedVm != null)
+                _trackedVm.PropertyChanged -= _bgHandler;
+            _bgHandler = null;
+        }
+
+        if (DataContext is AlbumDetailViewModel vm)
+        {
+            vm.SavedScrollOffset = TrackScrollViewer.Offset.Y;
+        }
+
+        // Reset multi-selection so it doesn't leak back when the view is revisited.
+        ClearTrackSelection();
+
+        base.OnDetachedFromVisualTree(e);
+    }
+
+    private void CancelPendingScrollRestore()
+    {
+        if (_pendingScrollRestore != null)
+        {
+            DiscGroupList.LayoutUpdated -= _pendingScrollRestore;
+            _pendingScrollRestore = null;
+            DiscGroupList.Opacity = 1;
+        }
+    }
+
+    /// <summary>
+    /// When Avalonia reuses this view across AlbumDetailViewModel swaps (e.g. clicking
+    /// an album in the Other Versions / More By Artist sections), neither
+    /// OnDetachedFromVisualTree nor OnAttachedToVisualTree fire — so the underlying
+    /// ScrollViewer keeps the previous album's physical scroll offset. Mirror the
+    /// save/restore logic here so a fresh navigation always starts at the top.
+    /// </summary>
+    private void OnAlbumDataContextChanged(object? sender, EventArgs e)
+    {
+        // Save the outgoing VM's scroll offset before the new VM takes over, so
+        // back-navigation still restores the previous album's position.
+        if (_trackedVm != null)
+            _trackedVm.SavedScrollOffset = TrackScrollViewer.Offset.Y;
+
+        // Drop any selection from the previous album so it doesn't carry over.
+        _selectedTracks.Clear();
+
+        // Reset the shared track menu so it rebinds to the new VM's commands.
+        DetachMenuFromOwner();
+        _menuBuilder = null;
+
+        CancelPendingScrollRestore();
+
+        // Re-wire the BackgroundBrush watcher too: on an in-place VM swap neither
+        // attach nor detach fires, so without this the handler would stay subscribed
+        // to the old VM (rooting this view for as long as that VM sits in history).
+        if (_trackedVm != null && _bgHandler != null)
+            _trackedVm.PropertyChanged -= _bgHandler;
+
+        var newVm = DataContext as AlbumDetailViewModel;
+        _trackedVm = newVm;
+        if (newVm == null) return;
+
+        if (_bgHandler != null)
+        {
+            newVm.PropertyChanged += _bgHandler;
+            AlbumTintBg.Opacity = newVm.BackgroundBrush != null ? 1 : 0;
+        }
+        UpdateAlbumBlockLayout();
+
+        if (newVm.SavedScrollOffset > 0)
+        {
+            DiscGroupList.Opacity = 0;
+            var targetOffset = newVm.SavedScrollOffset;
+            var attempts = 0;
+            _pendingScrollRestore = (s, args) =>
+            {
+                attempts++;
+                var sv = TrackScrollViewer;
+                if (sv.Extent.Height < targetOffset && attempts < 10) return;
+                var clampedOffset = Math.Min(targetOffset, Math.Max(0, sv.Extent.Height - sv.Viewport.Height));
+                sv.Offset = new Vector(0, clampedOffset);
+                DiscGroupList.Opacity = 1;
+                CancelPendingScrollRestore();
+            };
+            DiscGroupList.LayoutUpdated += _pendingScrollRestore;
+        }
+        else
+        {
+            TrackScrollViewer.Offset = new Vector(0, 0);
+        }
+    }
+
+    protected override void OnAttachedToVisualTree(VisualTreeAttachmentEventArgs e)
+    {
+        base.OnAttachedToVisualTree(e);
+
+        if (DataContext is AlbumDetailViewModel vm2)
+        {
+            if (vm2.BackgroundBrush != null)
+                AlbumTintBg.Opacity = 1;
+
+            _bgHandler = (_, args) =>
+            {
+                if (args.PropertyName == nameof(AlbumDetailViewModel.BackgroundBrush))
+                    AlbumTintBg.Opacity = ((AlbumDetailViewModel)DataContext!).BackgroundBrush != null ? 1 : 0;
+                if (args.PropertyName is nameof(AlbumDetailViewModel.HasTint)
+                    or nameof(AlbumDetailViewModel.TintWholePage)
+                    or nameof(AlbumDetailViewModel.HasOtherVersions)
+                    or nameof(AlbumDetailViewModel.HasMoreByArtist))
+                    UpdateAlbumBlockLayout();
+            };
+            vm2.PropertyChanged += _bgHandler;
+            UpdateAlbumBlockLayout();
+        }
+
+        // Scroll restore/reset is now driven by OnAlbumDataContextChanged so it also
+        // fires when the view is recycled across VM swaps. Only fall back here if that
+        // handler hasn't already processed the current DataContext.
+        if (!ReferenceEquals(_trackedVm, DataContext)
+            && DataContext is AlbumDetailViewModel vm && vm.SavedScrollOffset > 0)
+        {
+            DiscGroupList.Opacity = 0;
+            var targetOffset = vm.SavedScrollOffset;
+            var attempts = 0;
+
+            _pendingScrollRestore = (s, args) =>
+            {
+                attempts++;
+                var sv = TrackScrollViewer;
+
+                if (sv.Extent.Height < targetOffset && attempts < 10)
+                    return;
+
+                var clampedOffset = Math.Min(targetOffset, Math.Max(0, sv.Extent.Height - sv.Viewport.Height));
+                sv.Offset = new Vector(0, clampedOffset);
+                DiscGroupList.Opacity = 1;
+                CancelPendingScrollRestore();
+            };
+
+            DiscGroupList.LayoutUpdated += _pendingScrollRestore;
+            _trackedVm = vm;
+        }
+        else if (!ReferenceEquals(_trackedVm, DataContext))
+        {
+            // Fresh navigation: reset to top.
+            TrackScrollViewer.Offset = new Vector(0, 0);
+            _trackedVm = DataContext as AlbumDetailViewModel;
+        }
+    }
+}

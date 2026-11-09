@@ -1,0 +1,45 @@
+using System.Collections.ObjectModel;
+using CommunityToolkit.Mvvm.ComponentModel;
+
+namespace Undertone.Models;
+
+/// <summary>
+/// A node in the folder browse tree. Computed on demand from library tracks;
+/// not persisted. A node represents one directory under a configured music root.
+/// </summary>
+public sealed partial class FolderNode : ObservableObject
+{
+    /// <summary>Absolute path of this folder on disk.</summary>
+    public required string FullPath { get; init; }
+
+    /// <summary>Leaf display name (e.g. "Rock"). For a root, the full root path.</summary>
+    public required string DisplayName { get; init; }
+
+    /// <summary>True if this node is one of the user's configured music roots.</summary>
+    public bool IsRoot { get; init; }
+
+    /// <summary>Child subfolders, in natural (numeric-aware) name order.</summary>
+    public ObservableCollection<FolderNode> Children { get; } = new();
+
+    /// <summary>Tracks that live directly in this folder (not in subfolders),
+    /// sorted at build time by disc/track number then natural filename.</summary>
+    public List<Track> DirectTracks { get; } = new();
+
+    /// <summary>Total track count including all descendants (computed at build time).</summary>
+    public int TotalTrackCount { get; set; }
+
+    /// <summary>
+    /// Whether this node is expanded in the Folders tree. Lives on the model
+    /// (not the TreeViewItem container) so expansion survives view re-creation
+    /// when navigating away and back.
+    /// </summary>
+    [ObservableProperty] private bool _isExpanded;
+
+    /// <summary>This folder itself is in AppSettings.HiddenLibraryFolders — its menu offers
+    /// "Show in Library".</summary>
+    [ObservableProperty] private bool _isHiddenFromLibrary;
+
+    /// <summary>This folder or one of its parents is hidden: drawn dimmed, and its tracks are
+    /// left out of the track pane and the folder play commands.</summary>
+    [ObservableProperty] private bool _isInHiddenFolder;
+}

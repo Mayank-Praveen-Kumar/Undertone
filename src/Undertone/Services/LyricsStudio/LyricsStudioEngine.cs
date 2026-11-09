@@ -1,0 +1,312 @@
+using Undertone.Helpers;
+using Undertone.Models;
+
+namespace Undertone.Services.LyricsStudio;
+
+public enum LyricsStudioSource
+{
+    /// <summary>The track's own plain (or previously synced) lyrics were re-timed.</summary>
+    ExistingLyrics,
+    /// <summary>Plain lyrics came from LRCLIB and were timed against the audio.</summary>
+    Lrclib,
+    /// <summary>No lyrics anywhere: the speech model's transcript is the lyrics.</summary>
+    Transcription,
+    /// <summary>Not a model run: timed lyrics the track already had, loaded for review.</summary>
+    ExistingFile,
+    /// <summary>Lyrics the user pasted or imported in the Studio, timed against the audio.</summary>
+    PastedLyrics,
+    /// <summary>Not a run here: lrc.red's in-house model word-synced lrc.red's own lyrics of the song.</summary>
+    LrcRed,
+}
+
+/// <summary>
+/// No lyrics were found for the song (own, sidecar or online) and transcription was not
+/// allowed: the Studio asks the user to paste or import them instead of guessing by ear.
+/// </summary>
+public sealed class LyricsStudioNeedsLyricsException : Exception
+{
+    public LyricsStudioNeedsLyricsException() : base("No lyrics found — paste or import them.") { }
+}
+
+public sealed record LyricsStudioOptions(
+    WhisperModelSize Model,
+    string Language,
+    bool AllowOnlineLyrics = true,
+    bool ForceTranscription = false,
+    /// <summary>Text to time, when the caller already has it (re-sync / upgrade of loaded lyrics).</summary>
+    IReadOnlyList<string>? SourceLines = null,
+    /// <summary>Known start per source line (same count): words are then placed inside each line's own window.</summary>
+    IReadOnlyList<TimeSpan>? SourceLineStarts = null,
+    /// <summary>False: a song with no lyrics anywhere stops with <see cref="LyricsStudioNeedsLyricsException"/> instead of being transcribed.</summary>
+    bool AllowTranscription = true);
+
+/// <summary>A step of the run and how far into it (0–1); <see cref="Fraction"/> is the whole song's.</summary>
+public sealed record LyricsStudioProgress(LyricsStudioStage Stage, double StageFraction)
+{
+    public double Fraction => LyricsStudioStages.Overall(Stage, StageFraction);
+}
+
+public sealed record LyricsStudioResult(
+    Track Track,
+    IReadOnlyList<AlignedLine> Lines,
+    LyricsStudioSource Source,
+    double Confidence,
+    string Language,
+    int HeardWords,
+    /// <summary>What the model heard, word by word (null for results that did not run it, e.g. restored drafts).</summary>
+    IReadOnlyList<RecognizedWord>? Heard = null);
+
+public interface ILyricsStudioEngine
+{
+    bool HasFfmpeg { get; }
+    WhisperModelManager Models { get; }
+
+    /// <summary>Loads the model once; dispose after the run.</summary>
+    IDisposable OpenSession(WhisperModelSize model);
+
+    Task<LyricsStudioResult> ProcessAsync(Track track, LyricsStudioOptions options, IProgress<LyricsStudioProgress>? progress, CancellationToken ct);
+}
+
+/// <summary>
+/// One track through Lyrics Studio: pick the text (own lyrics → LRCLIB → none), listen with
+/// Whisper (lyrics as the prompt when known), then align words to lines or group the
+/// transcript into lines. Nothing is written — the caller reviews and saves.
+/// </summary>
+public sealed class LyricsStudioEngine : ILyricsStudioEngine
+{
+    private readonly IAudioConverterService _ffmpeg;
+    private readonly ILrcLibService _lrcLib;
+    private WhisperTranscriber.Session? _session;
+    /// <summary>Which file <see cref="_session"/> holds: path, length and write time (a re-download reloads).</summary>
+    private string? _sessionKey;
+    private int _sessionUsers;
+    private Timer? _idleRelease;
+    private readonly object _sessionGate = new();
+
+    /// <summary>
+    /// How long the speech model stays loaded after the last run ends, so the next Start skips
+    /// the load (seconds warm, up to 46 s from a cold disk, 09-29). Zero releases it at once.
+    /// </summary>
+    internal TimeSpan KeepModelLoaded { get; init; } = TimeSpan.FromMinutes(3);
+
+    public WhisperModelManager Models { get; }
+
+    public LyricsStudioEngine(IAudioConverterService ffmpeg, ILrcLibService lrcLib, IPersistenceService persistence)
+    {
+        _ffmpeg = ffmpeg;
+        _lrcLib = lrcLib;
+        Models = new WhisperModelManager(persistence.DataDirectory);
+        WhisperGpu.SetMarkerFolder(Models.Directory);
+    }
+
+    public bool HasFfmpeg => _ffmpeg.GetFfmpegPath() != null;
+
+    /// <summary>True while a loaded model is waiting for the next run (for tests and the session log).</summary>
+    internal bool HasLoadedModel { get { lock (_sessionGate) return _session is not null; } }
+
+    public IDisposable OpenSession(WhisperModelSize model)
+    {
+        var path = Models.PathFor(model);
+        if (!Models.IsInstalled(model))
+            throw new InvalidOperationException($"The {WhisperModelManager.Info(model).DisplayName} model is not installed.");
+        var key = SessionKey(path);
+        lock (_sessionGate)
+        {
+            _idleRelease?.Dispose();
+            _idleRelease = null;
+            // A model loaded by an earlier run is reused; a changed file (a fresh download) is
+            // loaded again, but never under a run that still holds the old one.
+            if (_session is not null && _sessionKey != key && _sessionUsers == 0)
+            {
+                _session.Dispose();
+                _session = null;
+            }
+            if (_session is null)
+            {
+                _session = new WhisperTranscriber.Session(path, WhisperModelManager.AlignmentHeads(model));
+                _sessionKey = key;
+            }
+            else DebugLogger.Info(DebugLogger.Category.Lyrics, "LyricsStudio.ModelReused", Path.GetFileName(path));
+            _sessionUsers++;
+            return new SessionHandle(this);
+        }
+    }
+
+    private static string SessionKey(string path)
+    {
+        var file = new FileInfo(path);
+        return $"{file.FullName}|{(file.Exists ? file.Length : -1)}|{(file.Exists ? file.LastWriteTimeUtc.Ticks : 0)}";
+    }
+
+    /// <summary>The last run let go of the model: keep it for <see cref="KeepModelLoaded"/>, then free it.</summary>
+    private void ReleaseSession()
+    {
+        lock (_sessionGate)
+        {
+            if (--_sessionUsers > 0 || _session is null) return;
+            if (KeepModelLoaded <= TimeSpan.Zero)
+            {
+                FreeIdleSession();
+                return;
+            }
+            Timer? timer = null;
+            timer = new Timer(_ =>
+            {
+                lock (_sessionGate)
+                {
+                    if (!ReferenceEquals(_idleRelease, timer)) return;
+                    FreeIdleSession();
+                }
+            });
+            _idleRelease = timer;
+            timer.Change(KeepModelLoaded, Timeout.InfiniteTimeSpan);
+        }
+    }
+
+    /// <summary>Frees the model when no run holds it. Call under <see cref="_sessionGate"/>.</summary>
+    private void FreeIdleSession()
+    {
+        if (_sessionUsers > 0) return;
+        _idleRelease?.Dispose();
+        _idleRelease = null;
+        _session?.Dispose();
+        _session = null;
+        _sessionKey = null;
+        DebugLogger.Info(DebugLogger.Category.Lyrics, "LyricsStudio.ModelReleased", "speech model freed after idle");
+    }
+
+    private sealed class SessionHandle : IDisposable
+    {
+        private LyricsStudioEngine? _owner;
+        public SessionHandle(LyricsStudioEngine owner) => _owner = owner;
+        public void Dispose() => Interlocked.Exchange(ref _owner, null)?.ReleaseSession();
+    }
+
+    public async Task<LyricsStudioResult> ProcessAsync(Track track, LyricsStudioOptions options, IProgress<LyricsStudioProgress>? progress, CancellationToken ct)
+    {
+        var ffmpeg = _ffmpeg.GetFfmpegPath() ?? throw new InvalidOperationException("ffmpeg is required to decode the song. Set its path under Settings → Advanced → Helper programs.");
+        if (string.IsNullOrWhiteSpace(track.FilePath) || !File.Exists(track.FilePath))
+            throw new FileNotFoundException("The audio file is missing.", track.FilePath);
+
+        WhisperTranscriber.Session session;
+        lock (_sessionGate)
+            session = _session ?? throw new InvalidOperationException("No model session — call OpenSession first.");
+
+        // 1. Source text.
+        progress?.Report(new LyricsStudioProgress(LyricsStudioStage.FindingLyrics, 0));
+        var (lines, source) = options.ForceTranscription
+            ? (null, LyricsStudioSource.Transcription)
+            : options.SourceLines is { Count: > 0 } given
+                ? (given.Select(l => (l ?? string.Empty).Trim()).ToList(), LyricsStudioSource.ExistingLyrics)
+                : await ResolveSourceLinesAsync(track, options.AllowOnlineLyrics, ct).ConfigureAwait(false);
+        // Keep starts and lines paired, then drop blank lines together.
+        List<TimeSpan>? lineStarts = null;
+        if (lines is not null && options.SourceLines is not null && options.SourceLineStarts is { } starts && starts.Count == lines.Count)
+        {
+            var kept = lines.Select((l, i) => (l, s: starts[i])).Where(x => x.l.Length > 0).ToList();
+            lines = kept.Select(x => x.l).ToList();
+            lineStarts = kept.Select(x => x.s).ToList();
+        }
+        else if (lines is not null)
+            lines = lines.Where(l => l.Length > 0).ToList();
+        // Checked before decoding: a song with nothing to time costs no model run.
+        if (!options.ForceTranscription && !options.AllowTranscription && lines is not { Count: > 0 })
+            throw new LyricsStudioNeedsLyricsException();
+
+        // 2. Decode.
+        progress?.Report(new LyricsStudioProgress(LyricsStudioStage.Decoding, 0));
+        var pcm = await PcmDecoder16k.DecodeAsync(ffmpeg, track.FilePath, ct,
+            new InlineProgress<double>(f => progress?.Report(new LyricsStudioProgress(LyricsStudioStage.Decoding, f))), track.Duration).ConfigureAwait(false);
+        if (pcm.Length < PcmDecoder16k.SampleRate)
+            throw new InvalidOperationException("The song is too short to analyse.");
+
+        // 3. Listen.
+        // Inline, not Progress<T>: with no UI context that posts each report to the thread pool,
+        // where they can land out of order and walk the bar backwards.
+        var listenProgress = new InlineProgress<double>(f => progress?.Report(new LyricsStudioProgress(LyricsStudioStage.Listening, f)));
+        var prompt = lines is { Count: > 0 } ? string.Join('\n', lines) : null;
+        var transcript = await session.TranscribeAsync(pcm, options.Language, prompt, listenProgress, ct).ConfigureAwait(false);
+
+        // 4. Align or group.
+        progress?.Report(new LyricsStudioProgress(LyricsStudioStage.Aligning, 0));
+        var duration = track.Duration > TimeSpan.Zero ? track.Duration : TimeSpan.FromSeconds(pcm.Length / (double)PcmDecoder16k.SampleRate);
+        IReadOnlyList<AlignedLine> aligned;
+        if (lines is { Count: > 0 })
+            aligned = lineStarts is not null
+                ? LyricsAligner.AlignWithinLines(lines, lineStarts, transcript.Words, duration)
+                : LyricsAligner.Align(lines, transcript.Words, duration);
+        else
+        {
+            aligned = TranscriptLines.Group(transcript.Words, totalDuration: duration, segmentStarts: transcript.SegmentStarts);
+            source = LyricsStudioSource.Transcription;
+        }
+
+        var confidence = aligned.Count == 0 ? 0 : aligned.Average(l => l.Confidence);
+        progress?.Report(new LyricsStudioProgress(LyricsStudioStage.Done, 1));
+        DebugLogger.Info(DebugLogger.Category.Lyrics, "LyricsStudio.Processed",
+            $"{track.Title}: source={source}, lines={aligned.Count}, heard={transcript.Words.Count}, confidence={confidence:0.00}, lang={transcript.Language}");
+        return new LyricsStudioResult(track, aligned, source, confidence, transcript.Language, transcript.Words.Count, transcript.Words);
+    }
+
+    private async Task<(List<string>? Lines, LyricsStudioSource Source)> ResolveSourceLinesAsync(Track track, bool allowOnline, CancellationToken ct)
+    {
+        // Sidecars first (.elrc, .lrc), then the stored/embedded text — same order the Studio shows.
+        var sidecar = ExistingLyricsLoader.Load(track);
+        if (sidecar is { Lines.Count: > 0 })
+            return (sidecar.Lines.Select(l => l.Text).ToList(), LyricsStudioSource.ExistingLyrics);
+        var own = FirstText(track.Lyrics, track.SyncedLyrics);
+        if (own is not null) return (own, LyricsStudioSource.ExistingLyrics);
+
+        if (allowOnline)
+        {
+            try
+            {
+                var result = await _lrcLib.GetLyricsAsync(track.Artist ?? string.Empty, track.Title ?? string.Empty, track.Duration.TotalSeconds, ct).ConfigureAwait(false);
+                var online = FirstText(result?.PlainLyrics, result?.SyncedLyrics);
+                if (online is not null) return (online, LyricsStudioSource.Lrclib);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                DebugLogger.Warn(DebugLogger.Category.Lyrics, "LyricsStudio.LrclibFailed", ex.Message);
+            }
+        }
+        return (null, LyricsStudioSource.Transcription);
+    }
+
+    /// <summary>
+    /// The lines of an imported lyrics file for the lyrics box: a TTML file's sung lines
+    /// (GitHub #132 — its markup, translations and timing are not lyrics to align; one that
+    /// will not parse gives its readable text), anything else through <see cref="FirstText"/>.
+    /// </summary>
+    internal static List<string>? ImportText(string text, string? fileName = null)
+    {
+        var isTtml = fileName?.EndsWith(".ttml", StringComparison.OrdinalIgnoreCase) == true || TtmlParser.LooksLikeTtml(text);
+        if (!isTtml) return FirstText(text);
+
+        var (lines, _) = TtmlParser.Parse(text);
+        var sung = lines?.Select(l => l.Text.Replace('\n', ' ').Trim()).Where(t => t.Length > 0).ToList()
+                   ?? LyricsLoader.RawTextLines(text);
+        return sung.Count > 0 ? sung : null;
+    }
+
+    /// <summary>Plain lines from the first non-empty text; timestamps are stripped so synced text can be re-timed.</summary>
+    internal static List<string>? FirstText(params string?[] candidates)
+    {
+        foreach (var c in candidates)
+        {
+            if (string.IsNullOrWhiteSpace(c)) continue;
+            var plain = LyricsTextHelper.ContainsTimestamps(c) ? LyricsTextHelper.StripTimestamps(c) : c;
+            var lines = plain.Split('\n')
+                .Select(l => l.Trim('\r', ' ', '\t'))
+                .Where(l => l.Length > 0 && !IsMetadataTag(l))
+                .ToList();
+            if (lines.Count > 0) return lines;
+        }
+        return null;
+    }
+
+    /// <summary>LRC header tags like [ar:], [ti:], [length:] are not lyrics.</summary>
+    private static bool IsMetadataTag(string line) =>
+        line.Length > 3 && line[0] == '[' && line.EndsWith(']') && line.IndexOf(':') is var i && i > 1 && line[1..i].All(char.IsLetter);
+}

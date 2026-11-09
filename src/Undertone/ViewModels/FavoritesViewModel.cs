@@ -1,0 +1,645 @@
+using System.Collections.ObjectModel;
+using System.Diagnostics;
+using System.Linq;
+using Avalonia.Threading;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using Undertone.Helpers;
+using Undertone.Models;
+using Undertone.Services;
+
+namespace Undertone.ViewModels;
+
+/// <summary>
+/// ViewModel for the Favorites tab — shows favorited tracks and fully-favorited albums.
+/// </summary>
+public partial class FavoritesViewModel : ViewModelBase, ISearchable, IDisposable
+{
+    private readonly PlayerViewModel _player;
+    private readonly ILibraryService _library;
+    private readonly IPersistenceService _persistence;
+    private readonly SidebarViewModel _sidebar;
+    private readonly SettingsViewModel _settings;
+
+    private bool _isDirty = true;
+    private string _currentFilter = string.Empty;
+    private List<FavoriteItem> _allFavoriteItems = new();
+
+    /// <summary>Saved scroll offset for restoring position after navigation.</summary>
+    public double SavedScrollOffset { get; set; }
+
+    [ObservableProperty] private double _tileArtworkSize = 180;
+    [ObservableProperty] private string _searchText = string.Empty;
+
+    /// <summary>Covers per row, sharing the Albums grid's cover-size setting
+    /// (see <see cref="Helpers.AlbumGridMetrics"/>).</summary>
+    [ObservableProperty] private int _gridColumns = Helpers.AlbumGridMetrics.ClassicColumns;
+
+    /// <summary>Last usable width reported by the view, so a settings change can
+    /// recompute columns without waiting for a resize.</summary>
+    private double _lastUsableWidth;
+
+    /// <summary>True when the library has no favorites at all (shows the onboarding hint).</summary>
+    [ObservableProperty] private bool _showNoFavorites;
+
+    /// <summary>True when favorites exist but the active search matched none of them.</summary>
+    [ObservableProperty] private bool _showNoResults;
+
+    /// <summary>FavoriteItems currently Ctrl-selected in the view. Set by code-behind.</summary>
+    public List<FavoriteItem> CtrlSelectedItems { get; set; } = new();
+
+    /// <summary>The Ctrl-selection when the acted-on item is part of it, else just that item.</summary>
+    private List<FavoriteItem> SelectionOr(FavoriteItem item) =>
+        CtrlSelectedItems.Contains(item) ? CtrlSelectedItems.ToList() : new List<FavoriteItem> { item };
+
+    /// <summary>Favorite items (albums where all tracks are favorited, plus individual tracks).</summary>
+    public BulkObservableCollection<FavoriteItem> FavoriteItems { get; } = new();
+
+    /// <summary>Favorite items grouped into rows for the virtualized grid.</summary>
+    public BulkObservableCollection<FavoriteItemRow> FavoriteItemRows { get; } = new();
+
+    /// <summary>Fires when the user wants to view an album from a track.</summary>
+    public event EventHandler<Track>? ViewAlbumRequested;
+
+    /// <summary>Fires when the user wants to open an album detail view.</summary>
+    public event EventHandler<Album>? AlbumOpened;
+
+    public FavoritesViewModel(PlayerViewModel player, ILibraryService library, IPersistenceService persistence, SidebarViewModel sidebar, SettingsViewModel settings)
+    {
+        _player = player;
+        _library = library;
+        _persistence = persistence;
+        _sidebar = sidebar;
+        _settings = settings;
+
+        // Cover-size setting shared with the Albums grid: recompute columns from the
+        // last known width. UpdateGridMetrics no-ops before the view has ever measured
+        // and handles its own dirty/active gating when the column count changes.
+        _settingsPropertyChangedHandler = (_, e) =>
+        {
+            if (e.PropertyName is nameof(SettingsViewModel.AlbumTileSizeAuto)
+                or nameof(SettingsViewModel.AlbumTileTargetSize))
+                Dispatcher.UIThread.Post(() => UpdateGridMetrics(_lastUsableWidth));
+        };
+        _settings.PropertyChanged += _settingsPropertyChangedHandler;
+
+        // Dispatch to UI thread since scan fires LibraryUpdated from a background thread.
+        // Held in fields so Dispose can detach them; anonymous lambdas with no stored
+        // reference can never be unsubscribed (this view-model had no Dispose at all).
+        // Only rebuild immediately while this view is current — the rebuild is a
+        // full-library favorites scan on the UI thread, and it used to run on every
+        // LibraryUpdated regardless of what page (or modal) was actually showing.
+        _libraryUpdatedHandler = (_, _) => { _isDirty = true; if (_isActive) Dispatcher.UIThread.Post(Refresh); };
+        _favoritesChangedHandler = (_, _) => { _isDirty = true; if (_isActive) Dispatcher.UIThread.Post(Refresh); };
+        _library.LibraryUpdated += _libraryUpdatedHandler;
+        _library.FavoritesChanged += _favoritesChangedHandler;
+    }
+
+    private EventHandler? _libraryUpdatedHandler;
+    private EventHandler? _favoritesChangedHandler;
+    private System.ComponentModel.PropertyChangedEventHandler? _settingsPropertyChangedHandler;
+
+    /// <summary>
+    /// Recomputes column count and tile size from the view's usable width and the
+    /// cover-size setting (mirrors <see cref="LibraryAlbumsViewModel.UpdateGridMetrics"/>).
+    /// Returns true when anything changed so the caller can preserve scroll.
+    /// </summary>
+    public bool UpdateGridMetrics(double usableWidth)
+    {
+        if (!double.IsFinite(usableWidth) || usableWidth <= 0)
+            return false;
+        _lastUsableWidth = usableWidth;
+
+        var columns = Helpers.AlbumGridMetrics.ComputeColumns(
+            usableWidth, _settings.AlbumTileSizeAuto, _settings.AlbumTileTargetSize);
+        var newSize = Helpers.AlbumGridMetrics.ComputeTileSize(usableWidth, columns);
+
+        var columnsChanged = columns != GridColumns;
+        if (!columnsChanged && Math.Abs(newSize - TileArtworkSize) < 0.5)
+            return false;
+
+        GridColumns = columns;
+        TileArtworkSize = newSize;
+        if (columnsChanged)
+        {
+            // Re-chunk rows now when visible; hidden views catch up via Refresh on activation.
+            _isDirty = true;
+            if (_isActive)
+                ApplyFilter(_currentFilter);
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Set by MainWindowViewModel when Favorites becomes (or stops being) the current
+    /// view. Mirrors the other library-view VMs: gates event-driven rebuilds while
+    /// hidden, and catches up on activation (no-op when nothing changed).
+    /// </summary>
+    public bool IsActive
+    {
+        get => _isActive;
+        set
+        {
+            if (_isActive == value) return;
+            _isActive = value;
+            // Covers back-navigation paths that swap CurrentView without a Refresh call.
+            if (value) Refresh();
+        }
+    }
+
+    private bool _isActive;
+
+    public void Dispose()
+    {
+        if (_libraryUpdatedHandler != null)
+        {
+            _library.LibraryUpdated -= _libraryUpdatedHandler;
+            _libraryUpdatedHandler = null;
+        }
+        if (_favoritesChangedHandler != null)
+        {
+            _library.FavoritesChanged -= _favoritesChangedHandler;
+            _favoritesChangedHandler = null;
+        }
+        if (_settingsPropertyChangedHandler != null)
+        {
+            _settings.PropertyChanged -= _settingsPropertyChangedHandler;
+            _settingsPropertyChangedHandler = null;
+        }
+    }
+
+    /// <summary>Forces the next Refresh() call to rebuild even if data hasn't changed.</summary>
+    public void MarkDirty() => _isDirty = true;
+
+    /// <summary>Refreshes the Favorites tab content with latest data.</summary>
+    public void Refresh()
+    {
+        if (!_isDirty && FavoriteItems.Count > 0)
+            return;
+        _isDirty = false;
+
+        // Sync rebuild: navigation sets CurrentView immediately after this
+        // returns, so the bound list must be current on first paint to avoid
+        // flashing previous content for a frame.
+        var favTracks = _library.Tracks
+            .Where(t => t.IsFavorite)
+            .ToList();
+
+        var items = new List<(FavoriteItem item, DateTime sortKey)>();
+
+        // Most recent favorite event for a track. Legacy favorites (null
+        // FavoritedAt) sink to the bottom so any freshly favorited track —
+        // stamped DateTime.UtcNow in Track.OnIsFavoriteChanged — always lands
+        // at the top of the grid.
+        static DateTime FavoriteSortKey(Track t) => t.FavoritedAt ?? DateTime.MinValue;
+
+        // Group favorite tracks by album
+        var grouped = favTracks.GroupBy(t => t.AlbumId);
+        foreach (var group in grouped)
+        {
+            var album = _library.GetAlbumById(group.Key);
+            if (album != null && album.Tracks.Count > 1 && album.IsAllTracksFavorite)
+            {
+                // All tracks in the album are favorites → show as one album card.
+                // Use the most recent track favorite as the album's sort key.
+                var key = album.Tracks.Max(FavoriteSortKey);
+                items.Add((new FavoriteItem { Album = album }, key));
+            }
+            else
+            {
+                // Individual tracks
+                foreach (var track in group)
+                    items.Add((new FavoriteItem { Track = track }, FavoriteSortKey(track)));
+            }
+        }
+
+        // Newest favorites first. OrderByDescending is a stable sort: items with
+        // equal timestamps (legacy favorites, album batch-favorites) keep their
+        // library order instead of reshuffling on every refresh like List.Sort did.
+        _allFavoriteItems = items
+            .OrderByDescending(x => x.sortKey)
+            .Select(x => x.item)
+            .ToList();
+        ApplyFilter(_currentFilter);
+    }
+
+    public void ApplyFilter(string query)
+    {
+        if (SearchText != query)
+            SearchText = query;
+
+        _currentFilter = query;
+        var filteredItems = _allFavoriteItems.AsEnumerable();
+
+        if (!string.IsNullOrWhiteSpace(query))
+        {
+            var q = query.Trim();
+            var parsed = Undertone.Helpers.SearchQuery.Parse(q);
+            // Album cards also match on their track titles — a fully-favorited
+            // album collapses into one card, but its tracks are still favorites.
+            // Tracks (and album tracks) also take the library search syntax (GitHub #107).
+            filteredItems = filteredItems.Where(item =>
+                (!parsed.HasFieldTerms &&
+                 (MatchesSearch(item.Title, q) ||
+                  MatchesSearch(item.Subtitle, q) ||
+                  (item.IsAlbum && item.Album!.Tracks.Any(t => MatchesSearch(t.Title, q))))) ||
+                (item.IsAlbum ? item.Album!.Tracks.Any(parsed.Matches) : parsed.Matches(item.Track!)));
+        }
+
+        var visibleItems = filteredItems.ToList();
+        FavoriteItems.ReplaceAll(visibleItems);
+        FavoriteItemRows.ReplaceAll(BuildRows(visibleItems));
+
+        ShowNoFavorites = _allFavoriteItems.Count == 0;
+        ShowNoResults = _allFavoriteItems.Count > 0 && visibleItems.Count == 0;
+    }
+
+    private List<FavoriteItemRow> BuildRows(IReadOnlyList<FavoriteItem> items)
+    {
+        var columns = GridColumns;
+        var rows = new List<FavoriteItemRow>();
+        for (var i = 0; i < items.Count; i += columns)
+        {
+            rows.Add(new FavoriteItemRow
+            {
+                Items = items.Skip(i).Take(columns).ToList()
+            });
+        }
+
+        return rows;
+    }
+
+    private static bool MatchesSearch(string? source, string query)
+        => !string.IsNullOrWhiteSpace(source) && Undertone.Helpers.SearchText.Matches(source, query);
+
+    // ── Page-level commands ────────────────────────────────────
+
+    [RelayCommand]
+    private void PlayAll()
+    {
+        var allTracks = GetAllFavoriteTracks();
+        if (allTracks.Count == 0) return;
+        _player.ReplaceQueueAndPlay(allTracks, 0);
+    }
+
+    [RelayCommand]
+    private void ShuffleAll()
+    {
+        var allTracks = GetAllFavoriteTracks();
+        if (allTracks.Count == 0) return;
+        _player.PlayShuffled(allTracks);
+    }
+
+    // ── Track commands ──────────────────────────────────────────
+
+    [RelayCommand]
+    private void PlayTrack(Track track)
+    {
+        // Build a flat list of all favorite tracks for queue
+        var allTracks = GetAllFavoriteTracks();
+        var idx = allTracks.FindIndex(t => t.Id == track.Id);
+        if (idx < 0) idx = 0;
+        _player.ReplaceQueueAndPlay(allTracks, idx);
+    }
+
+    [RelayCommand]
+    private void ShuffleTrack(Track track)
+    {
+        var allTracks = GetAllFavoriteTracks();
+        // Selected track first
+        _player.PlayShuffled(allTracks, first: track);
+    }
+
+    [RelayCommand]
+    private void PlayNextTrack(Track track) => _player.AddNext(track);
+
+    /// <summary>The album, or the Ctrl-selection its tile is in (owner 10-10, albums and songs
+    /// alike), in one snooze write.</summary>
+    [RelayCommand]
+    private Task SnoozeAlbumForMonth(Album album)
+    {
+        var clicked = CtrlSelectedItems.FirstOrDefault(i => i.IsAlbum && ReferenceEquals(i.Album, album));
+        var tracks = clicked != null ? ExpandToTracks(SelectionOr(clicked)) : album?.Tracks?.ToList() ?? new();
+        CtrlSelectedItems.Clear();
+        return _player.SnoozeTracksForMonthAsync(tracks);
+    }
+
+    [RelayCommand]
+    private void AddTrackToQueue(Track track) => _player.AddToQueue(track);
+
+    [RelayCommand]
+    private void ShowTrackInExplorer(Track track)
+    {
+        if (track == null || !File.Exists(track.FilePath)) return;
+        Helpers.PlatformHelper.ShowInFileManager(track.FilePath);
+    }
+
+    [RelayCommand]
+    private void ViewAlbumFromTrack(Track track)
+    {
+        ViewAlbumRequested?.Invoke(this, track);
+    }
+
+    [RelayCommand]
+    private async Task AddTrackToNewPlaylist(Track track)
+    {
+        if (track == null) return;
+        await _sidebar.CreatePlaylistWithTracksAsync(new List<Track> { track });
+    }
+
+    [RelayCommand]
+    private async Task OpenTrackMetadata(Track track)
+    {
+        if (track == null) return;
+        await MetadataHelper.OpenMetadataWindow(track);
+    }
+
+    [RelayCommand]
+    private async Task RemoveTrackFromLibrary(Track track)
+    {
+        if (track == null) return;
+        await Helpers.LibraryRemovalHelper.RemoveWithPromptAsync(_library, new List<Track> { track });
+    }
+
+    // ── Album commands ──────────────────────────────────────────
+
+    [RelayCommand]
+    private void PlayAlbum(Album album)
+    {
+        if (album?.Tracks == null || album.Tracks.Count == 0) return;
+        _player.ReplaceQueueAndPlay(album.Tracks, 0);
+    }
+
+    [RelayCommand]
+    private void ShuffleAlbum(Album album)
+    {
+        if (album?.Tracks == null || album.Tracks.Count == 0) return;
+        _player.PlayShuffled(album.Tracks);
+    }
+
+    [RelayCommand]
+    private void PlayNextAlbum(Album album)
+    {
+        if (album?.Tracks == null || album.Tracks.Count == 0) return;
+        _player.AddNextRange(album.Tracks.ToList(), album.Name);
+    }
+
+    [RelayCommand]
+    private void AddAlbumToQueue(Album album)
+    {
+        if (album?.Tracks == null || album.Tracks.Count == 0) return;
+        _player.AddRangeToQueue(album.Tracks.ToList(), album.Name);
+    }
+
+    [RelayCommand]
+    private async Task AddAlbumToNewPlaylist(Album album)
+    {
+        if (album?.Tracks == null || album.Tracks.Count == 0) return;
+        await _sidebar.CreatePlaylistWithTracksAsync(album.Tracks.ToList());
+    }
+
+    [RelayCommand]
+    private async Task OpenAlbumMetadata(Album album)
+    {
+        if (album?.Tracks == null || album.Tracks.Count == 0) return;
+        await MetadataHelper.OpenMetadataWindow(album.Tracks[0], albumScoped: true);
+    }
+
+    [RelayCommand]
+    private void OpenAlbum(Album album)
+    {
+        AlbumOpened?.Invoke(this, album);
+    }
+
+    [RelayCommand]
+    private void ShowAlbumInExplorer(Album album)
+    {
+        if (album?.Tracks == null || album.Tracks.Count == 0) return;
+        var filePath = album.Tracks[0].FilePath;
+        if (!File.Exists(filePath)) return;
+        Helpers.PlatformHelper.ShowInFileManager(filePath);
+    }
+
+    [RelayCommand]
+    private async Task RemoveAlbumFromLibrary(Album album)
+    {
+        if (album?.Tracks == null || album.Tracks.Count == 0) return;
+        await Helpers.LibraryRemovalHelper.RemoveWithPromptAsync(_library, album.Tracks.ToList());
+    }
+
+    // ── Unified FavoriteItem commands (used by context menu) ────
+
+    [RelayCommand]
+    private void PlayItem(FavoriteItem item)
+    {
+        if (item.IsAlbum) PlayAlbum(item.Album!);
+        else PlayTrack(item.Track!);
+    }
+
+    /// <summary>Tile hover button: Pause/resume when the item is the loaded one, else play it.</summary>
+    [RelayCommand]
+    private void TogglePlayItem(FavoriteItem item)
+    {
+        if (item == null) return;
+        if (item.IsAlbum)
+        {
+            var album = item.Album!;
+            if (album.IsCurrent) { _player.PlayPauseCommand.Execute(null); return; }
+            var ordered = Helpers.AlbumTile.OrderedTracks(album);
+            if (ordered.Count == 0) return;
+            _player.ReplaceQueueAndPlay(ordered, 0);
+            return;
+        }
+        if (item.Track!.IsNowPlaying) _player.PlayPauseCommand.Execute(null);
+        else PlayTrack(item.Track!);
+    }
+
+    [RelayCommand]
+    private void ShuffleItem(FavoriteItem item)
+    {
+        if (item.IsAlbum) ShuffleAlbum(item.Album!);
+        else ShuffleTrack(item.Track!);
+    }
+
+    [RelayCommand]
+    private void PlayNextItem(FavoriteItem item)
+    {
+        if (item.IsAlbum) PlayNextAlbum(item.Album!);
+        else PlayNextTrack(item.Track!);
+    }
+
+    [RelayCommand]
+    private void AddItemToQueue(FavoriteItem item)
+    {
+        if (item.IsAlbum) AddAlbumToQueue(item.Album!);
+        else AddTrackToQueue(item.Track!);
+    }
+
+    [RelayCommand]
+    private async Task AddItemToNewPlaylist(FavoriteItem item)
+    {
+        var items = SelectionOr(item);
+        var tracks = new List<Track>();
+        foreach (var fi in items)
+        {
+            if (fi.IsAlbum && fi.Album?.Tracks != null)
+                tracks.AddRange(fi.Album.Tracks);
+            else if (fi.Track != null)
+                tracks.Add(fi.Track);
+        }
+        if (tracks.Count > 0)
+            await _sidebar.CreatePlaylistWithTracksAsync(tracks);
+        CtrlSelectedItems.Clear();
+    }
+
+    [RelayCommand]
+    private async Task RemoveItemFavorite(FavoriteItem item)
+    {
+        var items = SelectionOr(item);
+        var changed = new List<Track>();
+        foreach (var fi in items)
+        {
+            if (fi.IsAlbum && fi.Album?.Tracks != null)
+            {
+                var newState = !fi.Album.IsAllTracksFavorite;
+                foreach (var track in fi.Album.Tracks)
+                {
+                    track.IsFavorite = newState;
+                    changed.Add(track);
+                }
+            }
+            else if (fi.Track != null)
+            {
+                fi.Track.IsFavorite = !fi.Track.IsFavorite;
+                changed.Add(fi.Track);
+            }
+        }
+        await _library.SaveTrackUserStateAsync(changed);
+        _library.NotifyFavoritesChanged(changed);
+        Refresh();
+        CtrlSelectedItems.Clear();
+    }
+
+    [RelayCommand]
+    private async Task OpenItemMetadata(FavoriteItem item)
+    {
+        // If the user multi-selected, expand to tracks and open the batch dialog.
+        var selection = SelectionOr(item);
+        if (selection.Count > 1)
+        {
+            CtrlSelectedItems.Clear();
+            var tracks = ExpandToTracks(selection);
+            if (tracks.Count > 1) { await MetadataHelper.OpenBatchMetadataWindow(tracks); return; }
+            if (tracks.Count == 1) { await MetadataHelper.OpenMetadataWindow(tracks[0]); return; }
+        }
+
+        if (item.IsAlbum) await OpenAlbumMetadata(item.Album!);
+        else await OpenTrackMetadata(item.Track!);
+    }
+
+    [RelayCommand]
+    private async Task ConvertItem(FavoriteItem item)
+    {
+        var items = SelectionOr(item);
+        CtrlSelectedItems.Clear();
+        var tracks = ExpandToTracks(items);
+        if (tracks.Count == 0) return;
+        await MetadataHelper.OpenAudioConverterDialog(tracks);
+    }
+
+    [RelayCommand]
+    private async Task ScanItemReplayGain(FavoriteItem item)
+    {
+        var items = SelectionOr(item);
+        CtrlSelectedItems.Clear();
+        var tracks = ExpandToTracks(items);
+        if (tracks.Count == 0) return;
+        await MetadataHelper.OpenReplayGainScannerDialog(tracks);
+    }
+
+    internal static List<Track> ExpandToTracks(IEnumerable<FavoriteItem> items)
+    {
+        var tracks = new List<Track>();
+        foreach (var fi in items)
+        {
+            if (fi.IsAlbum && fi.Album?.Tracks != null) tracks.AddRange(fi.Album.Tracks);
+            else if (fi.Track != null) tracks.Add(fi.Track);
+        }
+        return tracks;
+    }
+
+    [RelayCommand]
+    private void ViewItemAlbum(FavoriteItem item)
+    {
+        if (item.IsAlbum) OpenAlbum(item.Album!);
+        else ViewAlbumFromTrack(item.Track!);
+    }
+
+    [RelayCommand]
+    private void ShowItemInExplorer(FavoriteItem item)
+    {
+        if (item.IsAlbum) ShowAlbumInExplorer(item.Album!);
+        else ShowTrackInExplorer(item.Track!);
+    }
+
+    [RelayCommand]
+    private async Task RemoveItemFromLibrary(FavoriteItem item)
+    {
+        var items = SelectionOr(item);
+        var tracks = new List<Track>();
+        foreach (var fi in items)
+        {
+            if (fi.IsAlbum && fi.Album?.Tracks != null)
+                tracks.AddRange(fi.Album.Tracks);
+            else if (fi.Track != null)
+                tracks.Add(fi.Track);
+        }
+        if (!await Helpers.LibraryRemovalHelper.RemoveWithPromptAsync(_library, tracks))
+            return;
+        CtrlSelectedItems.Clear();
+    }
+
+    // ── Shared helpers ──────────────────────────────────────────
+
+    private Action<Track>? _searchLyricsAction;
+    public void SetSearchLyricsAction(Action<Track> action) => _searchLyricsAction = action;
+
+    /// <summary>Track menu: Lyrics ▸ Search Lyrics (as on Home and the Albums page).</summary>
+    [RelayCommand]
+    private void SearchLyricsTrack(Track track)
+    {
+        if (track != null) _searchLyricsAction?.Invoke(track);
+    }
+
+    /// <summary>Album menu: Search Lyrics for the album's first song (as on Home).</summary>
+    [RelayCommand]
+    private void SearchLyricsAlbum(Album album)
+    {
+        if (album?.Tracks == null || album.Tracks.Count == 0) return;
+        _searchLyricsAction?.Invoke(album.Tracks[0]);
+    }
+
+    private Action<string>? _viewArtistAction;
+    public void SetViewArtistAction(Action<string> action) => _viewArtistAction = action;
+
+    [RelayCommand]
+    private void ViewArtist(string artistName)
+    {
+        if (!string.IsNullOrWhiteSpace(artistName))
+            _viewArtistAction?.Invoke(artistName);
+    }
+
+    /// <summary>Flattens all favorite items into a single track list (expanding albums).</summary>
+    private List<Track> GetAllFavoriteTracks()
+    {
+        var tracks = new List<Track>();
+        foreach (var item in FavoriteItems)
+        {
+            if (item.IsAlbum)
+                tracks.AddRange(item.Album!.Tracks);
+            else
+                tracks.Add(item.Track!);
+        }
+        return tracks;
+    }
+}

@@ -1,0 +1,141 @@
+using System.IO;
+using Undertone.Services;
+using Undertone.Services.Loon;
+using Xunit;
+
+namespace Undertone.Tests;
+
+public class SecurityHardeningTests
+{
+    // ── Self-updater: download URLs are pinned to GitHub over HTTPS ──
+
+    [Theory]
+    [InlineData("https://api.github.com/repos/Mayank-Praveen-Kumar/Undertone/releases/assets/123", true)]
+    [InlineData("https://github.com/Mayank-Praveen-Kumar/Undertone/releases/download/v1/Setup.exe", true)]
+    [InlineData("https://objects.githubusercontent.com/abc", true)]
+    [InlineData("https://release-assets.githubusercontent.com/abc", true)]
+    [InlineData("http://api.github.com/x", false)]            // not HTTPS
+    [InlineData("https://evil.com/Setup.exe", false)]
+    [InlineData("https://api.github.com.evil.com/x", false)]  // suffix-spoof
+    [InlineData("https://notgithub.com/x", false)]
+    [InlineData("not a url", false)]
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public void IsTrustedGitHubUrl_pinsToGitHubHttps(string? url, bool expected)
+        => Assert.Equal(expected, UpdateService.IsTrustedGitHubUrl(url));
+
+    // ── Self-updater: SHA-256 manifest parsing ──
+
+    [Fact]
+    public void ParseSha256_findsMatchingEntry_acrossFormats()
+    {
+        const string expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        var manifest =
+            $"{new string('a', 64)}  Other-File.dmg\n" +   // double-space (text mode)
+            "# a comment line\n" +
+            $"{expected} *Undertone-v1.2.3-Setup.exe\n";       // ' *' binary marker
+
+        Assert.Equal(expected, UpdateService.ParseSha256FromChecksums(manifest, "Undertone-v1.2.3-Setup.exe"));
+        Assert.Equal(expected, UpdateService.ParseSha256FromChecksums(manifest, "undertone-v1.2.3-setup.exe")); // case-insensitive name
+    }
+
+    [Theory]
+    [InlineData("Missing.exe")]   // no line for this file
+    [InlineData("")]
+    [InlineData(null)]
+    public void ParseSha256_returnsNullWhenNoMatch(string? fileName)
+    {
+        var manifest = $"{new string('a', 64)}  Present.exe\n";
+        Assert.Null(UpdateService.ParseSha256FromChecksums(manifest, fileName));
+    }
+
+    [Fact]
+    public void ParseSha256_rejectsNonHexAndWrongLength()
+    {
+        Assert.Null(UpdateService.ParseSha256FromChecksums("zzzz  File.exe", "File.exe"));          // non-hex
+        Assert.Null(UpdateService.ParseSha256FromChecksums("abcd  File.exe", "File.exe"));          // too short
+        Assert.Null(UpdateService.ParseSha256FromChecksums(null, "File.exe"));
+    }
+
+    // ── Bounded network reads (LRCLIB / NetEase / Deezer / iTunes / Last.fm) ──
+
+    [Fact]
+    public async Task ReadStringBounded_returnsSmallBody()
+    {
+        using var content = new System.Net.Http.StringContent("{\"ok\":true}");
+        Assert.Equal("{\"ok\":true}", await HttpSafety.ReadStringBoundedAsync(content, maxBytes: 1024));
+    }
+
+    [Fact]
+    public async Task ReadStringBounded_throwsHttpRequestExceptionWhenOversize()
+    {
+        // HttpRequestException so existing "network failed" catch blocks absorb it.
+        using var content = new System.Net.Http.StringContent(new string('x', 2048));
+        await Assert.ThrowsAsync<System.Net.Http.HttpRequestException>(
+            () => HttpSafety.ReadStringBoundedAsync(content, maxBytes: 1024));
+    }
+
+    [Theory]
+    [InlineData(new byte[] { 0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0, 0, 0, 0, 0 }, true)]   // JPEG
+    [InlineData(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0 }, true)] // PNG
+    [InlineData(new byte[] { (byte)'<', (byte)'h', (byte)'t', (byte)'m', (byte)'l', (byte)'>', 0, 0, 0, 0, 0, 0 }, false)] // HTML error page
+    [InlineData(new byte[] { 0, 1, 2 }, false)] // too short
+    public void LooksLikeImage_acceptsRasterSignaturesOnly(byte[] data, bool expected)
+        => Assert.Equal(expected, HttpSafety.LooksLikeImage(data));
+
+    // ── Loon artwork relay: path-traversal containment ──
+
+    [Fact]
+    public void ResolveArtworkPath_allowsContainedFile()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "undertone-art-test");
+        var resolved = LoonClient.ResolveArtworkPath(root, "artwork/abc123.jpg");
+        Assert.NotNull(resolved);
+        Assert.EndsWith("abc123.jpg", resolved);
+    }
+
+    [Fact]
+    public void ResolveArtworkPath_acceptsTheCacheBustingVersionSegment()
+    {
+        // Minted paths are "artwork/{version}/{file}" so an edited cover produces a different
+        // URL instead of hiding behind Discord's cache. The version has no counterpart on
+        // disk — only the final segment names a file.
+        var root = Path.Combine(Path.GetTempPath(), "undertone-art-test");
+        var resolved = LoonClient.ResolveArtworkPath(root, "artwork/1f4a-8ddc0f1e2a3b4c5/abc123.jpg");
+        Assert.NotNull(resolved);
+        Assert.Equal(Path.Combine(Path.GetFullPath(root), "abc123.jpg"), resolved);
+    }
+
+    [Fact]
+    public void ResolveArtworkPath_acceptsPerTrackCoversInTheTracksFolder()
+    {
+        // Per-track covers live in "<artwork>/tracks/{trackId}.jpg" and are minted as
+        // "artwork/{version}/tracks/{file}".
+        var root = Path.Combine(Path.GetTempPath(), "undertone-art-test");
+        var resolved = LoonClient.ResolveArtworkPath(root, "artwork/1f4a-8ddc0f1e2a3b4c5/tracks/abc123.jpg");
+        Assert.Equal(Path.Combine(Path.GetFullPath(root), "tracks", "abc123.jpg"), resolved);
+    }
+
+    [Theory]
+    [InlineData("artwork/../../escape.txt")]
+    [InlineData("../escape.txt")]
+    [InlineData("artwork/../../../../../../etc/passwd")]
+    [InlineData("artwork/")]   // strips to empty
+    [InlineData("")]
+    // Dot segments stay refused now that a leading segment is stripped as the version.
+    [InlineData("artwork/../escape.txt")]
+    [InlineData("artwork/1f4a-8ddc/../../escape.txt")]
+    // Deeper than anything this client mints, and prefix-less paths it never mints either.
+    [InlineData("artwork/1f4a-8ddc/nested/abc123.jpg")]
+    [InlineData("abc123.jpg")]
+    // Only the one "tracks" folder, one level deep, and never a traversal through it.
+    [InlineData("artwork/1f4a-8ddc/tracks/nested/abc123.jpg")]
+    [InlineData("artwork/1f4a-8ddc/tracks/")]
+    [InlineData("artwork/1f4a-8ddc/tracks/../../escape.txt")]
+    [InlineData("artwork/1f4a-8ddc/other/abc123.jpg")]
+    public void ResolveArtworkPath_rejectsTraversalAndEmpty(string requestPath)
+    {
+        var root = Path.Combine(Path.GetTempPath(), "undertone-art-test");
+        Assert.Null(LoonClient.ResolveArtworkPath(root, requestPath));
+    }
+}

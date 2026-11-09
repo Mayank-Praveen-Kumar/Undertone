@@ -1,0 +1,311 @@
+using Undertone.Models;
+
+namespace Undertone.Services;
+
+public static class AutoMixTransitionPlanner
+{
+    private static readonly string[] ExcludedContentTerms =
+    {
+        "podcast", "audiobook", "audio book", "spoken", "speech", "interview",
+        "classical", "meditation", "mindfulness", "live set", "dj set", "concert"
+    };
+
+    public static bool ShouldAutoMix(Track current, Track next, AutoMixPlannerOptions options) =>
+        CreateTransitionPlan(current, next, options).IsEnabled;
+
+    public static AutoMixTransitionPlan CreateTransitionPlan(
+        Track current,
+        Track next,
+        AutoMixPlannerOptions options)
+    {
+        var currentSilence = EstimateSilenceProfile(current);
+        var nextSilence = EstimateSilenceProfile(next);
+
+        if (options.Mode == AutoMixTransitionMode.Off)
+            return AutoMixTransitionPlan.None("AutoMix skipped: transition mode is off", currentSilence, nextSilence);
+
+        if (options.ManualTransition)
+            return AutoMixTransitionPlan.None("AutoMix skipped: manual skip/previous", currentSilence, nextSilence);
+
+        if (options.RepeatMode == RepeatMode.One)
+            return AutoMixTransitionPlan.None("AutoMix skipped: repeat-one enabled", currentSilence, nextSilence);
+
+        if (IsContentTypeExcluded(current) || IsContentTypeExcluded(next))
+            return AutoMixTransitionPlan.None("AutoMix skipped: content type or genre excluded", currentSilence, nextSilence);
+
+        if (options.AvoidAutoMixForAlbums && !options.ShuffleEnabled && IsSequentialAlbumTrack(current, next))
+            return AutoMixTransitionPlan.None("AutoMix skipped: same album sequential track", currentSilence, nextSilence);
+
+        var currentSeconds = GetEffectiveDurationSeconds(current);
+        var nextSeconds = GetEffectiveDurationSeconds(next);
+        if (currentSeconds < 45 || nextSeconds < 45)
+            return AutoMixTransitionPlan.None("AutoMix skipped: track too short", currentSilence, nextSilence);
+
+        if (options.Mode == AutoMixTransitionMode.Crossfade)
+        {
+            // Plain crossfade honours the user's Settings > Audio duration.
+            var crossfadeSeconds = Math.Clamp(options.CrossfadeDurationSeconds, 1, 12);
+            return CreateCrossfadePlan(
+                current,
+                next,
+                options,
+                currentSilence,
+                nextSilence,
+                AutoMixTransitionType.SimpleCrossfade,
+                TimeSpan.FromSeconds(crossfadeSeconds),
+                $"AutoMix planned: SimpleCrossfade {crossfadeSeconds:0.#}s");
+        }
+
+        var missingBpm = current.Bpm <= 0 || next.Bpm <= 0;
+        var missingKey = AutoMixKeyTempo.NormalizeCamelotKey(current.MusicalKey) == null ||
+                         AutoMixKeyTempo.NormalizeCamelotKey(next.MusicalKey) == null;
+        var silenceTrim = options.RemoveSilenceBetweenSongs &&
+                          (currentSilence.EndSilence >= TimeSpan.FromSeconds(1.5) ||
+                           nextSilence.StartSilence >= TimeSpan.FromSeconds(1.5));
+
+        if (silenceTrim && missingBpm)
+        {
+            return CreateCrossfadePlan(
+                current,
+                next,
+                options,
+                currentSilence,
+                nextSilence,
+                AutoMixTransitionType.SilenceTrim,
+                TimeSpan.FromSeconds(0),
+                "AutoMix planned: SilenceTrim; missing BPM/key fallback",
+                missingBpm,
+                missingKey);
+        }
+
+        if (missingBpm)
+        {
+            return CreateCrossfadePlan(
+                current,
+                next,
+                options,
+                currentSilence,
+                nextSilence,
+                AutoMixTransitionType.SimpleCrossfade,
+                TimeSpan.FromSeconds(StrengthBaseSeconds(options.Strength) - 2),
+                "AutoMix fallback: missing BPM/key",
+                missingBpm,
+                missingKey);
+        }
+
+        var tempoCompatible = AutoMixKeyTempo.IsTempoCompatible(current.Bpm, next.Bpm);
+        var keyCompatible = !options.BeatMatchWhenMetadataAvailable ||
+                            missingKey ||
+                            AutoMixKeyTempo.AreKeysCompatible(current.MusicalKey, next.MusicalKey);
+
+        if (options.BeatMatchWhenMetadataAvailable && tempoCompatible && keyCompatible)
+        {
+            var duration = TimeSpan.FromSeconds(StrengthBaseSeconds(options.Strength) + (missingKey ? 0 : 2));
+            return CreateCrossfadePlan(
+                current,
+                next,
+                options,
+                currentSilence,
+                nextSilence,
+                AutoMixTransitionType.BeatMatchedCrossfade,
+                duration,
+                $"AutoMix planned: BeatMatchedCrossfade {duration.TotalSeconds:0}s",
+                false,
+                missingKey,
+                usedBpm: true,
+                usedKey: !missingKey);
+        }
+
+        if (tempoCompatible || keyCompatible)
+        {
+            var duration = TimeSpan.FromSeconds(StrengthBaseSeconds(options.Strength) - 1);
+            return CreateCrossfadePlan(
+                current,
+                next,
+                options,
+                currentSilence,
+                nextSilence,
+                AutoMixTransitionType.SimpleCrossfade,
+                duration,
+                $"AutoMix planned: SimpleCrossfade {duration.TotalSeconds:0}s",
+                false,
+                missingKey,
+                usedBpm: true,
+                usedKey: !missingKey);
+        }
+
+        if (silenceTrim)
+        {
+            return CreateCrossfadePlan(
+                current,
+                next,
+                options,
+                currentSilence,
+                nextSilence,
+                AutoMixTransitionType.SilenceTrim,
+                TimeSpan.Zero,
+                "AutoMix planned: SilenceTrim; tempo/key mismatch",
+                false,
+                missingKey,
+                usedBpm: true,
+                usedKey: !missingKey);
+        }
+
+        return CreateCrossfadePlan(
+            current,
+            next,
+            options,
+            currentSilence,
+            nextSilence,
+            AutoMixTransitionType.SafeFade,
+            TimeSpan.FromSeconds(2),
+            "AutoMix planned: SafeFade 2s",
+            false,
+            missingKey,
+            usedBpm: true,
+            usedKey: !missingKey);
+    }
+
+    public static bool IsSequentialAlbumTrack(Track current, Track next) =>
+        current.AlbumId != Guid.Empty &&
+        current.AlbumId == next.AlbumId &&
+        current.DiscNumber == next.DiscNumber &&
+        current.TrackNumber > 0 &&
+        next.TrackNumber == current.TrackNumber + 1;
+
+    public static bool IsContentTypeExcluded(Track track)
+    {
+        var values = new[]
+        {
+            track.MediaKind,
+            track.Genre,
+            track.Grouping,
+            track.WorkName,
+            track.Comment
+        };
+
+        return values.Any(value =>
+            !string.IsNullOrWhiteSpace(value) &&
+            ExcludedContentTerms.Any(term => value.Contains(term, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    public static TimeSpan ClampTransitionDuration(
+        TimeSpan requested, Track current, Track next, AutoMixStrength strength, double? maxSecondsOverride = null)
+    {
+        var maxByStrength = maxSecondsOverride ?? strength switch
+        {
+            AutoMixStrength.Subtle => 6,
+            AutoMixStrength.Extended => 12,
+            _ => 9
+        };
+
+        var currentLimit = Math.Max(1, GetEffectiveDurationSeconds(current) * 0.20);
+        var nextLimit = Math.Max(1, GetEffectiveDurationSeconds(next) * 0.20);
+        var safeMax = Math.Min(maxByStrength, Math.Min(currentLimit, nextLimit));
+        return TimeSpan.FromSeconds(Math.Clamp(requested.TotalSeconds, 1, safeMax));
+    }
+
+    public static AudioSilenceProfile EstimateSilenceProfile(Track track)
+    {
+        // StartTimeMs is a user-set trim point, not an estimate — it must not be capped.
+        // The 5s clamp made AutoMix start a track with a 20s trimmed intro at 5s, playing
+        // 15s of the intro the user removed, while the gapless path honoured it in full.
+        var start = track.StartTimeMs > 0
+            ? TimeSpan.FromMilliseconds(track.StartTimeMs)
+            : TimeSpan.Zero;
+
+        var end = TimeSpan.Zero;
+        if (track.StopTimeMs > 0 && track.Duration > TimeSpan.Zero)
+        {
+            var trailingMs = track.Duration.TotalMilliseconds - track.StopTimeMs;
+            if (trailingMs > 0)
+                end = TimeSpan.FromMilliseconds(Math.Min(trailingMs, 5000));
+        }
+
+        // TODO: Replace this metadata-only estimate with waveform/PCM analysis when
+        // Undertone has a background audio analysis cache. The planner treats this as
+        // advisory so playback remains safe without exact silence data.
+        return new AudioSilenceProfile(start, end, true);
+    }
+
+    private static AutoMixTransitionPlan CreateCrossfadePlan(
+        Track current,
+        Track next,
+        AutoMixPlannerOptions options,
+        AudioSilenceProfile currentSilence,
+        AudioSilenceProfile nextSilence,
+        AutoMixTransitionType type,
+        TimeSpan requestedDuration,
+        string reason,
+        bool missingBpm = false,
+        bool missingKey = false,
+        bool usedBpm = false,
+        bool usedKey = false)
+    {
+        var useSilenceTrim = options.RemoveSilenceBetweenSongs &&
+                             (currentSilence.EndSilence > TimeSpan.Zero ||
+                              nextSilence.StartSilence > TimeSpan.Zero);
+        var duration = type == AutoMixTransitionType.SilenceTrim
+            ? TimeSpan.Zero
+            : ClampTransitionDuration(
+                requestedDuration, current, next, options.Strength,
+                // Plain crossfade honours the full Settings range (1-12s) instead
+                // of the AutoMix strength cap; the 20%-of-track limit still applies.
+                options.Mode == AutoMixTransitionMode.Crossfade ? 12 : null);
+        // EndSilence is defined as the region *after* StopTimeMs, and GetTransitionEnd
+        // already returns StopTimeMs when one is set — so subtracting it there removed the
+        // same region twice and cut audio the user explicitly kept. (240s track with
+        // StopTimeMs=235s: EndSilence=5s and the transition anchored at 230s.)
+        var transitionEnd = current.StopTimeMs > 0
+            ? GetTransitionEnd(current)
+            : GetTransitionEnd(current) - currentSilence.EndSilence;
+        if (transitionEnd < TimeSpan.Zero)
+            transitionEnd = TimeSpan.Zero;
+
+        var fadeStart = transitionEnd - duration;
+        if (fadeStart < TimeSpan.Zero)
+            fadeStart = TimeSpan.Zero;
+
+        return new AutoMixTransitionPlan(
+            type,
+            duration,
+            fadeStart,
+            nextSilence.StartSilence,
+            type == AutoMixTransitionType.BeatMatchedCrossfade
+                ? AutoMixFadeCurve.EqualPower
+                : AutoMixFadeCurve.SmoothEase,
+            reason,
+            useSilenceTrim,
+            usedBpm,
+            usedKey,
+            missingBpm,
+            missingKey,
+            currentSilence,
+            nextSilence);
+    }
+
+    private static TimeSpan GetTransitionEnd(Track current)
+    {
+        if (current.StopTimeMs > 0)
+            return TimeSpan.FromMilliseconds(current.StopTimeMs);
+        return current.Duration;
+    }
+
+    private static int StrengthBaseSeconds(AutoMixStrength strength) => strength switch
+    {
+        AutoMixStrength.Subtle => 5,
+        AutoMixStrength.Extended => 10,
+        _ => 7
+    };
+
+    private static double GetEffectiveDurationSeconds(Track track)
+    {
+        var durationMs = track.Duration.TotalMilliseconds;
+        if (track.StopTimeMs > 0)
+            durationMs = Math.Min(durationMs, track.StopTimeMs);
+        if (track.StartTimeMs > 0 && track.StartTimeMs < durationMs)
+            durationMs -= track.StartTimeMs;
+        return Math.Max(0, durationMs / 1000d);
+    }
+
+}

@@ -1,0 +1,26 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:loc="using:Undertone.Localization"
+        xmlns:vm="using:Undertone.ViewModels"
+        xmlns:views="using:Undertone.Views"
+        xmlns:controls="using:Undertone.Controls"
+        x:Class="Undertone.Views.LyricsStudioDialog"
+        x:DataType="vm:LyricsStudioViewModel"
+        Title="{loc:T LyricsStudio.Title}"
+        CanResize="False"
+        WindowDecorations="None"
+        TransparencyLevelHint="Transparent"
+        Background="Transparent"
+        ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner">
+
+    <!-- Per-song Lyrics Studio (right-click → Lyrics Studio). The surface itself lives in
+         LyricsStudioPanel, shared with the sidebar's Lyrics Studio page. Owner 10-08: the
+         rounded pill pop-up — PillDialogHost draws the blurred, dimmed app behind and the card,
+         and plays the shared open/close animation for every close (the round X, Esc, Alt+F4). -->
+    <controls:PillDialogHost>
+        <Grid Width="1000" Height="720">
+            <views:LyricsStudioPanel />
+        </Grid>
+    </controls:PillDialogHost>
+</Window>

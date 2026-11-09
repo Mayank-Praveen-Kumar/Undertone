@@ -1,0 +1,433 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Undertone.Mobile.ViewModels"
+             xmlns:views="using:Undertone.Mobile.Views"
+             xmlns:models="using:Undertone.Models"
+             xmlns:controls="using:Undertone.Controls"
+             x:Class="Undertone.Mobile.Views.ArtistPage"
+             x:DataType="vm:ArtistPageViewModel"
+             Background="{Binding Tint.Background}"
+             Classes.tinted="{Binding Tint.HasTint}"
+             Classes.light="{Binding Tint.IsLight}">
+
+    <!-- Apple Music's artist page (iOS 26): the photo full-bleed under the status bar, fading
+         into its own bottom colour, with the big name and three round buttons over its lower
+         part; then the card carousel, Top Songs as a sideways-paged grid, and the rails. The
+         album page's machinery (HeroChrome): text follows the theme until the photo's colour
+         lands, then the tint's WCAG text colours, kept as page resources (ArtistText,
+         ArtistSubtleText, ArtistWash, ArtistRule); the code-behind adds the two shades of the
+         page colour (ArtistButtonFill for the round buttons, ArtistCardFill for the cards).
+         Rows are Buttons, whose presenter takes the Button's Foreground, hence the Button setters. -->
+    <UserControl.Styles>
+        <Style Selector="views|ArtistPage">
+            <Setter Property="Foreground" Value="{DynamicResource PrimaryTextBrush}" />
+        </Style>
+        <Style Selector="views|ArtistPage.tinted">
+            <Setter Property="Foreground" Value="{DynamicResource ArtistText}" />
+        </Style>
+        <Style Selector="views|ArtistPage Button.row, views|ArtistPage Button.icon, views|ArtistPage Button.round">
+            <Setter Property="Foreground" Value="{DynamicResource PrimaryTextBrush}" />
+        </Style>
+        <Style Selector="views|ArtistPage.tinted Button.row, views|ArtistPage.tinted Button.icon, views|ArtistPage.tinted Button.round, views|ArtistPage.tinted Button.glass-round">
+            <Setter Property="Foreground" Value="{DynamicResource ArtistText}" />
+        </Style>
+        <Style Selector="views|ArtistPage TextBlock.artist-subtle">
+            <Setter Property="Foreground" Value="{DynamicResource SecondaryTextBrush}" />
+        </Style>
+        <Style Selector="views|ArtistPage.tinted TextBlock.artist-subtle">
+            <Setter Property="Foreground" Value="{DynamicResource ArtistSubtleText}" />
+        </Style>
+        <Style Selector="views|ArtistPage Border.rule">
+            <Setter Property="Background" Value="#22808080" />
+        </Style>
+        <Style Selector="views|ArtistPage.tinted Border.rule">
+            <Setter Property="Background" Value="{DynamicResource ArtistRule}" />
+        </Style>
+
+        <!-- Fluent repaints the presenter on :pointerover/:pressed (see MobileStyles.axaml);
+             glass-round keeps its look here as on the album page. -->
+        <Style Selector="views|ArtistPage Button.glass-round:pointerover /template/ ContentPresenter#PART_ContentPresenter, views|ArtistPage Button.glass-round:pressed /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="{Binding $parent[Button].Background}" />
+            <Setter Property="Foreground" Value="{Binding $parent[Button].Foreground}" />
+        </Style>
+
+        <!-- ⤨ ▶ ☆: Apple's circles (iOS 26 reference, 2026-10-20: ~47 pt either side of a ~70 pt
+             Play), the small ones filled with a shade of the page colour. -->
+        <Style Selector="views|ArtistPage Button.artist-round">
+            <Setter Property="Width" Value="48" />
+            <Setter Property="Height" Value="48" />
+            <Setter Property="CornerRadius" Value="24" />
+        </Style>
+        <Style Selector="views|ArtistPage Button.artist-round PathIcon">
+            <Setter Property="Width" Value="22" />
+            <Setter Property="Height" Value="22" />
+        </Style>
+        <Style Selector="views|ArtistPage.tinted Button.artist-round">
+            <Setter Property="Background" Value="{DynamicResource ArtistButtonFill}" />
+        </Style>
+        <!-- Play: Apple's big filled circle, white with a dark glyph on a deep page; the colours
+             come from the code-behind (ArtistPlayFill / ArtistPlayGlyph: the page's text colour,
+             or the logo's own accent when it has one). -->
+        <Style Selector="views|ArtistPage Button.artist-round.artist-play">
+            <Setter Property="Width" Value="66" />
+            <Setter Property="Height" Value="66" />
+            <Setter Property="CornerRadius" Value="33" />
+            <Setter Property="Background" Value="{DynamicResource ArtistPlayFill}" />
+            <Setter Property="Foreground" Value="{DynamicResource ArtistPlayGlyph}" />
+        </Style>
+        <Style Selector="views|ArtistPage Button.artist-round.artist-play PathIcon">
+            <Setter Property="Width" Value="30" />
+            <Setter Property="Height" Value="30" />
+        </Style>
+        <Style Selector="views|ArtistPage Button.artist-play:pointerover /template/ ContentPresenter#PART_ContentPresenter, views|ArtistPage Button.artist-play:pressed /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="{Binding $parent[Button].Background}" />
+            <Setter Property="Foreground" Value="{Binding $parent[Button].Foreground}" />
+        </Style>
+
+        <!-- Carousel cards: a lighter shade of the page colour, Apple's 16 pt corners. -->
+        <Style Selector="views|ArtistPage Border.artist-card">
+            <Setter Property="Background" Value="{DynamicResource HomeCardBackground}" />
+            <Setter Property="CornerRadius" Value="16" />
+            <Setter Property="Padding" Value="10" />
+        </Style>
+        <Style Selector="views|ArtistPage.tinted Border.artist-card">
+            <Setter Property="Background" Value="{DynamicResource ArtistCardFill}" />
+        </Style>
+        <!-- The card's small round ▶, where Apple has its download arrow. -->
+        <Style Selector="views|ArtistPage Button.card-play">
+            <Setter Property="Width" Value="34" />
+            <Setter Property="Height" Value="34" />
+            <Setter Property="CornerRadius" Value="17" />
+        </Style>
+        <Style Selector="views|ArtistPage Button.card-play PathIcon">
+            <Setter Property="Width" Value="18" />
+            <Setter Property="Height" Value="18" />
+        </Style>
+        <Style Selector="views|ArtistPage.tinted Button.card-play">
+            <Setter Property="Background" Value="{DynamicResource ArtistWash}" />
+        </Style>
+
+        <!-- "Top Songs ›": the section title with Apple's small chevron. -->
+        <Style Selector="views|ArtistPage Button.artist-section">
+            <Setter Property="HorizontalAlignment" Value="Left" />
+            <Setter Property="Margin" Value="18,0,0,0" />
+            <Setter Property="Padding" Value="2,4" />
+        </Style>
+        <Style Selector="views|ArtistPage Button.artist-section TextBlock">
+            <Setter Property="FontSize" Value="21" />
+            <Setter Property="FontWeight" Value="Bold" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+        </Style>
+        <Style Selector="views|ArtistPage Button.artist-section PathIcon">
+            <Setter Property="Width" Value="22" />
+            <Setter Property="Height" Value="22" />
+            <Setter Property="Margin" Value="0,1,0,0" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="Opacity" Value="0.6" />
+        </Style>
+
+        <!-- The playing song's bars, white over its darkened cover (Apple's). -->
+        <Style Selector="views|ArtistPage views|PlayingBars">
+            <Setter Property="Fill" Value="White" />
+        </Style>
+    </UserControl.Styles>
+
+    <UserControl.Resources>
+        <!-- A rail tile: Apple's rounded cover, the name (with the explicit badge) and the year
+             (or, on Appears On, the album's artist). -->
+        <DataTemplate x:Key="ArtistRailTile" x:DataType="vm:ArtistRelease">
+            <Button Classes="row" Width="150" Margin="0,0,12,0" VerticalAlignment="Top"
+                    Command="{Binding $parent[views:ArtistPage].((vm:ArtistPageViewModel)DataContext).Shell.OpenAlbumCommand}"
+                    CommandParameter="{Binding Album}"
+                    views:LongPress.Command="{Binding $parent[views:ShellView].((vm:ShellViewModel)DataContext).OpenAlbumSheetCommand}"
+                    views:LongPress.CommandParameter="{Binding Album}">
+                <StackPanel>
+                    <Border Classes="art" Width="150" Height="150" CornerRadius="10">
+                        <Panel>
+                            <PathIcon Data="{DynamicResource AlbumsIcon}" Width="40" Height="40" Opacity="0.4" />
+                            <controls:CachedImage SourcePath="{Binding Album.ArtworkPath}" DecodeWidth="384" Stretch="UniformToFill" />
+                        </Panel>
+                    </Border>
+                    <Grid ColumnDefinitions="*,Auto" HorizontalAlignment="Left" Margin="0,6,0,0">
+                        <TextBlock Text="{Binding Album.Name}" FontSize="14" FontWeight="Medium" MaxLines="1"
+                                   TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                        <Border Grid.Column="1" Classes="explicit-badge compact" Margin="5,0,0,0" IsVisible="{Binding Album.IsExplicit}">
+                            <TextBlock Text="E" Classes="explicit-badge-text compact" FontSize="8" Opacity="0.9" />
+                        </Border>
+                    </Grid>
+                    <TextBlock Classes="artist-subtle" Text="{Binding Subtitle}" FontSize="13" MaxLines="1" TextTrimming="CharacterEllipsis" />
+                </StackPanel>
+            </Button>
+        </DataTemplate>
+    </UserControl.Resources>
+
+    <!-- The page reaches up under the status bar (HeroChrome: a negative top margin of the
+         shell's SafeArea.Top), so the photo is full-bleed; the buttons and fades float over. -->
+    <Panel>
+        <ScrollViewer Classes="page-scroll" Name="ArtistScroll" views:ScrollMemory.IsEnabled="True" HorizontalScrollBarVisibility="Disabled">
+            <!-- The body carries the page's ramp below the photo (HeroChrome, as the album page). -->
+            <StackPanel Name="PageBody" Margin="0,0,0,24">
+                <!-- Square (the code-behind sizes it from the width, as the album cover); the
+                     bottom fades into the page colour. -->
+                <Panel Name="Hero" Height="412" ClipToBounds="True" Background="{DynamicResource HomeCardBackground}">
+                    <PathIcon Name="HeroPlaceholder" Data="{DynamicResource ArtistsIcon}" Width="96" Height="96" Opacity="0.35"
+                              IsVisible="{Binding !HasHero}" />
+                    <controls:CachedImage Name="HeroImage" SourcePath="{Binding HeroArtworkPath}" DecodeWidth="1024"
+                                          ClearOnSourceChange="False" Stretch="UniformToFill" />
+                    <Border Name="HeroFade" VerticalAlignment="Bottom" IsHitTestVisible="False" />
+                </Panel>
+
+                <!-- The name (or the artist's own logo, Apple Music's artist logos) and the buttons
+                     over the photo's faded lower part (the margin pulls them up by their own
+                     height, the row's bottom margin is the gap to the photo's end; see
+                     ArtistPage.axaml.cs, which also sizes the logo and gives it a halo when its
+                     ink would not read on the page). The logo decodes by width bucket, not
+                     PixelExact, whose decode width assumes square art (a 4:1 logo came out at a
+                     quarter of its width, pixelated, on the emulator 2026-10-20). -->
+                <StackPanel Name="TitleBlock" Margin="20,-121,20,0">
+                    <Panel Name="TitleArt">
+                        <TextBlock Name="ArtistName" Text="{Binding Name}" FontSize="34" FontWeight="Bold" LineHeight="41"
+                                   TextAlignment="Center" TextWrapping="Wrap" MaxLines="2" TextTrimming="CharacterEllipsis"
+                                   IsVisible="{Binding !HasLogo}" />
+                        <controls:CachedImage Name="ArtistLogo" SourcePath="{Binding LogoPath}" DecodeWidth="1024"
+                                              Stretch="Uniform" HorizontalAlignment="Center" VerticalAlignment="Bottom"
+                                              IsVisible="{Binding HasLogo}" AutomationProperties.Name="{Binding Name}" />
+                    </Panel>
+                    <!-- Apple's row: two small circles in a shade of the page colour either side of a
+                         bigger Play in the page's text colour, or in the logo's own colour when it
+                         has one (Doja Cat's blue). The star sits right, where Apple has it. -->
+                    <StackPanel Name="ButtonRow" Orientation="Horizontal" HorizontalAlignment="Center" Spacing="26" Margin="0,16,0,12">
+                        <Button Name="ShuffleButton" Classes="round artist-round" Command="{Binding ShuffleCommand}" VerticalAlignment="Center"
+                                AutomationProperties.Name="Shuffle">
+                            <PathIcon Data="{DynamicResource PhShuffle}" />
+                        </Button>
+                        <Button Name="PlayButton" Classes="round artist-round artist-play" Command="{Binding PlayCommand}" VerticalAlignment="Center"
+                                AutomationProperties.Name="Play">
+                            <!-- The desktop's play triangle sits 1.43 of its 24 right of the box's middle
+                                 (its ink runs 5 to 21.86): moved back so the ink is dead centre (owner
+                                 10-20: "center middle of the button"). Same for the stars' ink below. -->
+                            <PathIcon Name="PlayGlyph" Data="{DynamicResource PhPlayFill}" RenderTransform="translate(-1.79px, 0px)" />
+                        </Button>
+                        <Button Name="FavouriteButton" Classes="round artist-round" Command="{Binding ToggleFavouriteCommand}" VerticalAlignment="Center"
+                                AutomationProperties.Name="Favourite">
+                            <Panel>
+                                <PathIcon Name="StarOutline" Data="{DynamicResource PhStar}" IsVisible="{Binding !IsFavourite}"
+                                          RenderTransform="translate(0px, 0.24px)" />
+                                <PathIcon Name="StarFilled" Data="{DynamicResource PhStarFill}" IsVisible="{Binding IsFavourite}"
+                                          RenderTransform="translate(0px, 0.46px)" />
+                            </Panel>
+                        </Button>
+                    </StackPanel>
+                </StackPanel>
+
+                <!-- The carousel: one card a page, the next one peeking (card width from the
+                     code-behind), snapping to each card's left edge. -->
+                <ScrollViewer Name="CardScroll" Margin="0,12,0,0" HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Disabled"
+                              HorizontalSnapPointsType="MandatorySingle" HorizontalSnapPointsAlignment="Near"
+                              IsVisible="{Binding HasCards}">
+                    <ItemsControl Name="CardList" ItemsSource="{Binding Cards}" Margin="16,0,16,0">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <StackPanel Orientation="Horizontal" Spacing="{x:Static views:ArtistPage.CardGap}" />
+                            </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="vm:ArtistCard">
+                                <Button Classes="row" Width="{Binding $parent[views:ArtistPage].CardWidth}"
+                                        Command="{Binding $parent[views:ArtistPage].((vm:ArtistPageViewModel)DataContext).OpenCardCommand}"
+                                        CommandParameter="{Binding}"
+                                        views:LongPress.Command="{Binding $parent[views:ShellView].((vm:ShellViewModel)DataContext).OpenAlbumSheetCommand}"
+                                        views:LongPress.CommandParameter="{Binding Album}">
+                                    <Border Classes="artist-card">
+                                        <Grid ColumnDefinitions="Auto,*,Auto">
+                                            <Border Classes="art" Width="62" Height="62" CornerRadius="8">
+                                                <Panel>
+                                                    <PathIcon Data="{DynamicResource AlbumsIcon}" Width="24" Height="24" Opacity="0.4" />
+                                                    <controls:CachedImage SourcePath="{Binding Album.ArtworkPath}" DecodeWidth="192" Stretch="UniformToFill" />
+                                                </Panel>
+                                            </Border>
+                                            <StackPanel Grid.Column="1" Margin="12,0,8,0" VerticalAlignment="Center" Spacing="1">
+                                                <TextBlock Name="CardKicker" Classes="artist-subtle" Text="{Binding Kicker}" FontSize="11" FontWeight="SemiBold"
+                                                           MaxLines="1" TextTrimming="CharacterEllipsis" />
+                                                <Grid ColumnDefinitions="*,Auto" HorizontalAlignment="Left">
+                                                    <TextBlock Name="CardTitle" Text="{Binding Album.Name}" FontSize="16" FontWeight="SemiBold" MaxLines="1"
+                                                               TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                                                    <Border Grid.Column="1" Name="CardExplicit" Classes="explicit-badge compact" Margin="6,0,0,0"
+                                                            IsVisible="{Binding IsExplicit}">
+                                                        <TextBlock Text="E" Classes="explicit-badge-text compact" FontSize="8" Opacity="0.9" />
+                                                    </Border>
+                                                </Grid>
+                                                <TextBlock Name="CardSongs" Classes="artist-subtle" Text="{Binding SongsText}" FontSize="13" />
+                                            </StackPanel>
+                                            <Button Grid.Column="2" Name="CardPlay" Classes="round card-play" VerticalAlignment="Center"
+                                                    Command="{Binding $parent[views:ArtistPage].((vm:ArtistPageViewModel)DataContext).PlayCardCommand}"
+                                                    CommandParameter="{Binding}">
+                                                <PathIcon Name="CardPlayGlyph" Data="{DynamicResource PhPlayFill}" RenderTransform="translate(-1.07px, 0px)" />
+                                            </Button>
+                                        </Grid>
+                                    </Border>
+                                </Button>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </ScrollViewer>
+
+                <!-- Top Songs: columns of four rows, paged sideways with the next column peeking.
+                     Virtualised sideways like the rails below: all five columns (20 rows, each a
+                     cover, two buttons and the bars) used to be realised as the page opened, and
+                     they were the largest part of its first layout; now the column on screen and
+                     the one peeking in. VirtualizingStackPanel has no Spacing, so each column
+                     carries the gap as a right margin. -->
+                <StackPanel Name="TopSongsSection" Margin="0,22,0,0" IsVisible="{Binding HasTopSongs}">
+                    <Button Name="TopSongsHeader" Classes="row artist-section" Command="{Binding OpenAllSongsCommand}">
+                        <StackPanel Orientation="Horizontal" Spacing="2">
+                            <TextBlock Text="Top Songs" />
+                            <PathIcon Data="{DynamicResource PhChevronRight}" />
+                        </StackPanel>
+                    </Button>
+                    <ScrollViewer Name="TopSongScroll" Margin="0,4,0,0" HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Disabled"
+                                  HorizontalSnapPointsType="MandatorySingle" HorizontalSnapPointsAlignment="Near">
+                        <ItemsControl Name="TopSongPages" ItemsSource="{Binding TopSongPages}" Margin="16,0,16,0">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <VirtualizingStackPanel Orientation="Horizontal" />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:DataType="vm:ArtistTopSongPage">
+                                    <ItemsControl ItemsSource="{Binding Rows}" Width="{Binding $parent[views:ArtistPage].TopSongPageWidth}"
+                                                  Margin="{x:Static views:ArtistPage.ColumnMargin}" VerticalAlignment="Top">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate x:DataType="vm:ArtistTopSong">
+                                                <Button Classes="row"
+                                                        Command="{Binding $parent[views:ArtistPage].((vm:ArtistPageViewModel)DataContext).PlayTopSongCommand}"
+                                                        CommandParameter="{Binding}"
+                                                        views:LongPress.Command="{Binding $parent[views:ShellView].((vm:ShellViewModel)DataContext).OpenTrackSheetCommand}"
+                                                        views:LongPress.CommandParameter="{Binding Track}">
+                                                    <Grid ColumnDefinitions="Auto,*,Auto" Height="62">
+                                                        <Border Classes="art" Width="48" Height="48" CornerRadius="6">
+                                                            <Panel>
+                                                                <PathIcon Data="{DynamicResource SongsIcon}" Width="18" Height="18" Opacity="0.5" />
+                                                                <controls:CachedImage SourcePath="{Binding Track.AlbumArtworkPath}" DecodeWidth="144" Stretch="UniformToFill" />
+                                                                <!-- The playing song: Apple's bars over the darkened cover. -->
+                                                                <!-- The bars at 1.6x: the row indicator's size is for a 30 dp number column. -->
+                                                                <Border Name="PlayingScrim" Background="#80000000" IsVisible="{Binding IsCurrent}">
+                                                                    <views:PlayingBars Name="EqBars" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                                                       RenderTransform="scale(1.6)"
+                                                                                       IsPlaying="{Binding IsAnimating}" IsVisible="{Binding IsCurrent}" />
+                                                                </Border>
+                                                            </Panel>
+                                                        </Border>
+                                                        <StackPanel Grid.Column="1" Margin="12,0,4,0" VerticalAlignment="Center">
+                                                            <Grid ColumnDefinitions="*,Auto" HorizontalAlignment="Left">
+                                                                <TextBlock Name="TopSongTitle" Text="{Binding Track.Title}" FontSize="16" MaxLines="1"
+                                                                           TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                                                                <Border Grid.Column="1" Classes="explicit-badge compact" Margin="6,0,0,0"
+                                                                        IsVisible="{Binding Track.IsExplicit}">
+                                                                    <TextBlock Text="E" Classes="explicit-badge-text compact" FontSize="8" Opacity="0.9" />
+                                                                </Border>
+                                                            </Grid>
+                                                            <TextBlock Classes="artist-subtle" Text="{Binding Subtitle}" FontSize="13" MaxLines="1"
+                                                                       TextTrimming="CharacterEllipsis" Margin="0,1,0,0" />
+                                                        </StackPanel>
+                                                        <Button Grid.Column="2" Classes="icon" Width="40" Height="40"
+                                                                Command="{Binding $parent[views:ShellView].((vm:ShellViewModel)DataContext).OpenTrackSheetCommand}"
+                                                                CommandParameter="{Binding Track}">
+                                                            <PathIcon Data="{DynamicResource PhMore}" />
+                                                        </Button>
+                                                        <Border Grid.Column="1" Grid.ColumnSpan="2" Classes="rule" Height="0.5" Margin="12,0,0,0"
+                                                                VerticalAlignment="Bottom" IsHitTestVisible="False" IsVisible="{Binding ShowsRule}" />
+                                                    </Grid>
+                                                </Button>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </ScrollViewer>
+                </StackPanel>
+
+                <!-- Albums, Singles & EPs, Appears On: Apple's rails of covers with the year under
+                     the name; › opens the whole set as a grid. Virtualised sideways (a prolific
+                     artist would otherwise realise every tile at page open); VirtualizingStackPanel
+                     has no Spacing, so each tile carries the gap as a right margin. -->
+                <StackPanel Name="AlbumsSection" Margin="0,22,0,0" IsVisible="{Binding HasAlbums}">
+                    <Button Name="AlbumsHeader" Classes="row artist-section" Command="{Binding OpenAlbumsCommand}">
+                        <StackPanel Orientation="Horizontal" Spacing="2">
+                            <TextBlock Text="Albums" />
+                            <PathIcon Data="{DynamicResource PhChevronRight}" />
+                        </StackPanel>
+                    </Button>
+                    <ScrollViewer Margin="0,6,0,0" HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Disabled">
+                        <ItemsControl Name="AlbumRail" ItemsSource="{Binding Albums}" Margin="20,0,8,0" ItemTemplate="{StaticResource ArtistRailTile}">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <VirtualizingStackPanel Orientation="Horizontal" />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                        </ItemsControl>
+                    </ScrollViewer>
+                </StackPanel>
+
+                <StackPanel Name="SinglesSection" Margin="0,18,0,0" IsVisible="{Binding HasSingles}">
+                    <Button Name="SinglesHeader" Classes="row artist-section" Command="{Binding OpenSinglesCommand}">
+                        <StackPanel Orientation="Horizontal" Spacing="2">
+                            <TextBlock Text="Singles &amp; EPs" />
+                            <PathIcon Data="{DynamicResource PhChevronRight}" />
+                        </StackPanel>
+                    </Button>
+                    <ScrollViewer Margin="0,6,0,0" HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Disabled">
+                        <ItemsControl Name="SingleRail" ItemsSource="{Binding Singles}" Margin="20,0,8,0" ItemTemplate="{StaticResource ArtistRailTile}">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <VirtualizingStackPanel Orientation="Horizontal" />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                        </ItemsControl>
+                    </ScrollViewer>
+                </StackPanel>
+
+                <StackPanel Name="AppearsOnSection" Margin="0,18,0,0" IsVisible="{Binding HasAppearsOn}">
+                    <Button Name="AppearsOnHeader" Classes="row artist-section" Command="{Binding OpenAppearsOnCommand}">
+                        <StackPanel Orientation="Horizontal" Spacing="2">
+                            <TextBlock Text="Appears On" />
+                            <PathIcon Data="{DynamicResource PhChevronRight}" />
+                        </StackPanel>
+                    </Button>
+                    <ScrollViewer Margin="0,6,0,0" HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Disabled">
+                        <ItemsControl Name="AppearsOnRail" ItemsSource="{Binding AppearsOn}" Margin="20,0,8,0" ItemTemplate="{StaticResource ArtistRailTile}">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <VirtualizingStackPanel Orientation="Horizontal" />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                        </ItemsControl>
+                    </ScrollViewer>
+                </StackPanel>
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- Apple's soft top and the scrolled scrim, as on the album page (HeroChrome). -->
+        <Border Name="TopFade" VerticalAlignment="Top" IsHitTestVisible="False" />
+        <Border Name="TopScrim" VerticalAlignment="Top" Opacity="0" IsHitTestVisible="False" />
+
+        <!-- Round Liquid Glass buttons over the photo: back and the artist's sheet, with the
+             artist's name between them once the big name has gone under them. -->
+        <Grid Name="TopBar" VerticalAlignment="Top" ColumnDefinitions="Auto,*,Auto" Margin="16,6,16,0">
+            <controls:GlassPanel Classes="header-glass">
+                <Button Name="BackButton" Classes="glass-round" Command="{Binding Shell.NavigateBackCommand}">
+                    <PathIcon Data="{DynamicResource PhBack}" />
+                </Button>
+            </controls:GlassPanel>
+            <TextBlock Grid.Column="1" Name="SmallTitle" Text="{Binding Name}" FontSize="17" FontWeight="SemiBold"
+                       TextAlignment="Center" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="12,0"
+                       MaxLines="1" TextTrimming="CharacterEllipsis" Opacity="0" IsHitTestVisible="False" />
+            <controls:GlassPanel Grid.Column="2" Classes="header-glass">
+                <Button Name="MoreButton" Classes="glass-round" Command="{Binding MoreCommand}">
+                    <PathIcon Data="{DynamicResource PhMore}" />
+                </Button>
+            </controls:GlassPanel>
+        </Grid>
+    </Panel>
+</UserControl>

@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Reference plugin. `dotnet build -c Release` also writes bin/Release/Undertone.SamplePlugin-<version>.zip
+    (the DLL + plugin.json): install it from Settings → Plugins → "Install from file…".
+    Only the plugin DLL goes in the package: Undertone.Plugins.Abstractions and Avalonia come
+    from the app itself. See docs/PLUGINS.md.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Undertone.SamplePlugin</RootNamespace>
+    <Version>1.0.0</Version>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Undertone.Plugins.Abstractions\Undertone.Plugins.Abstractions.csproj">
+      <Private>false</Private>
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </ProjectReference>
+  </ItemGroup>
+  <Import Project="..\PluginPackage.targets" />
+</Project>

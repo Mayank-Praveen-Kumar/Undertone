@@ -1,0 +1,88 @@
+using System;
+using System.Diagnostics;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Media;
+using Undertone.Controls;
+
+namespace Undertone.Helpers;
+
+/// <summary>
+/// Turns any visual like a disc: the same coasting <see cref="SpinClock"/> the Now
+/// Playing costumes use (spin-up when play starts, coast to a stop on pause), driven
+/// from the host TopLevel's frame clock and applied as a centre rotation. Used for the
+/// Pill mini player design, whose round cover has no CD hub to justify a MediaArtwork.
+/// </summary>
+public sealed class CoverSpinner
+{
+    private readonly Control _host;
+    private readonly Visual _target;
+    private readonly RotateTransform _rotate = new();
+    private readonly SpinClock _clock = new();
+    private long _lastTimestamp;
+    private bool _frameQueued;
+    private bool _stopped;
+
+    public CoverSpinner(Control host, Visual target)
+    {
+        _host = host;
+        _target = target;
+        _target.RenderTransformOrigin = RelativePoint.Center;
+        _target.RenderTransform = _rotate;
+    }
+
+    /// <summary>Drive (true) or let the disc coast to a stop (false).</summary>
+    public bool IsSpinning
+    {
+        get => _clock.IsRunning;
+        set
+        {
+            if (_clock.IsRunning == value) return;
+            _clock.IsRunning = value;
+            QueueFrame();
+        }
+    }
+
+    /// <summary>Current angle in degrees (tests/diagnostics).</summary>
+    public double Angle => _clock.Angle;
+
+    /// <summary>
+    /// Ends the loop for good (host window closed). The frame request goes to the app-wide
+    /// frame clock, not the window, so a spinner left running would keep firing every frame
+    /// and rooting its closed window.
+    /// </summary>
+    public void Stop()
+    {
+        _stopped = true;
+        _clock.IsRunning = false;
+    }
+
+    private void QueueFrame()
+    {
+        if (_stopped || _frameQueued || _clock.IsSettled) return;
+        if (TopLevel.GetTopLevel(_host) is not { } topLevel) return;
+        _lastTimestamp = Stopwatch.GetTimestamp();
+        _frameQueued = true;
+        topLevel.RequestAnimationFrame(OnFrame);
+    }
+
+    private void OnFrame(TimeSpan _)
+    {
+        _frameQueued = false;
+        if (_stopped) return;
+        var now = Stopwatch.GetTimestamp();
+        // Clamped so a long stall (hidden window, sleep) doesn't whip the cover round.
+        var elapsed = Math.Min((now - _lastTimestamp) / (double)Stopwatch.Frequency, 0.1);
+        _lastTimestamp = now;
+
+        _clock.Advance(elapsed);
+        _rotate.Angle = _clock.Angle;
+
+        if (_clock.IsSettled) return;
+        if (TopLevel.GetTopLevel(_host) is { } topLevel)
+        {
+            _frameQueued = true;
+            topLevel.RequestAnimationFrame(OnFrame);
+        }
+    }
+}

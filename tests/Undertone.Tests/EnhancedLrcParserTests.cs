@@ -1,0 +1,557 @@
+using Undertone.Services;
+using Xunit;
+
+namespace Undertone.Tests;
+
+public class EnhancedLrcParserTests
+{
+    [Fact]
+    public void ParseLine_PlainBody_ReturnsTextAndNoWords()
+    {
+        var (text, words) = EnhancedLrcParser.ParseLine("Hello world");
+
+        Assert.Equal("Hello world", text);
+        Assert.Null(words);
+    }
+
+    [Fact]
+    public void ParseLine_WordTags_StripsTagsFromDisplayText()
+    {
+        var (text, words) = EnhancedLrcParser.ParseLine("<00:05.41>Hello <00:05.90>world<00:06.40>");
+
+        Assert.Equal("Hello world", text);
+        Assert.NotNull(words);
+        Assert.Equal(2, words!.Count);
+    }
+
+    [Fact]
+    public void ParseLine_WordTags_AssignsStartAndEndTimes()
+    {
+        var (_, words) = EnhancedLrcParser.ParseLine("<00:05.41>Hello <00:05.90>world<00:06.40>");
+
+        Assert.Equal(TimeSpan.FromMilliseconds(5_410), words![0].Start);
+        Assert.Equal(TimeSpan.FromMilliseconds(5_900), words[0].End);
+        Assert.Equal("Hello ", words[0].Text);
+
+        Assert.Equal(TimeSpan.FromMilliseconds(5_900), words[1].Start);
+        // Trailing tag with no following text marks the end of the last word.
+        Assert.Equal(TimeSpan.FromMilliseconds(6_400), words[1].End);
+        Assert.Equal("world", words[1].Text);
+    }
+
+    [Fact]
+    public void ParseLine_CjkPerCharacterTiming_Parses()
+    {
+        var (text, words) = EnhancedLrcParser.ParseLine(
+            "<00:05.416>夢<00:06.256>を<00:06.406>語<00:06.716>っ<00:07.126>て<00:07.826>");
+
+        Assert.Equal("夢を語って", text);
+        Assert.Equal(5, words!.Count);
+        Assert.Equal(TimeSpan.FromMilliseconds(5_416), words[0].Start);
+        Assert.Equal(TimeSpan.FromMilliseconds(7_826), words[^1].End);
+    }
+
+    [Fact]
+    public void ParseLine_EmptyBody_ReturnsEmpty()
+    {
+        var (text, words) = EnhancedLrcParser.ParseLine("");
+
+        Assert.Equal("", text);
+        Assert.Null(words);
+    }
+
+    [Fact]
+    public void ParseLine_FinalWordWithoutTrailingTag_HasNullEnd()
+    {
+        var (_, words) = EnhancedLrcParser.ParseLine("<00:01.00>one <00:02.00>two");
+
+        Assert.Equal(2, words!.Count);
+        Assert.Equal(TimeSpan.FromMilliseconds(2_000), words[0].End);
+        Assert.Null(words[1].End);
+    }
+
+    [Fact]
+    public void ParseLine_SyllableTags_MergeIntoWholeWords()
+    {
+        // "tal" + "king " are syllable tags of one word; they must merge into a
+        // single cell or the karaoke WrapPanel can line-break mid-word.
+        var (text, words) = EnhancedLrcParser.ParseLine(
+            "<00:01.00>tal<00:01.40>king <00:02.00>false<00:02.80>");
+
+        Assert.Equal("talking false", text);
+        Assert.Equal(2, words!.Count);
+        Assert.Equal("talking ", words[0].Text);
+        Assert.Equal(TimeSpan.FromMilliseconds(1_000), words[0].Start);
+        Assert.Equal(TimeSpan.FromMilliseconds(2_000), words[0].End);
+        Assert.Equal("false", words[1].Text);
+    }
+
+    [Fact]
+    public void ParseLine_LeadingSpaceTokens_ShiftSpaceToPreviousWord()
+    {
+        // "<t>word<t> word" files put the space at the START of each token; the sweep
+        // overlay only trims trailing space, so a leading space makes the edge cross
+        // invisible whitespace at the start of every word — a per-word stall.
+        var (text, words) = EnhancedLrcParser.ParseLine("<00:01.00>Hello<00:02.00> world<00:03.00>");
+
+        Assert.Equal("Hello world", text);
+        Assert.Equal(2, words!.Count);
+        Assert.Equal("Hello ", words[0].Text);
+        Assert.Equal("world", words[1].Text);
+        Assert.Equal(TimeSpan.FromMilliseconds(2_000), words[1].Start);
+        Assert.Equal(TimeSpan.FromMilliseconds(3_000), words[1].End);
+    }
+
+    [Fact]
+    public void ParseLine_WhitespaceOnlyToken_DroppedWithoutLosingGap()
+    {
+        var (_, words) = EnhancedLrcParser.ParseLine("<00:01.00>one<00:01.50> <00:02.00>two<00:02.50>");
+
+        Assert.Equal(2, words!.Count);
+        Assert.Equal("one ", words[0].Text);
+        // The gap 1.5s→2.0s stays a real pause: "one" still ends at its own tag.
+        Assert.Equal(TimeSpan.FromMilliseconds(1_500), words[0].End);
+        Assert.Equal("two", words[1].Text);
+        Assert.Equal(TimeSpan.FromMilliseconds(2_000), words[1].Start);
+    }
+
+    [Fact]
+    public void ParseLine_LeadingSpaceOnFirstToken_Trimmed()
+    {
+        var (text, words) = EnhancedLrcParser.ParseLine("<00:01.00> Hello <00:02.00>world<00:03.00>");
+
+        Assert.Equal("Hello world", text);
+        Assert.Equal("Hello ", words![0].Text);
+    }
+
+    [Fact]
+    public void ParseLine_LeadingSpaceSyllables_StillMergeIntoWholeWords()
+    {
+        // Leading-space shift must not break syllable merging.
+        var (_, words) = EnhancedLrcParser.ParseLine("<00:01.00>tal<00:01.40>king<00:02.00> false<00:02.80>");
+
+        Assert.Equal(2, words!.Count);
+        Assert.Equal("talking ", words[0].Text);
+        Assert.Equal(TimeSpan.FromMilliseconds(1_000), words[0].Start);
+        Assert.Equal(TimeSpan.FromMilliseconds(2_000), words[0].End);
+        Assert.Equal("false", words[1].Text);
+    }
+
+    [Fact]
+    public void ParseLine_MoreWordsThanCap_FallsBackToPlainText()
+    {
+        // One hostile line carrying thousands of word tags would realize a cell per
+        // word; past the cap the line keeps its text but drops word timing.
+        var body = string.Concat(Enumerable.Range(0, EnhancedLrcParser.MaxWordsPerLine + 1)
+            .Select(i => $"<00:01.00>w{i} "));
+
+        var (text, words) = EnhancedLrcParser.ParseLine(body);
+
+        Assert.Null(words);
+        Assert.StartsWith("w0 w1 ", text);
+        Assert.EndsWith($"w{EnhancedLrcParser.MaxWordsPerLine}", text);
+    }
+
+    [Fact]
+    public void ParseLine_WordsAtCap_KeepsWordTiming()
+    {
+        var body = string.Concat(Enumerable.Range(0, EnhancedLrcParser.MaxWordsPerLine)
+            .Select(i => $"<00:01.00>w{i} ")) + "<00:02.00>";
+
+        var (_, words) = EnhancedLrcParser.ParseLine(body);
+
+        Assert.Equal(EnhancedLrcParser.MaxWordsPerLine, words!.Count);
+        Assert.Equal(TimeSpan.FromSeconds(2), words[^1].End);
+    }
+
+    [Fact]
+    public void MergeSyllables_LongJoinableRun_MergesInLinearTime()
+    {
+        // TTML/Lyricsfile word lists are not capped: a run of 200k one-letter joinable
+        // syllables used to be re-concatenated per syllable (~2e10 char copies).
+        const int count = 200_000;
+        var words = Enumerable.Range(0, count).Select(i => new Undertone.Models.WordTiming
+        {
+            Text = "a",
+            Start = TimeSpan.FromMilliseconds(i),
+            End = TimeSpan.FromMilliseconds(i + 1),
+        }).ToList();
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var merged = EnhancedLrcParser.MergeSyllables(words);
+        sw.Stop();
+
+        var word = Assert.Single(merged);
+        Assert.Equal(count, word.Text.Length);
+        Assert.Equal(count, word.Syllables!.Count);
+        Assert.Equal(TimeSpan.Zero, word.Start);
+        Assert.Equal(TimeSpan.FromMilliseconds(count), word.End);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(2), $"MergeSyllables took {sw.Elapsed}");
+    }
+
+    [Theory]
+    // GitHub #149, Malayalam: a syllable ending in a virama (U+0D4D) or a vowel sign (U+0D3E) is a
+    // combining mark, not a letter, so "പാ" + "ട്ട്" stayed two cells — the conjunct shaped apart.
+    [InlineData("[00:01.00]<00:01.00>പാ<00:01.30>ട്ട്<00:01.60> <00:01.70>എന്റെ", "പാട്ട്")]
+    // ...and a cell that starts with a mark ("ക" + "ണ്ണീ" + "ർ" is fine, "പ" + "ാട്ട്" is not).
+    [InlineData("[00:01.00]<00:01.00>പ<00:01.30>ാട്ട്<00:01.60> <00:01.70>എന്റെ", "പാട്ട്")]
+    // Devanagari: "न" + "म" + "स्" + "ते" (virama at a syllable end).
+    [InlineData("[00:01.00]<00:01.00>नम<00:01.30>स्<00:01.50>ते<00:01.60> <00:01.70>जी", "नमस्ते")]
+    // A zero-width joiner (chillu / conjunct control) at a syllable end.
+    [InlineData("[00:01.00]<00:01.00>ന്‍<00:01.30>റെ<00:01.60> <00:01.70>എ", "ന്‍റെ")]
+    public void ParseLine_IndicSyllables_JoinIntoOneWord(string line, string firstWord)
+    {
+        var (_, words) = EnhancedLrcParser.ParseLine(line[10..]);
+
+        Assert.NotNull(words);
+        Assert.Equal(firstWord, words![0].Text.Trim());
+        Assert.Equal(2, words.Count);
+    }
+
+    [Fact]
+    public void MergeSyllables_MixedRuns_KeepTextTimesAndSyllables()
+    {
+        var words = new List<Undertone.Models.WordTiming>
+        {
+            new() { Text = "tal", Start = TimeSpan.FromSeconds(1), End = TimeSpan.FromSeconds(2) },
+            new() { Text = "king ", Start = TimeSpan.FromSeconds(2), End = TimeSpan.FromSeconds(3) },
+            new() { Text = "to ", Start = TimeSpan.FromSeconds(3), End = TimeSpan.FromSeconds(4) },
+            new() { Text = "com", Start = TimeSpan.FromSeconds(4), End = TimeSpan.FromSeconds(5) },
+            new() { Text = "pro", Start = TimeSpan.FromSeconds(5), End = null },
+            new() { Text = "mise", Start = TimeSpan.FromSeconds(6), End = TimeSpan.FromSeconds(7) },
+        };
+
+        var merged = EnhancedLrcParser.MergeSyllables(words);
+
+        Assert.Equal(3, merged.Count);
+        Assert.Equal("talking ", merged[0].Text);
+        Assert.Equal(TimeSpan.FromSeconds(1), merged[0].Start);
+        Assert.Equal(TimeSpan.FromSeconds(3), merged[0].End);
+        // Trailing space is discounted from the last syllable's length.
+        Assert.Equal(new[] { 3, 4 }, merged[0].Syllables!.Select(s => s.Length));
+        Assert.Same(words[2], merged[1]);
+        Assert.Null(merged[1].Syllables);
+        Assert.Equal("compromise", merged[2].Text);
+        Assert.Equal(TimeSpan.FromSeconds(4), merged[2].Start);
+        Assert.Equal(TimeSpan.FromSeconds(7), merged[2].End);
+        Assert.Equal(new[] { 3, 3, 4 }, merged[2].Syllables!.Select(s => s.Length));
+        Assert.Null(merged[2].Syllables![1].End);
+    }
+
+    [Fact]
+    public void AppendBackground_JoiningAPart_KeepsTheSeamWordsSyllables()
+    {
+        // Two "[bg: …]" parts on one line share a row; the seam word gains a space, and must
+        // keep its syllable timings while doing so.
+        var lines = LrcParser.Parse(
+            "[00:01.00]<00:01.00>main <00:02.00>line<00:03.00>\n[bg: <00:03.00>o<00:03.20>oh<00:03.50>]\n[bg: <00:04.00>ah<00:05.00>]");
+
+        var bg = lines[0].BackgroundWords!;
+        Assert.Equal(new[] { "ooh ", "ah" }, bg.Select(w => w.Text));
+        Assert.Equal(
+            new[] { TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(3.2) },
+            bg[0].Syllables!.Select(s => s.Start));
+    }
+
+    [Fact]
+    public void AppendBackground_StopsGrowingPastWordCap()
+    {
+        var target = new Undertone.Models.LyricLine { Timestamp = TimeSpan.FromSeconds(1), Text = "Hey" };
+        var adlib = new List<Undertone.Models.WordTiming>
+        {
+            new() { Text = "(ooh)", Start = TimeSpan.FromSeconds(1), End = TimeSpan.FromSeconds(2) },
+        };
+
+        for (int i = 0; i < EnhancedLrcParser.MaxWordsPerLine + 50; i++)
+            EnhancedLrcParser.AppendBackground(target, adlib, TimeSpan.FromSeconds(2));
+
+        Assert.Equal(EnhancedLrcParser.MaxWordsPerLine, target.BackgroundWords!.Count);
+    }
+
+    [Fact]
+    public void ContainsWordTags_DetectsInlineTags()
+    {
+        Assert.True(EnhancedLrcParser.ContainsWordTags("<00:05.41>Hi"));
+        Assert.False(EnhancedLrcParser.ContainsWordTags("plain"));
+    }
+
+    private static Undertone.Models.LyricLine WordLine(string text, double startSec, params (string Text, double Start, double End)[] words)
+    {
+        var line = new Undertone.Models.LyricLine
+        {
+            Timestamp = TimeSpan.FromSeconds(startSec),
+            Text = text,
+        };
+        line.Words = words.Select(w => new Undertone.Models.WordTiming
+        {
+            Text = w.Text,
+            Start = TimeSpan.FromSeconds(w.Start),
+            End = TimeSpan.FromSeconds(w.End),
+        }).ToList();
+        return line;
+    }
+
+    [Fact]
+    public void FoldBackgroundLines_ParenthesizedLine_AttachesToPreviousLine()
+    {
+        var main = WordLine("Wait for me", 10, ("Wait ", 10, 10.5), ("for ", 10.5, 11), ("me", 11, 11.5));
+        var adlib = WordLine("(I will)", 12, ("(I ", 12, 13), ("will)", 13, 14));
+        var lines = new List<Undertone.Models.LyricLine> { main, adlib };
+
+        EnhancedLrcParser.FoldBackgroundLines(lines);
+
+        Assert.Single(lines);
+        Assert.True(main.HasBackgroundWords);
+        Assert.Equal(2, main.BackgroundWords!.Count);
+        Assert.Equal(TimeSpan.FromSeconds(14), main.BackgroundEndTimestamp);
+    }
+
+    [Fact]
+    public void FoldBackgroundLines_ConsecutiveAdlibs_JoinWithSpaceSeam()
+    {
+        var main = WordLine("Hey", 10, ("Hey", 10, 10.5));
+        var bg1 = WordLine("(Ooh)", 11, ("(Ooh)", 11, 12));
+        var bg2 = WordLine("(Ahh)", 12, ("(Ahh)", 12, 13));
+        var lines = new List<Undertone.Models.LyricLine> { main, bg1, bg2 };
+
+        EnhancedLrcParser.FoldBackgroundLines(lines);
+
+        Assert.Single(lines);
+        var bg = main.BackgroundWords!;
+        Assert.Equal(2, bg.Count);
+        Assert.Equal("(Ooh) ", bg[0].Text);
+        Assert.Equal("(Ahh)", bg[1].Text);
+    }
+
+    [Fact]
+    public void FoldBackgroundLines_LeadingAdlib_KeepsItsLineSlot()
+    {
+        // A fully-parenthesized FIRST line has no preceding main line to fold into —
+        // it must keep its slot as a normal line, not vanish or self-extract to nothing.
+        var leading = WordLine("(Yeah)", 1, ("(Yeah)", 1, 2));
+        var main = WordLine("Hello", 3, ("Hello", 3, 4));
+        var lines = new List<Undertone.Models.LyricLine> { leading, main };
+
+        EnhancedLrcParser.FoldBackgroundLines(lines);
+
+        Assert.Equal(2, lines.Count);
+        Assert.False(leading.HasBackgroundWords);
+        Assert.Single(leading.Words!);
+    }
+
+    [Fact]
+    public void FoldBackgroundLines_MultipleInlineRuns_AllExtracted()
+    {
+        var mixed = WordLine("(Hey) yeah (hey)", 3, ("(Hey) ", 3, 4), ("yeah ", 4, 5), ("(hey)", 5, 6));
+        var lines = new List<Undertone.Models.LyricLine> { mixed };
+
+        EnhancedLrcParser.FoldBackgroundLines(lines);
+
+        Assert.Single(mixed.Words!);
+        Assert.Equal("yeah", mixed.Words![0].Text.TrimEnd());
+        var bg = mixed.BackgroundWords!;
+        Assert.Equal(2, bg.Count);
+        Assert.Equal("(Hey) ", bg[0].Text);
+        Assert.Equal("(hey)", bg[1].Text);
+    }
+
+    [Fact]
+    public void FoldBackgroundLines_InlineParenRun_ExtractedToBackground()
+    {
+        // Adlibs embedded inline: "late at night (I will wait)" — the paren run splits
+        // into the background layer; the main words keep their own timings.
+        var line = WordLine("Late at night (I will wait)", 10,
+            ("Late ", 10, 10.4), ("at ", 10.4, 10.8), ("night ", 10.8, 11.2),
+            ("(I ", 11.2, 11.6), ("will ", 11.6, 12.0), ("wait)", 12.0, 12.5));
+        var lines = new List<Undertone.Models.LyricLine> { line };
+
+        EnhancedLrcParser.FoldBackgroundLines(lines);
+
+        Assert.Single(lines);
+        Assert.Equal(3, line.Words!.Count);
+        Assert.Equal("night", line.Words![2].Text.TrimEnd());
+        Assert.True(line.HasBackgroundWords);
+        Assert.Equal(3, line.BackgroundWords!.Count);
+        Assert.Equal("(I ", line.BackgroundWords![0].Text);
+        Assert.Equal("wait)", line.BackgroundWords![2].Text);
+        Assert.Equal(TimeSpan.FromSeconds(12.5), line.BackgroundEndTimestamp);
+    }
+
+    [Fact]
+    public void FoldBackgroundLines_UnmatchedInlineParen_LeftAlone()
+    {
+        var line = WordLine("Hey (oh no", 10,
+            ("Hey ", 10, 10.5), ("(oh ", 10.5, 11), ("no", 11, 11.5));
+        var lines = new List<Undertone.Models.LyricLine> { line };
+
+        EnhancedLrcParser.FoldBackgroundLines(lines);
+
+        Assert.Equal(3, line.Words!.Count);
+        Assert.False(line.HasBackgroundWords);
+    }
+
+    [Fact]
+    public void FoldBackgroundLines_InlineRunPlusFollowingParenLine_MergeInBackground()
+    {
+        var main = WordLine("Go (yeah)", 10, ("Go ", 10, 10.5), ("(yeah)", 10.5, 11));
+        var adlib = WordLine("(Ooh)", 11.5, ("(Ooh)", 11.5, 12.5));
+        var lines = new List<Undertone.Models.LyricLine> { main, adlib };
+
+        EnhancedLrcParser.FoldBackgroundLines(lines);
+
+        Assert.Single(lines);
+        Assert.Single(main.Words!);
+        var bg = main.BackgroundWords!;
+        Assert.Equal(2, bg.Count);
+        Assert.Equal("(yeah) ", bg[0].Text);
+        Assert.Equal("(Ooh)", bg[1].Text);
+        Assert.Equal(TimeSpan.FromSeconds(12.5), main.BackgroundEndTimestamp);
+    }
+
+    [Fact]
+    public void FoldBackgroundLines_LineLevelParenthesizedLine_NotFolded()
+    {
+        // Only word-timed adlib lines fold; plain line-level lines keep their slot.
+        var main = WordLine("Hello", 10, ("Hello", 10, 11));
+        var plain = new Undertone.Models.LyricLine { Timestamp = TimeSpan.FromSeconds(12), Text = "(Whoa)" };
+        var lines = new List<Undertone.Models.LyricLine> { main, plain };
+
+        EnhancedLrcParser.FoldBackgroundLines(lines);
+
+        Assert.Equal(2, lines.Count);
+        Assert.False(main.HasBackgroundWords);
+    }
+
+    // ── Duet voice markers (Gramophone/iTunes "v1:"/"v2:"/"v3:") ──────────────
+
+    [Fact]
+    public void StripVoiceMarker_V1_StripsMarkerAndMapsToDefault()
+    {
+        var (body, voice) = EnhancedLrcParser.StripVoiceMarker("v1: Hello");
+
+        Assert.Equal(" Hello", body);
+        Assert.Equal(Undertone.Models.LyricVoice.Default, voice);
+    }
+
+    [Fact]
+    public void StripVoiceMarker_V2_StripsMarkerAndMapsToVoice2()
+    {
+        var (body, voice) = EnhancedLrcParser.StripVoiceMarker("v2: Hello");
+
+        Assert.Equal(" Hello", body);
+        Assert.Equal(Undertone.Models.LyricVoice.Voice2, voice);
+    }
+
+    [Fact]
+    public void StripVoiceMarker_V3_MapsToGroup()
+    {
+        var (body, voice) = EnhancedLrcParser.StripVoiceMarker("v3:Both");
+
+        Assert.Equal("Both", body);
+        Assert.Equal(Undertone.Models.LyricVoice.Group, voice);
+    }
+
+    [Fact]
+    public void StripVoiceMarker_SingleLeadingSpace_Accepted()
+    {
+        // Gramophone tolerates exactly one space between "]" and the marker.
+        var (body, voice) = EnhancedLrcParser.StripVoiceMarker(" v2: Hey");
+
+        Assert.Equal(" Hey", body);
+        Assert.Equal(Undertone.Models.LyricVoice.Voice2, voice);
+    }
+
+    [Fact]
+    public void StripVoiceMarker_TwoLeadingSpaces_NotAMarker()
+    {
+        var (body, voice) = EnhancedLrcParser.StripVoiceMarker("  v2: Hey");
+
+        Assert.Equal("  v2: Hey", body);
+        Assert.Equal(Undertone.Models.LyricVoice.Default, voice);
+    }
+
+    [Fact]
+    public void StripVoiceMarker_Uppercase_NotAMarker()
+    {
+        // Gramophone matches case-sensitively; "V2:" is lyric text.
+        var (body, voice) = EnhancedLrcParser.StripVoiceMarker("V2: Hey");
+
+        Assert.Equal("V2: Hey", body);
+        Assert.Equal(Undertone.Models.LyricVoice.Default, voice);
+    }
+
+    [Fact]
+    public void StripVoiceMarker_HigherVoiceIds_StrippedAndMapToDefault()
+    {
+        // Apple TTML exports carry agent ids beyond v3 (e.g. "v2000" for a sampled
+        // clip); those must never surface as lyric text. Layout falls back to Default.
+        Assert.Equal((" Hey", Undertone.Models.LyricVoice.Default), EnhancedLrcParser.StripVoiceMarker("v4: Hey"));
+        Assert.Equal((" Hey", Undertone.Models.LyricVoice.Default), EnhancedLrcParser.StripVoiceMarker("v2000: Hey"));
+        Assert.Equal((" Hey", Undertone.Models.LyricVoice.Default), EnhancedLrcParser.StripVoiceMarker(" v1000: Hey"));
+    }
+
+    [Fact]
+    public void StripVoiceMarker_VWithoutDigitsOrColon_NotAMarker()
+    {
+        Assert.Equal(("v: Hey", Undertone.Models.LyricVoice.Default), EnhancedLrcParser.StripVoiceMarker("v: Hey"));
+        Assert.Equal(("v20 Hey", Undertone.Models.LyricVoice.Default), EnhancedLrcParser.StripVoiceMarker("v20 Hey"));
+    }
+
+    [Fact]
+    public void StripVoiceMarker_MidLineOrAfterWordTag_NotAMarker()
+    {
+        // Speaker tags only count directly after the line timestamp, so a "v2:"
+        // later in the body — including right after a word tag — stays literal.
+        Assert.Equal(("Hello v2: there", Undertone.Models.LyricVoice.Default),
+            EnhancedLrcParser.StripVoiceMarker("Hello v2: there"));
+        Assert.Equal(("<00:12.50>v2: word", Undertone.Models.LyricVoice.Default),
+            EnhancedLrcParser.StripVoiceMarker("<00:12.50>v2: word"));
+    }
+
+    [Fact]
+    public void StripVoiceMarker_NoMarker_ReturnsBodyUnchanged()
+    {
+        var (body, voice) = EnhancedLrcParser.StripVoiceMarker("Hello world");
+
+        Assert.Equal("Hello world", body);
+        Assert.Equal(Undertone.Models.LyricVoice.Default, voice);
+    }
+
+    [Fact]
+    public void StripVoiceMarker_MarkerWithEmptyRest_StillCounts()
+    {
+        var (body, voice) = EnhancedLrcParser.StripVoiceMarker("v2:");
+
+        Assert.Equal(string.Empty, body);
+        Assert.Equal(Undertone.Models.LyricVoice.Voice2, voice);
+    }
+
+    [Fact]
+    public void StripVoiceMarker_BeforeWordTags_WordTimingStillParses()
+    {
+        var (body, voice) = EnhancedLrcParser.StripVoiceMarker("v2: <00:12.50>word <00:13.00>two<00:13.40>");
+        var (text, words) = EnhancedLrcParser.ParseLine(body);
+
+        Assert.Equal(Undertone.Models.LyricVoice.Voice2, voice);
+        Assert.Equal("word two", text);
+        Assert.NotNull(words);
+        Assert.Equal(2, words!.Count);
+        Assert.Equal(TimeSpan.FromMilliseconds(12_500), words[0].Start);
+        Assert.Equal(TimeSpan.FromMilliseconds(13_400), words[1].End);
+    }
+
+    [Fact]
+    public void FoldBackgroundLines_AdlibAfterVoicedLine_AttachesAndKeepsVoice()
+    {
+        var main = WordLine("Lead", 10, ("Lead", 10, 10.8));
+        main.Voice = Undertone.Models.LyricVoice.Voice2;
+        var adlib = WordLine("(Ooh)", 11, ("(Ooh)", 11, 11.9));
+        var lines = new List<Undertone.Models.LyricLine> { main, adlib };
+
+        EnhancedLrcParser.FoldBackgroundLines(lines);
+
+        Assert.Single(lines);
+        Assert.Equal(Undertone.Models.LyricVoice.Voice2, main.Voice);
+        Assert.True(main.HasBackgroundWords);
+    }
+}

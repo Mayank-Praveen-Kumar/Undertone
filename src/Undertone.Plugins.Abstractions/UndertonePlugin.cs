@@ -1,0 +1,238 @@
+using Avalonia.Controls;
+
+namespace Undertone.Plugins;
+
+/// <summary>
+/// Entry point of a Undertone plugin. Build a class library against
+/// <c>Undertone.Plugins.Abstractions</c>, implement this interface once, put a <c>plugin.json</c>
+/// manifest next to the DLL, zip the folder and install it from Settings → Plugins (or drop the
+/// folder into <c>&lt;Undertone data&gt;/plugins/&lt;id&gt;/</c>). Undertone loads the manifest's entry
+/// DLL in an isolated load context, creates one instance, and calls <see cref="Initialize"/> on
+/// the UI thread. Exceptions from any callback are caught, the plugin is marked Failed and
+/// stopped; it cannot take the app down. See docs/PLUGINS.md.
+/// </summary>
+public interface IUndertonePlugin
+{
+    /// <summary>Who and what this is; shown in Settings → Plugins.</summary>
+    PluginInfo Info { get; }
+
+    /// <summary>Called once after load, on the UI thread. Register extensions on <paramref name="host"/> here.</summary>
+    void Initialize(IPluginHost host);
+
+    /// <summary>Called on disable/unload/app exit. Release timers, files and subscriptions.</summary>
+    void Shutdown();
+}
+
+/// <summary>Plugin identity. <paramref name="Id"/> must be stable across versions (reverse-DNS style, e.g. "dev.example.pulsering").</summary>
+public sealed record PluginInfo(string Id, string Name, string Version, string Author, string Description);
+
+/// <summary>
+/// What the host offers a plugin. Everything here is safe to call from the UI thread.
+/// Members added in API 1.1 to 1.6 have default bodies that throw <see cref="NotSupportedException"/>,
+/// so code compiled against an older kit (and any older implementation of this interface) keeps working;
+/// Undertone itself implements all of them. Hooks marked with a permission throw
+/// <see cref="PluginPermissionException"/> unless plugin.json declares it.
+/// </summary>
+public interface IPluginHost
+{
+    /// <summary>The Undertone version the plugin is running in ("1.5.3").</summary>
+    string AppVersion { get; }
+
+    /// <summary>
+    /// A folder private to this plugin for its own files. Since API 1.1 it lives outside the
+    /// plugin folder (<c>&lt;data&gt;/plugin-data/&lt;id&gt;/</c>), so updating or replacing the
+    /// plugin keeps it. Create it before writing (<see cref="Directory.CreateDirectory(string)"/>).
+    /// </summary>
+    string DataDirectory { get; }
+
+    /// <summary>What is playing right now, with change notifications.</summary>
+    INowPlaying NowPlaying { get; }
+
+    /// <summary>Live beat pulse of the audio being heard (0..1), for visuals that move with the music.</summary>
+    IBeatSource Beat { get; }
+
+    /// <summary>Live spectrum of the audio being heard, for visualizer-style plugins.</summary>
+    ISpectrumSource Spectrum { get; }
+
+    /// <summary>Writes a line to the Undertone debug log, prefixed with the plugin name.</summary>
+    void Log(string message);
+
+    /// <summary>Adds a visual layer drawn behind the lyrics on the lyrics page. Call from <see cref="IUndertonePlugin.Initialize"/>.</summary>
+    void RegisterVisualLayer(IVisualLayerProvider provider);
+
+    // ── API 1.1 ──
+
+    /// <summary>API 1.1. The folder the plugin was loaded from (read-only; replaced on update).
+    /// Use it for files you ship next to the DLL: plugin assemblies are loaded from memory, so
+    /// <c>Assembly.Location</c> is empty.</summary>
+    string PluginDirectory => throw Missing();
+
+    /// <summary>API 1.1, "playback.control": play, pause, skip and seek.</summary>
+    IPlaybackControl Playback => throw Missing();
+
+    /// <summary>API 1.1, "library.read": read-only search over the library. Results are copies.</summary>
+    ILibraryReader Library => throw Missing();
+
+    /// <summary>API 1.1: the values of the settings this plugin declared in plugin.json.
+    /// Undertone draws the controls in Settings → Plugins; the plugin only reads them.</summary>
+    IPluginSettings Settings => throw Missing();
+
+    /// <summary>API 1.1, "notifications": a short message in the app's notice pill.</summary>
+    void Notify(string message) => throw Missing();
+
+    /// <summary>API 1.1, "lyrics.provider": joins the online lyrics search after the built-in
+    /// providers. Dispose the result to withdraw it (Undertone also does on disable).</summary>
+    IDisposable RegisterLyricsProvider(ILyricsProvider provider) => throw Missing();
+
+    /// <summary>API 1.1, "menu.commands": adds an entry to the track context menu.</summary>
+    /// <param name="label">Menu text.</param>
+    /// <param name="icon">Optional SVG path data (24×24 box), or null.</param>
+    /// <param name="handler">Runs on the UI thread with a copy of the clicked track.</param>
+    IDisposable RegisterTrackCommand(string label, string? icon, Action<TrackInfo> handler) => throw Missing();
+
+    /// <summary>API 1.1, "menu.commands": async variant of
+    /// <see cref="RegisterTrackCommand(string, string?, Action{TrackInfo})"/>.</summary>
+    IDisposable RegisterTrackCommand(string label, string? icon, Func<TrackInfo, Task> handler) => throw Missing();
+
+    /// <summary>API 1.1, default "playback.read": called when a track counts as listened
+    /// (played past half its length or four minutes: the Last.fm rule), with the time it started.
+    /// Fires whether or not a scrobbling service is connected.</summary>
+    IDisposable OnTrackScrobbled(Action<TrackInfo, DateTimeOffset> handler) => throw Missing();
+
+    // ── API 1.2 ──
+
+    /// <summary>API 1.2, "library.write.analysis": sets BPM and key of library tracks (only those
+    /// two values, only in Undertone's library, never in file tags).</summary>
+    ITrackAnalysisWriter TrackAnalysis => throw Missing("1.2");
+
+    // ── API 1.3 ──
+
+    /// <summary>API 1.3: adds a view of the plugin's own (a whole page, not a layer). Settings →
+    /// Plugins shows an "Open" button for it on the plugin's card, and Undertone shows the control
+    /// in a window of its own. <see cref="IPluginViewProvider.CreateView"/> runs each time the
+    /// window opens; the window closes when the plugin stops or the registration is disposed.</summary>
+    IDisposable RegisterView(IPluginViewProvider provider) => throw Missing("1.3");
+
+    /// <summary>API 1.3: opens a view this plugin registered (for example from a menu command).
+    /// False when it is not registered (anymore) or the plugin stopped.</summary>
+    bool OpenView(IPluginViewProvider provider) => throw Missing("1.3");
+
+    /// <summary>API 1.3: shows an album's page in the main window and brings the window forward.
+    /// <paramref name="albumId"/> is <see cref="TrackInfo.AlbumId"/>. False for an unknown album.</summary>
+    bool ShowAlbum(string albumId) => throw Missing("1.3");
+
+    // ── API 1.5 ──
+
+    /// <summary>API 1.5: changes how word-synced lyrics move (lyrics page, side panel, mini
+    /// player). Undertone keeps drawing the words, their sweep and glow; the effect only says where
+    /// each letter sits and how big it is (<see cref="ILyricsEffect"/>), and which lines read
+    /// right to left. One effect is used at a time: the latest registered. Dispose the result to
+    /// withdraw it (Undertone also does on disable); Undertone's own motion then comes back.</summary>
+    IDisposable RegisterLyricsEffect(ILyricsEffect effect) => throw Missing("1.5");
+
+    /// <summary>API 1.5, "library.import": adds audio files the plugin saved to the library
+    /// (see <see cref="ILibraryImport"/>).</summary>
+    ILibraryImport LibraryImport => throw Missing("1.5");
+
+    // ── API 1.6 ──
+
+    /// <summary>API 1.6, "audio.decode": decodes song files to mono PCM for offline analysis
+    /// (see <see cref="IAudioDecoder"/>).</summary>
+    IAudioDecoder AudioDecoder => throw Missing("1.6");
+
+    private static NotSupportedException Missing(string api = "1.1")
+        => new($"This Undertone build does not implement plugin API {api}. Set minAppVersion in plugin.json.");
+}
+
+/// <summary>Current track and transport state. Events are raised on the UI thread.</summary>
+public interface INowPlaying
+{
+    /// <summary>The current track, or null when nothing is loaded.</summary>
+    NowPlayingTrack? Track { get; }
+
+    bool IsPlaying { get; }
+
+    /// <summary>Playback position; polled, not a stream of events. It moves in steps (about every
+    /// 100 ms on desktop) and holds still for a moment after a seek: for anything finer, add the
+    /// time since the value last changed (docs/PLUGINS.md, "How exact A-B Loop is").</summary>
+    TimeSpan Position { get; }
+
+    /// <summary>A new track started (or playback was cleared: <see cref="Track"/> is null).</summary>
+    event EventHandler? TrackChanged;
+
+    /// <summary>Play/pause flipped.</summary>
+    event EventHandler? IsPlayingChanged;
+}
+
+/// <summary>A read-only snapshot of a track for plugins.</summary>
+public sealed record NowPlayingTrack(
+    string Title,
+    string Artist,
+    string Album,
+    TimeSpan Duration,
+    string FilePath,
+    string? ArtworkPath,
+    int Bpm);
+
+/// <summary>Beat pulse of the audio at the speaker. False when no live audio is flowing (paused, or an engine without a tap).</summary>
+public interface IBeatSource
+{
+    bool TryRead(out double pulse);
+}
+
+/// <summary>Log-spaced spectrum (0..1 per band) of the audio at the speaker. Fills <paramref name="bands"/> with as many bands as it has room for.</summary>
+public interface ISpectrumSource
+{
+    bool TryRead(Span<float> bands);
+}
+
+/// <summary>
+/// A visual layer for the lyrics page. <see cref="CreateLayer"/> is called on the UI thread
+/// when the page mounts and the control is disposed with the page; keep per-frame work
+/// cheap (transform/opacity writes), never touch layout per frame.
+/// </summary>
+public interface IVisualLayerProvider
+{
+    /// <summary>Shown in Settings → Plugins under the owning plugin.</summary>
+    string Name { get; }
+
+    Control CreateLayer();
+}
+
+/// <summary>
+/// API 1.3: a view of the plugin's own, registered with <see cref="IPluginHost.RegisterView"/>.
+/// <see cref="CreateView"/> is called on the UI thread each time the user opens it; the control
+/// is detached when its window closes. Keep it cheap while hidden: stop timers when the control
+/// leaves the visual tree (DetachedFromVisualTree) or its window is minimized.
+/// </summary>
+public interface IPluginViewProvider
+{
+    /// <summary>Window title and button text ("Open &lt;Name&gt;").</summary>
+    string Name { get; }
+
+    /// <summary>Builds the view (UI thread), each time its window opens.</summary>
+    Control CreateView();
+
+    /// <summary>
+    /// API 1.5: the size the view's window opens at, in device-independent pixels (the client
+    /// area, without the title bar). Undertone sizes the window before it shows it and centres it on
+    /// the screen Undertone is on; the user can still resize it. null, or an axis that is not a
+    /// positive number, keeps Undertone's default (1000 × 680). Declare it as a public property on
+    /// the class that implements this interface; older Undertone versions ignore it.
+    /// </summary>
+    Avalonia.Size? PreferredWindowSize => null;
+
+    /// <summary>
+    /// API 1.5: the smallest size the user can shrink the window to, in device-independent pixels.
+    /// null (or an axis that is not a positive number) = Undertone's default of 480 × 360, lowered to
+    /// <see cref="PreferredWindowSize"/> when that is smaller.
+    /// </summary>
+    Avalonia.Size? MinWindowSize => null;
+
+    /// <summary>
+    /// API 1.5: opens the window at the size of the view's content instead of
+    /// <see cref="PreferredWindowSize"/> (on the axes it names), within the minimum size and the
+    /// screen. Once the user resizes the window it keeps the size they gave it.
+    /// </summary>
+    SizeToContent WindowSizeToContent => SizeToContent.Manual;
+}

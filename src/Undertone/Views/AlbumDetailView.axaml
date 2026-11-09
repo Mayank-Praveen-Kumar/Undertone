@@ -1,0 +1,1321 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:loc="using:Undertone.Localization"
+             xmlns:vm="using:Undertone.ViewModels"
+             xmlns:m="using:Undertone.Models"
+             xmlns:controls="using:Undertone.Controls"
+             xmlns:conv="using:Undertone.Converters"
+             xmlns:helpers="using:Undertone.Helpers"
+             x:Class="Undertone.Views.AlbumDetailView"
+             x:DataType="vm:AlbumDetailViewModel"
+             Background="{DynamicResource AppMainBackground}"
+             ClipToBounds="True">
+
+    <UserControl.Resources>
+        <conv:GuidEqualsConverter x:Key="GuidEquals" />
+        <conv:ArtworkPathConverter x:Key="ArtworkConverter" />
+        <conv:MetadataLineConverter x:Key="MetadataLine" />
+    </UserControl.Resources>
+
+    <UserControl.Styles>
+        <!-- Foldable "Other Versions" / "More By" headers: the Home and artist pages' disclosure
+             (title + chevron in the sidebar folder's grey rounded box), same styles. -->
+        <Style Selector="Button.section-toggle">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="HorizontalAlignment" Value="Left"/>
+        </Style>
+        <Style Selector="Button.section-toggle:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+        </Style>
+        <Style Selector="Button.section-toggle:pressed /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+        </Style>
+        <!-- Section headers fold, they don't zoom: no app-wide hover / press scale (10-05). -->
+        <Style Selector="Button.section-toggle:pointerover, Button.section-toggle:pressed">
+            <Setter Property="RenderTransform" Value="scale(1)"/>
+        </Style>
+        <Style Selector="Border.section-chevron-box">
+            <Setter Property="Width" Value="28"/>
+            <Setter Property="Height" Value="28"/>
+            <Setter Property="CornerRadius" Value="8"/>
+            <Setter Property="Background" Value="#22808080"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+        <Style Selector="Button.section-toggle Path.section-chevron">
+            <Setter Property="Stroke" Value="{Binding $parent[Button].Foreground}"/>
+            <Setter Property="Opacity" Value="0.8"/>
+            <Setter Property="RenderTransform" Value="rotate(-90deg)"/>
+            <Setter Property="Transitions">
+                <Transitions>
+                    <TransformOperationsTransition Property="RenderTransform" Duration="0:0:0.18">
+                        <TransformOperationsTransition.Easing>
+                            <CubicEaseOut/>
+                        </TransformOperationsTransition.Easing>
+                    </TransformOperationsTransition>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.15"/>
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Button.section-toggle.expanded Path.section-chevron">
+            <Setter Property="RenderTransform" Value="rotate(0deg)"/>
+        </Style>
+        <Style Selector="Button.section-toggle:pointerover Path.section-chevron">
+            <Setter Property="Opacity" Value="1"/>
+        </Style>
+        <Style Selector="Button.hscroll-arrow">
+            <Setter Property="Background" Value="#B0000000" />
+            <Setter Property="BorderBrush" Value="#40FFFFFF" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="999" />
+            <Setter Property="Width" Value="28" />
+            <Setter Property="Height" Value="28" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Opacity" Value="0.85" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+        </Style>
+        <Style Selector="Button.hscroll-arrow:pointerover">
+            <Setter Property="Opacity" Value="1" />
+        </Style>
+        <Style Selector="Button.hscroll-arrow:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="#B0000000" />
+            <Setter Property="BorderBrush" Value="#80FFFFFF" />
+        </Style>
+        <Style Selector="Button.album-desc-btn:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="{DynamicResource AccentColorBrush}" />
+            <Setter Property="Foreground" Value="White" />
+        </Style>
+        <Style Selector="Button.album-desc-btn:pressed /template/ ContentPresenter">
+            <Setter Property="Background" Value="{DynamicResource AccentColorBrush}" />
+            <Setter Property="Foreground" Value="White" />
+        </Style>
+        <Style Selector="Button.album-desc-btn:disabled /template/ ContentPresenter">
+            <Setter Property="Background" Value="#80E74856" />
+            <Setter Property="Foreground" Value="#80FFFFFF" />
+        </Style>
+        <Style Selector="Button.album-header-action">
+            <Setter Property="RenderTransform" Value="scale(1)" />
+            <Setter Property="RenderTransformOrigin" Value="50%,50%" />
+            <Setter Property="Background" Value="{DynamicResource AccentButtonBackground}" />
+            <Setter Property="Foreground" Value="{DynamicResource AccentForegroundBrush}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
+        </Style>
+        <!-- On a cover tint the Play / Shuffle / Add to Queue pills, the heart and the "…"
+             take contrast-checked colours (AlbumTintPalette.ForPage): the accent wherever it
+             already stands apart from the page, a lighter or darker shade of it where it would
+             melt in (with "Accent follows album art" the accent IS the cover colour, Discord
+             09-24). Style setters, not local values, so the plain page keeps the accent. -->
+        <Style Selector="StackPanel.on-tint Button.album-header-action">
+            <Setter Property="Background" Value="{Binding $parent[UserControl].((vm:AlbumDetailViewModel)DataContext).TintButtonBackground}" />
+            <Setter Property="Foreground" Value="{Binding $parent[UserControl].((vm:AlbumDetailViewModel)DataContext).TintButtonForeground}" />
+            <Setter Property="BorderBrush" Value="{Binding $parent[UserControl].((vm:AlbumDetailViewModel)DataContext).TintButtonBorder}" />
+        </Style>
+        <!-- A small soft shadow lifts the pills off the tint (Discord ask 09-24); same family
+             as the slider thumbs' 0 1 3 / the lyrics thumb's 0 2 5. -->
+        <Style Selector="StackPanel.on-tint Button.album-header-action /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="BoxShadow" Value="0 2 6 0 #40000000" />
+        </Style>
+        <Style Selector="PathIcon.album-dots">
+            <Setter Property="Foreground" Value="{DynamicResource AccentTextExactBrush}" />
+        </Style>
+        <Style Selector="StackPanel.on-tint PathIcon.album-dots">
+            <Setter Property="Foreground" Value="{Binding $parent[UserControl].((vm:AlbumDetailViewModel)DataContext).TintIconBrush}" />
+        </Style>
+        <Style Selector="StackPanel.on-tint controls|HeartIcon.album-heart">
+            <Setter Property="OnBrush" Value="{Binding $parent[UserControl].((vm:AlbumDetailViewModel)DataContext).TintHeartBrush}" />
+        </Style>
+        <Style Selector="Button.album-header-action:pointerover">
+            <Setter Property="RenderTransform" Value="scale(1.045)" />
+        </Style>
+        <Style Selector="Button.no-hover-scale:pointerover">
+            <Setter Property="RenderTransform" Value="scale(1)" />
+        </Style>
+        <Style Selector="Button.no-hover-scale:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="#22FFFFFF" />
+        </Style>
+        <Style Selector="Button.no-hover-scale:pressed /template/ ContentPresenter">
+            <Setter Property="Background" Value="#33FFFFFF" />
+        </Style>
+        <!-- Header heart / dots: bare glyph buttons — no hover box, no scale; a
+             slight dim on press is the only feedback. -->
+        <Style Selector="Button.header-icon-btn:pointerover">
+            <Setter Property="RenderTransform" Value="scale(1)" />
+        </Style>
+        <Style Selector="Button.header-icon-btn:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="Button.header-icon-btn:pressed /template/ ContentPresenter">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Opacity" Value="0.7" />
+        </Style>
+        <!-- Whole-page tint: related-section text takes the page colour (dark on light
+             covers). Classed, not every TextBlock: the tiles' context menus and the "E"
+             badge keep their own colours. Inside Buttons, so inheritance alone can't reach. -->
+        <Style Selector="StackPanel#RelatedSections.page-tint TextBlock.page-text">
+            <Setter Property="Foreground" Value="{Binding $parent[UserControl].((vm:AlbumDetailViewModel)DataContext).PageForegroundBrush}" />
+        </Style>
+        <Style Selector="StackPanel#RelatedSections.page-tint Path.page-text">
+            <Setter Property="Stroke" Value="{Binding $parent[UserControl].((vm:AlbumDetailViewModel)DataContext).PageForegroundBrush}" />
+        </Style>
+        <Style Selector="Button.related-album-tile:pointerover">
+            <Setter Property="RenderTransform" Value="scale(1)" />
+        </Style>
+        <Style Selector="Button.related-album-tile:pressed">
+            <Setter Property="RenderTransform" Value="scale(1)" />
+        </Style>
+        <!-- Kill press/pointerover scale on row 3-dot buttons so the MenuFlyout
+             popup doesn't shift down when the button bounds momentarily change. -->
+        <Style Selector="Button.row-more-dots">
+            <Setter Property="RenderTransform" Value="scale(1)" />
+            <Setter Property="Transitions">
+                <Transitions />
+            </Setter>
+        </Style>
+        <Style Selector="Button.row-more-dots:pointerover">
+            <Setter Property="RenderTransform" Value="scale(1)" />
+        </Style>
+        <Style Selector="Button.row-more-dots:pressed">
+            <Setter Property="RenderTransform" Value="scale(1)" />
+        </Style>
+
+        <!-- Album artist credits: accent on the plain page. On a cover tint they take the
+             page text colour instead — with "Accent follows album art" the accent IS the
+             cover colour, so the name vanished into the tint (Discord NJZ 09-22). Style
+             setters, not local values: a local Foreground would beat both. -->
+        <Style Selector="TextBlock.artist-credit-text">
+            <Setter Property="Foreground" Value="{DynamicResource AccentTextExactBrush}" />
+        </Style>
+        <Style Selector="ItemsControl.on-tint TextBlock.artist-credit-text">
+            <Setter Property="Foreground" Value="{Binding $parent[UserControl].((vm:AlbumDetailViewModel)DataContext).PageForegroundBrush}" />
+        </Style>
+
+        <!-- Row background moves off the ListBoxItem onto the inner row-body Border so the
+             hover box and the now-playing box are one element and cannot drift apart. The
+             ListBoxItem keeps its hit-testing and layout role but paints nothing. Same
+             pattern as PlaylistView. -->
+        <Style Selector="ListBox.track-list ListBoxItem">
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem:nth-child(2n)">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem:pointerover">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem:nth-child(2n):pointerover">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem:selected">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem:nth-child(2n):selected">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem.ctrl-selected">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem.ctrl-selected:nth-child(2n)">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem.ctrl-selected:pointerover">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem.ctrl-selected:nth-child(2n):pointerover">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem.ctrl-selected /template/ ContentPresenter">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem.ctrl-selected:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <!-- Styles.axaml also carries a compound :selected variant (a row can be both
+             natively :selected — e.g. a plain click before a Ctrl+click on the same row —
+             and .ctrl-selected at once). The neutralisers above already cover it: Avalonia
+             has no selector specificity, so the plain .ctrl-selected pair matches such a row
+             too and wins on origin order (view styles apply after app styles). Kept as
+             belt-and-braces so the compound case is visibly accounted for. -->
+        <Style Selector="ListBox.track-list ListBoxItem.ctrl-selected:selected">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem.ctrl-selected:selected /template/ ContentPresenter">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+
+        <!-- Row body: carries stripe, hover and the now-playing fill on one rectangle.
+             The stripe uses a descendant selector off the container's :nth-child so this
+             view needs no code-behind "even" stamping (PlaylistView stamps it only because
+             its album run headers live inside the item). -->
+        <Style Selector="Border.row-body">
+            <Setter Property="Padding" Value="0,9,8,9" />
+            <Setter Property="CornerRadius" Value="4" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Transitions">
+                <Transitions>
+                    <BrushTransition Property="Background" Duration="0:0:0.04" />
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="ListBox.track-list ListBoxItem:nth-child(2n) Border.row-body">
+            <Setter Property="Background" Value="{DynamicResource TrackListStripeBrush}" />
+        </Style>
+        <Style Selector="Border.row-body:pointerover">
+            <Setter Property="Background" Value="{DynamicResource TrackListHoverBrush}" />
+        </Style>
+        <!-- Row rating stars: hidden until hovered, always visible once rated (same idiom as the Songs page). -->
+        <Style Selector="controls|RatingStars.row-rating">
+            <Setter Property="Opacity" Value="0" />
+        </Style>
+        <Style Selector="controls|RatingStars.row-rating.rated">
+            <Setter Property="Opacity" Value="0.7" />
+        </Style>
+        <Style Selector="Border.row-body:pointerover controls|RatingStars.row-rating">
+            <Setter Property="Opacity" Value="0.45" />
+        </Style>
+        <Style Selector="Border.row-body:pointerover controls|RatingStars.row-rating.rated">
+            <Setter Property="Opacity" Value="1" />
+        </Style>
+        <Style Selector="ListBoxItem.ctrl-selected Border.row-body">
+            <Setter Property="Background" Value="#3FFFFFFF" />
+        </Style>
+        <Style Selector="Border.cover-viewable">
+            <Setter Property="Cursor" Value="Hand" />
+        </Style>
+        <!-- MUST stay last: equal-origin Avalonia styles resolve by declaration order, so
+             this is what makes the box win on striped, hovered and ctrl-selected rows alike. -->
+        <!-- No tween onto/off the fill: Avalonia lerps colours in linear light, so hover
+             wash (white at ~4%) -> opaque accent passed through a half-opaque near-white
+             (#81D1BDBF on Wine) = a white flicker on dark accents (NowPlayingRowSnapTests).
+             Transitions MUST be the first setter: setters apply in order, and after
+             Background the 40ms tween still catches the change. -->
+        <Style Selector="Border.row-body.now-playing">
+            <Setter Property="Transitions">
+                <Transitions />
+            </Setter>
+            <Setter Property="Background" Value="{DynamicResource NowPlayingRowBrush}" />
+        </Style>
+    </UserControl.Styles>
+
+    <Grid>
+    <ScrollViewer x:Name="TrackScrollViewer"
+                  VerticalScrollBarVisibility="Auto"
+                  HorizontalScrollBarVisibility="Disabled"
+                  IsHitTestVisible="{Binding !IsAlbumDescriptionOpen}">
+    <!-- Row 0 album block, row 1 related sections. The tint spans row 0, or both rows
+         with Settings → Tint whole page (Discord "Album Page Redesign"); the star row lets
+         a whole-page tint reach the bottom of the viewport on short pages. -->
+    <Grid x:Name="PageLayout" RowDefinitions="Auto,*">
+
+        <!-- Album block: header, tracks and footer facts sit on one flat panel of the
+             cover's edge colour, the way iTunes' expanded album view did. Other Versions
+             and More By below stay on the app background with theme text. The fill is
+             its own layer (faded in from code-behind) so the fade never hides content. -->
+        <!-- MinHeight / bottom padding are set from code-behind (UpdateAlbumBlockLayout):
+             a tinted block always reaches the bottom of the viewport with the footer facts
+             pinned to its foot (Discord NJZ 09-22), and whichever block ends the page
+             keeps the floating player bar's clearance. -->
+        <Border x:Name="AlbumTintBg"
+                Grid.Row="0"
+                Background="{Binding BackgroundBrush}"
+                IsHitTestVisible="False"
+                Opacity="0">
+            <Border.Transitions>
+                <Transitions>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.16">
+                        <DoubleTransition.Easing><CubicEaseOut/></DoubleTransition.Easing>
+                    </DoubleTransition>
+                </Transitions>
+            </Border.Transitions>
+        </Border>
+        <Grid x:Name="AlbumBlock" Grid.Row="0">
+        <DockPanel x:Name="AlbumBlockContent"
+                   LastChildFill="True"
+                   TextElement.Foreground="{Binding PageForegroundBrush}">
+
+        <!-- Album header -->
+        <Grid DockPanel.Dock="Top"
+              ColumnDefinitions="Auto,*,Auto"
+              Margin="16,12,28,20">
+
+            <!-- Large album art. A click opens it full size (GitHub #114, OnHeaderCoverTapped);
+                 the hand cursor shows only when there is a cover to open. -->
+            <Border Grid.Column="0"
+                    Width="340" Height="340"
+                    CornerRadius="8"
+                    ClipToBounds="True"
+                    Background="{DynamicResource SystemControlBackgroundBaseLowBrush}"
+                    Margin="0,0,32,0"
+                    Classes.cover-viewable="{Binding CanViewArtwork}"
+                    Tapped="OnHeaderCoverTapped">
+                <Panel>
+                    <TextBlock Text="{loc:T AlbumDetail.Album}"
+                               FontSize="24"
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Center"
+                               Opacity="0.2"
+                               IsVisible="{Binding HeaderArtPath, Converter={x:Static StringConverters.IsNullOrEmpty}}" />
+                    <!-- PixelExact: decoded at the cover's own device pixels and drawn 1:1, as
+                         sharp as the full-size viewer (a 512 bucket was shrunk to 425 px at 125%
+                         and stretched to 680 px at 200%). -->
+                    <controls:CachedImage SourcePath="{Binding HeaderArtPath}"
+                                          DecodeWidth="512"
+                                          PixelExact="True"
+                                          Stretch="UniformToFill"
+                                          RenderOptions.BitmapInterpolationMode="HighQuality"
+                                          IsVisible="{Binding HeaderArtPath, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                    <!-- Bitmap-rendered (not a native VideoView): composes/clips like a
+                         normal control, so it doesn't bleed over or jump relative to the
+                         sidebar when it expands. -->
+                    <controls:AnimatedCoverImage
+                        Source="{Binding AnimatedCoverPath}"
+                        IsActive="{Binding ShowAnimatedCover}" />
+                </Panel>
+            </Border>
+
+            <!-- Album info -->
+            <StackPanel Grid.Column="1"
+                        VerticalAlignment="Center"
+                        Spacing="6">
+                <Grid ColumnDefinitions="Auto,Auto"
+                      HorizontalAlignment="Left"
+                      MaxWidth="1400">
+                    <TextBlock Grid.Column="0"
+                               Classes="one-line-explicit-title"
+                               Text="{Binding Album.Name}"
+                               FontSize="36"
+                               FontWeight="Bold"
+                               Foreground="{Binding PageForegroundBrush}"
+                               HorizontalAlignment="Left"
+                               MaxWidth="1320" />
+                    <!-- Anchored to the TOP of the title, not centred on it: the title's
+                         measured height grows with descender ink ("Single" vs "EP"), so a
+                         centred badge drifts per title. For 36px Inter the cap centre sits
+                         ~22px below the line top; 16px badge → 14px top margin. -->
+                    <Border Grid.Column="1"
+                            Classes="explicit-badge"
+                            VerticalAlignment="Top"
+                            RenderTransform="none"
+                            Margin="8,14,0,0"
+                            IsVisible="{Binding Album.IsExplicit}"
+                            ToolTip.Tip="{loc:T AlbumDetail.ExplicitTip}">
+                        <TextBlock Text="E"
+                                    Classes="explicit-badge-text"
+                                    FontSize="10"
+                                    Opacity="0.95" />
+                    </Border>
+                </Grid>
+                <!-- Album artist: one link per credited artist ("Rihanna, Kanye West, Paul McCartney"
+                     used to be a single button that always opened the first name). -->
+                <ItemsControl ItemsSource="{Binding ArtistTokens}" HorizontalAlignment="Left"
+                              Classes.on-tint="{Binding HasTint}">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <WrapPanel Orientation="Horizontal" />
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="vm:ArtistTokenItem">
+                            <StackPanel Orientation="Horizontal">
+                                <Button Classes="no-hover-scale artist-credit-link"
+                                        Background="Transparent"
+                                        BorderThickness="0"
+                                        Padding="0,1,0,2"
+                                        MinHeight="0"
+                                        Cursor="Hand"
+                                        Command="{Binding $parent[ItemsControl].((vm:AlbumDetailViewModel)DataContext).ViewArtistFromTrackCommand}"
+                                        CommandParameter="{Binding Name}">
+                                    <TextBlock Classes="artist-credit-text"
+                                               Text="{Binding Name}"
+                                               FontSize="20"
+                                               LineHeight="24"
+                                               VerticalAlignment="Center" />
+                                </Button>
+                                <TextBlock Classes="artist-credit-text"
+                                           Text=", "
+                                           FontSize="20"
+                                           LineHeight="24"
+                                           VerticalAlignment="Center"
+                                           Opacity="0.6"
+                                           IsVisible="{Binding !IsLast}" />
+                            </StackPanel>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <StackPanel Orientation="Horizontal" Spacing="0" Margin="0,4,0,0"
+                            TextElement.Foreground="{Binding PageForegroundBrush}">
+                    <TextBlock FontSize="13" Opacity="0.5" VerticalAlignment="Center">
+                        <TextBlock.Text>
+                            <MultiBinding Converter="{StaticResource MetadataLine}">
+                                <Binding Path="Album.GenreDisplay" />
+                                <Binding Path="Album.ReleaseDateFormatted" />
+                                <Binding Path="Album.TrackCountText" />
+                                <Binding Path="Album.HeaderDurationFormatted" />
+                            </MultiBinding>
+                        </TextBlock.Text>
+                    </TextBlock>
+                    <TextBlock Text=" · "
+                               FontSize="13"
+                               Opacity="0.5"
+                               VerticalAlignment="Center"
+                               IsVisible="{Binding Album.AudioQualityBadge, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+
+                    <!-- Audio quality badge: Lossless / Hi-Res Lossless / codec (hover for info, non-clickable) -->
+                    <Border Classes="quality-pill"
+                            Background="Transparent"
+                            CornerRadius="999"
+                            Padding="0,3,3,3"
+                            VerticalAlignment="Center"
+                            IsVisible="{Binding Album.AudioQualityBadge, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+                        <Border.Transitions>
+                            <Transitions>
+                                <BrushTransition Property="Background" Duration="0:0:0.12" />
+                            </Transitions>
+                        </Border.Transitions>
+                        <Border.Styles>
+                            <Style Selector="Border.quality-pill:pointerover">
+                                <Setter Property="Background" Value="#22FFFFFF" />
+                            </Style>
+                        </Border.Styles>
+                        <ToolTip.Tip>
+                            <StackPanel Width="220" Spacing="4">
+                                <TextBlock Text="{Binding Album.AudioQualityBadge}"
+                                           FontSize="13"
+                                           FontWeight="SemiBold"
+                                           Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" />
+                                <TextBlock Text="{Binding Album.AudioQualityDetailedInfo}"
+                                           FontSize="12"
+                                           Opacity="0.9"
+                                           Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+                                <TextBlock Text="{Binding Album.AudioQualityDescription}"
+                                           FontSize="11"
+                                           TextWrapping="Wrap"
+                                           Opacity="0.85"
+                                           Margin="0,4,0,0"
+                                           Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+                            </StackPanel>
+                        </ToolTip.Tip>
+                        <StackPanel Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                            <Viewbox Width="16" Height="11" VerticalAlignment="Center" Margin="0,1,0,0" Opacity="0.5">
+                            <Path Data="M8.184,0.35C9.944,0.35 10.703,3.296 11.338,5.238C11.673,3.842 11.497,3.542 11.857,3.542C11.99,3.542 12.126,3.633 12.126,3.798C12.126,3.809 12.123,3.839 12.117,3.883L12.091,4.058C12.02,4.522 11.845,5.494 11.654,6.144C13.198,10.191 14.345,4.861 14.474,3.772C14.493,3.615 14.612,3.542 14.731,3.542C14.891,3.542 15.022,3.662 14.997,3.843C14.72,5.605 14.295,8.35 12.547,8.35C11.582,8.35 11.04,7.595 10.611,6.73C9.54,4.626 9.047,1.093 7.997,1.093C7.66,1.093 7.411,1.444 7.394,1.444C7.362,1.444 7.337,1.301 7.023,0.909C7.322,0.567 7.734,0.35 8.184,0.35ZM2.458,0.354C5.211,0.354 5.456,7.618 7.014,7.618C7.197,7.618 7.394,7.507 7.61,7.256C7.729,7.458 7.851,7.638 7.978,7.796C7.667,8.151 7.28,8.35 6.795,8.35C5.054,8.349 4.306,5.434 3.663,3.466C3.511,4.097 3.432,4.669 3.402,4.925C3.382,5.088 3.263,5.163 3.143,5.163C3.009,5.163 2.874,5.071 2.874,4.908L2.874,4.908L2.877,4.87C2.966,4.223 3.146,3.243 3.347,2.56C3.079,1.858 2.745,1.091 2.252,1.091C1.257,1.091 0.687,3.591 0.527,4.925C0.508,5.088 0.388,5.163 0.268,5.163C0.135,5.163 0,5.071 0,4.908C0,4.896 0.001,4.883 0.002,4.87C0.283,2.836 0.808,0.354 2.458,0.354ZM5.315,0.35C5.809,0.35 6.339,0.608 6.797,1.211C6.822,1.241 7.078,1.639 7.159,1.777C8.277,3.802 8.818,7.627 9.881,7.627C10.065,7.627 10.264,7.513 10.484,7.256C10.604,7.458 10.726,7.638 10.852,7.796C10.542,8.15 10.155,8.35 9.67,8.35C6.933,8.349 6.636,1.09 5.128,1.09C4.788,1.09 4.536,1.444 4.519,1.444C4.487,1.444 4.462,1.301 4.148,0.909C4.455,0.558 4.87,0.35 5.315,0.35Z"
+                                  Fill="{Binding PageForegroundBrush}" />
+                            </Viewbox>
+                            <TextBlock Text="{Binding Album.AudioQualityBadge}"
+                                       FontSize="13"
+                                       FontWeight="SemiBold"
+                                       VerticalAlignment="Center"
+                                       Opacity="0.5" />
+                        </StackPanel>
+                    </Border>
+
+                    <!-- Favorite heart for singles or fully-favorited albums -->
+                    <TextBlock Text="·"
+                               FontSize="13"
+                               Opacity="0.5"
+                               Margin="3,0,4,0"
+                               VerticalAlignment="Center"
+                               IsVisible="{Binding IsAlbumFavorited}" />
+                    <controls:HeartIcon Size="12" ShowWhenOff="False"
+                                    Margin="0,2,0,0" VerticalAlignment="Center"
+                                    IsFavorite="{Binding IsAlbumFavorited}"/>
+                </StackPanel>
+
+                <Button Classes="no-hover-scale"
+                        Background="Transparent"
+                        BorderThickness="0"
+                        Padding="0"
+                        MinHeight="0"
+                        HorizontalAlignment="Left"
+                        HorizontalContentAlignment="Left"
+                        Cursor="Hand"
+                        MaxWidth="500"
+                        Margin="0,8,24,0"
+                        Command="{Binding OpenAlbumDescriptionCommand}"
+                        ToolTip.Tip="{loc:T AlbumDetail.OpenFullAlbumDescriptionTip}"
+                        IsVisible="{Binding HasAlbumDescription}">
+                    <!-- Explicit Foreground: the Button's theme resets it to the theme text,
+                         which is white on a light cover's panel (Goodbye & Good Riddance). -->
+                    <TextBlock x:Name="AlbumDescriptionText"
+                               Text="{Binding AlbumDescription}"
+                               Foreground="{Binding PageForegroundBrush}"
+                               FontSize="14"
+                               Opacity="0.72"
+                               TextWrapping="Wrap"
+                               MaxLines="4"
+                               TextTrimming="CharacterEllipsis" />
+                </Button>
+                <!-- No description: a quiet line in its place opens the popup ready to type
+                     (the right-click "Update Description" was the only way before). -->
+                <Button Classes="no-hover-scale"
+                        Background="Transparent"
+                        BorderThickness="0"
+                        Padding="0"
+                        MinHeight="0"
+                        HorizontalAlignment="Left"
+                        Cursor="Hand"
+                        Margin="0,8,24,0"
+                        Command="{Binding EditAlbumDescriptionCommand}"
+                        IsVisible="{Binding ShowAddAlbumDescription}">
+                    <TextBlock Text="{loc:T AlbumDetail.AddDescription}"
+                               Foreground="{Binding PageForegroundBrush}"
+                               FontSize="14"
+                               Opacity="0.45" />
+                </Button>
+
+                <!-- Play (pill) + Shuffle (pill) -->
+                <StackPanel Orientation="Horizontal" Spacing="12" Margin="0,28,0,0" VerticalAlignment="Center"
+                            Classes.on-tint="{Binding HasTint}">
+                    <Button Command="{Binding PlayAllCommand}"
+                            Classes="accent-btn album-header-action"
+                            Padding="26,8"
+                            CornerRadius="999"
+                            BorderThickness="1"
+                            FontWeight="Bold"
+                            Cursor="Hand"
+                            ToolTip.Tip="{loc:T AlbumDetail.PlayTip}">
+                        <StackPanel Orientation="Horizontal" Spacing="3">
+                            <PathIcon Data="{StaticResource PlayIcon}"
+                                     Width="13" Height="13"
+                                     Foreground="{Binding $parent[Button].Foreground}"
+                                     VerticalAlignment="Center" />
+                            <TextBlock Text="{loc:T AlbumDetail.PlayTip}"
+                                       FontSize="14"
+                                       FontWeight="Bold"
+                                       VerticalAlignment="Center" />
+                        </StackPanel>
+                    </Button>
+                    <Button Command="{Binding ShufflePlayCommand}"
+                            Classes="accent-btn album-header-action"
+                            Padding="22,8"
+                            CornerRadius="999"
+                            BorderThickness="1"
+                            FontWeight="Bold"
+                            Cursor="Hand"
+                            ToolTip.Tip="{loc:T AlbumDetail.ShuffleTip}">
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                            <Grid Width="16" Height="16" VerticalAlignment="Center">
+                                <PathIcon Data="{StaticResource ShuffleIcon}"
+                                          Width="16" Height="16"
+                                          Foreground="{Binding $parent[Button].Foreground}" />
+                                <PathIcon Data="{StaticResource ShuffleIcon}"
+                                          Width="16" Height="16"
+                                          Foreground="{Binding $parent[Button].Foreground}"
+                                          Opacity="0.85"
+                                          Margin="0.6,0,0,0" />
+                            </Grid>
+                            <TextBlock Text="{loc:T AlbumDetail.ShuffleTip}"
+                                       FontSize="14"
+                                       FontWeight="Bold"
+                                       VerticalAlignment="Center" />
+                        </StackPanel>
+                    </Button>
+                    <Button Command="{Binding AddAlbumToQueueCommand}"
+                            Classes="accent-btn album-header-action"
+                            Padding="22,8"
+                            CornerRadius="999"
+                            BorderThickness="1"
+                            FontWeight="Bold"
+                            Cursor="Hand"
+                            ToolTip.Tip="{loc:T AlbumDetail.AddWholeAlbumEndTip}">
+                        <Panel>
+                            <StackPanel Orientation="Horizontal" Spacing="6"
+                                        IsVisible="{Binding !AlbumAddedToQueue}">
+                                <controls:LineIcon Width="17" Height="17" VerticalAlignment="Center"
+                                                   Data="{StaticResource MenuLineQueue}"
+                                                   Foreground="{Binding $parent[Button].Foreground}" />
+                                <TextBlock Text="{loc:T AlbumDetail.AddQueue}"
+                                           FontSize="14"
+                                           FontWeight="Bold"
+                                           VerticalAlignment="Center" />
+                            </StackPanel>
+                            <!-- Same width as the resting label so the pill doesn't jump. -->
+                            <StackPanel Orientation="Horizontal" Spacing="6"
+                                        HorizontalAlignment="Center"
+                                        IsVisible="{Binding AlbumAddedToQueue}">
+                                <PathIcon Data="{StaticResource CheckmarkIcon}"
+                                          Width="15" Height="15"
+                                          Foreground="{Binding $parent[Button].Foreground}"
+                                          VerticalAlignment="Center" />
+                                <TextBlock Text="{loc:T AlbumDetail.AddedQueue}"
+                                           FontSize="14"
+                                           FontWeight="Bold"
+                                           VerticalAlignment="Center" />
+                            </StackPanel>
+                        </Panel>
+                    </Button>
+                </StackPanel>
+
+            </StackPanel>
+
+            <!-- Album-level favorite heart + 3-dots menu (bottom, aligned with track dots) -->
+            <StackPanel Grid.Column="2"
+                        Orientation="Horizontal"
+                        Spacing="4"
+                        VerticalAlignment="Bottom"
+                        Classes.on-tint="{Binding HasTint}">
+            <Button Classes="header-icon-btn"
+                    Background="Transparent"
+                    BorderThickness="0"
+                    Padding="0"
+                    Width="32" Height="32"
+                    Cursor="Hand"
+                    Command="{Binding ToggleAlbumFavoritesCommand}"
+                    AutomationProperties.Name="{loc:T AlbumDetail.FavoriteEverySongAlbum}">
+                <ToolTip.Tip>
+                    <TextBlock Text="{loc:T AlbumDetail.FavoriteEverySongAlbum}" />
+                </ToolTip.Tip>
+                <controls:HeartIcon Classes="album-heart" Size="15"
+                                    OffBrush="{Binding PageForegroundBrush}" OffOpacity="0.7"
+                                    IsFavorite="{Binding IsAlbumFavorited}" />
+            </Button>
+            <Button x:Name="AlbumOptionsButton"
+                    Classes="header-icon-btn"
+                    Background="Transparent"
+                    BorderThickness="0"
+                    Padding="0"
+                    Width="32" Height="32"
+                    VerticalAlignment="Bottom"
+                    HorizontalAlignment="Center"
+                    Cursor="Hand"
+                    Margin="0,0,0,0"
+                    ToolTip.Tip="{loc:T AlbumDetail.OptionsTip}">
+                <PathIcon Classes="album-dots"
+                          Data="{StaticResource MoreDotsIcon}"
+                          Width="14" Height="14"
+                          HorizontalAlignment="Center"
+                          VerticalAlignment="Center" />
+                <Button.Flyout>
+                    <MenuFlyout Placement="BottomEdgeAlignedRight"
+                                PlacementConstraintAdjustment="None"
+                                helpers:MenuOpenAnimation.EnableFlyoutClose="True"
+                                Opened="OnAlbumFlyoutOpened">
+                        <!-- v2 menu (10-09): plain header like every other row (the card trims it),
+                             muted line icons throughout. -->
+                        <MenuItem Header="{loc:T AlbumDetail.PlayTip}"
+                                  Command="{Binding PlayAllCommand}">
+                            <MenuItem.Icon>
+                                <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLinePlay}"/>
+                            </MenuItem.Icon>
+                        </MenuItem>
+                        <MenuItem Header="{loc:T AlbumDetail.ShuffleTip}"
+                                  Command="{Binding ShufflePlayCommand}">
+                            <MenuItem.Icon>
+                                <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineShuffle}"/>
+                            </MenuItem.Icon>
+                        </MenuItem>
+                        <MenuItem Header="{loc:T AlbumDetail.AddQueue}"
+                                  Command="{Binding AddAlbumToQueueCommand}">
+                            <MenuItem.Icon>
+                                <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineQueue}"/>
+                            </MenuItem.Icon>
+                        </MenuItem>
+                        <Separator />
+                        <MenuItem Header="{loc:T AlbumDetail.AddPlaylist}"
+                                  Command="{Binding AddAlbumToNewPlaylistCommand}">
+                            <MenuItem.Icon>
+                                <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLinePlaylistAdd}"/>
+                            </MenuItem.Icon>
+                        </MenuItem>
+                        <Separator />
+                        <MenuItem Header="{loc:T AlbumDetail.Metadata}"
+                                  Command="{Binding OpenAlbumMetadataCommand}">
+                            <MenuItem.Icon>
+                                <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineEdit}"/>
+                            </MenuItem.Icon>
+                        </MenuItem>
+                        <MenuItem Header="{loc:T AlbumDetail.EditDescription}"
+                                  Command="{Binding EditAlbumDescriptionCommand}">
+                            <MenuItem.Icon>
+                                <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineText}"/>
+                            </MenuItem.Icon>
+                        </MenuItem>
+                        <MenuItem Header="{loc:T AlbumDetail.LyricsBackgroundVideo}">
+                            <MenuItem.Icon>
+                                <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineVideo}"/>
+                            </MenuItem.Icon>
+                            <MenuItem Header="{loc:T AlbumDetail.ChooseAlbumVideo}"
+                                      Command="{x:Static helpers:LyricsBackgroundOverrides.ChooseForAlbumCommand}"
+                                      CommandParameter="{Binding Album}" />
+                            <MenuItem Header="{loc:T AlbumDetail.UseDefaultVideo}"
+                                      Command="{x:Static helpers:LyricsBackgroundOverrides.ClearForAlbumCommand}"
+                                      CommandParameter="{Binding Album}" />
+                        </MenuItem>
+                        <!-- Don't Scrobble This Album: binds itself on open (ScrobbleMenu.Entry) -->
+                        <MenuItem helpers:ScrobbleMenu.Entry="album">
+                            <MenuItem.Icon>
+                                <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineScrobbleOff}"/>
+                            </MenuItem.Icon>
+                        </MenuItem>
+                        <MenuItem Header="{loc:T AlbumDetail.ConvertAlbum}"
+                                  Command="{Binding ConvertAlbumCommand}">
+                            <MenuItem.Icon>
+                                <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineConvert}"/>
+                            </MenuItem.Icon>
+                        </MenuItem>
+                        <MenuItem Header="{loc:T AlbumDetail.ScanReplayGain}"
+                                  Command="{Binding ScanAlbumReplayGainCommand}">
+                            <MenuItem.Icon>
+                                <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineReplayGain}"/>
+                            </MenuItem.Icon>
+                        </MenuItem>
+                        <!-- GitHub #121: SendAlbumToFolderCommand existed since 2a616afb but no menu bound it. -->
+                        <MenuItem Header="{loc:T SendTo.Title}"
+                                  Command="{Binding SendAlbumToFolderCommand}">
+                            <MenuItem.Icon>
+                                <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineSendToFolder}"/>
+                            </MenuItem.Icon>
+                        </MenuItem>
+                        <MenuItem Header="{loc:T AlbumDetail.ShowFolder}"
+                                  Command="{Binding ShowAlbumInExplorerCommand}">
+                            <MenuItem.Icon>
+                                <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineFolder}"/>
+                            </MenuItem.Icon>
+                        </MenuItem>
+                        <Separator />
+                        <MenuItem Header="{loc:T AlbumDetail.RemoveFromLibrary}" Classes="danger"
+                                  Command="{Binding RemoveAlbumFromLibraryCommand}">
+                            <MenuItem.Icon>
+                                <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineTrash}"/>
+                            </MenuItem.Icon>
+                        </MenuItem>
+                    </MenuFlyout>
+                </Button.Flyout>
+            </Button>
+            </StackPanel>
+        </Grid>
+
+        <!-- Album footer: release date, track count + duration, copyright (Apple Music style).
+             Docked to the block's foot, so a tinted block stretched to the viewport carries
+             the facts at the bottom of the colour instead of mid-page. The bottom margin is
+             the coloured panel's breathing room under the facts. -->
+        <StackPanel DockPanel.Dock="Bottom"
+                    Margin="10,24,16,28" Spacing="3"
+                    TextElement.Foreground="{Binding PageForegroundBrush}">
+            <TextBlock Text="{Binding Album.ReleaseDateFormatted}"
+                       FontSize="13"
+                       Opacity="0.45"
+                       IsVisible="{Binding Album.HasReleaseDate}" />
+            <TextBlock FontSize="13" Opacity="0.45">
+                <TextBlock.Text>
+                    <MultiBinding Converter="{x:Static helpers:AlbumFacts.SongsAndLength}">
+                        <Binding Path="Album.TrackCount" />
+                        <Binding Path="Album.TotalDurationFormatted" />
+                        <!-- Not read by the converter: re-runs it when the language switches live. -->
+                        <Binding Source="{x:Static loc:Loc.Instance}" Path="[AlbumDetail.FooterSongs]" />
+                    </MultiBinding>
+                </TextBlock.Text>
+            </TextBlock>
+            <TextBlock Text="{Binding Album.Copyright}"
+                       FontSize="13"
+                       Opacity="0.45"
+                       TextWrapping="Wrap"
+                       IsVisible="{Binding Album.HasCopyright}" />
+        </StackPanel>
+
+        <!-- Track list (scrolls with the header above; fills the block between header and footer) -->
+        <StackPanel Margin="10,0,16,0" VerticalAlignment="Top">
+        <ItemsControl ItemsSource="{Binding DiscGroups}" x:Name="DiscGroupList">
+            <ItemsControl.ItemTemplate>
+                <DataTemplate x:DataType="vm:DiscGroup">
+                    <StackPanel>
+                        <TextBlock Text="{Binding Header}"
+                                   FontSize="17" FontWeight="Bold"
+                                   Margin="0,18,0,6"
+                                   Foreground="{Binding $parent[UserControl].((vm:AlbumDetailViewModel)DataContext).PageForegroundBrush}"
+                                   IsVisible="{Binding $parent[UserControl].((vm:AlbumDetailViewModel)DataContext).HasMultipleDiscs}" />
+                        <ListBox Classes="track-list"
+                                 ItemsSource="{Binding Tracks}"
+                                 Foreground="{Binding $parent[UserControl].((vm:AlbumDetailViewModel)DataContext).PageForegroundBrush}"
+                                 ScrollViewer.VerticalScrollBarVisibility="Disabled">
+            <!-- Non-virtualizing panel: this ListBox is nested inside an outer
+                 ScrollViewer (TrackScrollViewer), so VirtualizingStackPanel can't
+                 determine its viewport and produces inconsistent row heights as
+                 rows get realized/recycled during scroll. -->
+            <ListBox.ItemsPanel>
+                <ItemsPanelTemplate>
+                    <StackPanel />
+                </ItemsPanelTemplate>
+            </ListBox.ItemsPanel>
+            <ListBox.ItemTemplate>
+                <DataTemplate x:DataType="m:Track">
+                    <Border Classes="row-body" Classes.now-playing="{Binding IsNowPlaying}">
+                    <Grid ColumnDefinitions="32,*,Auto" Background="Transparent"
+                          helpers:DragFileBehavior.EnableFileDrag="True"
+                          Tag="{Binding}">
+
+
+                        <!-- Track number, replaced by EQ visualizer when this row is the current track -->
+                        <Panel Grid.Column="0"
+                               HorizontalAlignment="Right"
+                               Margin="0,0,10,0"
+                               VerticalAlignment="Center">
+                            <!-- Only visible on the now-playing row, so the bars take the row
+                                 foreground from Styles.axaml. No local Foreground here: a local
+                                 value beats every style setter and would pin the bars to one
+                                 colour regardless of the accent. -->
+                            <controls:EqVisualizer x:Name="RowEq"
+                                                    Width="34" Height="22"
+                                                    HorizontalAlignment="Right"
+                                                    VerticalAlignment="Center"
+                                                    Margin="0,0,-10,0"
+                                                    IsPlaying="{Binding $parent[UserControl].((vm:AlbumDetailViewModel)DataContext).IsPlayerPlaying, Mode=OneWay}">
+                                <controls:EqVisualizer.IsVisible>
+                                    <MultiBinding Converter="{StaticResource GuidEquals}" Mode="OneWay">
+                                        <Binding Path="Id" />
+                                        <Binding Path="$parent[UserControl].((vm:AlbumDetailViewModel)DataContext).CurrentPlayingTrackId" />
+                                    </MultiBinding>
+                                </controls:EqVisualizer.IsVisible>
+                            </controls:EqVisualizer>
+                            <TextBlock Text="{Binding TrackNumber}"
+                                       Opacity="0.5"
+                                       FontSize="14"
+                                       HorizontalAlignment="Right"
+                                       VerticalAlignment="Center"
+                                       IsVisible="{Binding !#RowEq.IsVisible}" />
+                        </Panel>
+
+                        <!-- Title + artist + explicit badge -->
+                        <StackPanel Grid.Column="1"
+                                    Orientation="Vertical"
+                                    Spacing="2"
+                                    Margin="2,0,0,0"
+                                    VerticalAlignment="Center">
+                            <Grid ColumnDefinitions="Auto,Auto">
+                                <TextBlock Grid.Column="0"
+                                           Classes="one-line-explicit-title"
+                                           Text="{Binding TitleDisplay}"
+                                           FontSize="15"
+                                           MaxWidth="600" />
+                                <Border Grid.Column="1"
+                                        Classes="explicit-badge compact"
+                                        Margin="6,0,0,0"
+                                        IsVisible="{Binding IsExplicit}"
+                                        ToolTip.Tip="{loc:T AlbumDetail.ExplicitTip}">
+                                    <TextBlock Text="E"
+                                               Classes="explicit-badge-text compact"
+                                               FontSize="8"
+                                               Opacity="0.9" />
+                                </Border>
+                            </Grid>
+                            <!-- Track artist subtitle: each credited name opens its artist page
+                                 (ArtistCreditLink; Discord Luwi 2026-10-03). -->
+                            <Button Classes="track-artist-link"
+                                    AutomationProperties.Name="{Binding ArtistDisplay}"
+                                    Background="Transparent" BorderThickness="0" Padding="0" MinHeight="0"
+                                    Cursor="Hand" HorizontalAlignment="Left"
+                                    IsVisible="{Binding ShouldShowArtistSubtitleInAlbum}"
+                                    helpers:ArtistCreditLink.IsEnabled="True"
+                                    Command="{Binding $parent[UserControl].((vm:AlbumDetailViewModel)DataContext).ViewArtistFromTrackCommand}"
+                                    CommandParameter="{Binding Artist}">
+                                <TextBlock Text="{Binding ArtistDisplay}"
+                                           FontSize="13"
+                                           Opacity="0.6"
+                                           TextTrimming="CharacterEllipsis"
+                                           MaxLines="1" />
+                            </Button>
+                        </StackPanel>
+
+                        <!-- Stars + Heart + Duration + Track options (column 2, fixed-width grid for alignment) -->
+                        <Grid Grid.Column="2"
+                              ColumnDefinitions="Auto,22,52,44"
+                              VerticalAlignment="Center"
+                              Margin="0,0,10,0">
+                            <!-- Col 0: rating stars (collapsed when unrated) -->
+                            <!-- Click-to-rate (see LibrarySongsView): revealed on row hover, always on once rated. -->
+                            <controls:RatingStars Grid.Column="0"
+                                                  Value="{Binding Rating}"
+                                                  Classes="row-rating"
+                                                  Classes.rated="{Binding !!Rating}"
+                                                  StarSize="11"
+                                                  StarSpacing="2"
+                                                  IsInteractive="True"
+                                                  Cursor="Hand"
+                                                  UserRated="OnRowRated"
+                                                  Margin="0,0,8,0"
+                                                  VerticalAlignment="Center" />
+                            <!-- Col 1: heart — always 22px wide so duration never shifts.
+                                 Shown for every track including a single's one track: the
+                                 metadata-row heart was treated as covering that case, which
+                                 left a favorited single as the only row in the app with no
+                                 heart on it. -->
+                            <Panel Grid.Column="1">
+                                <controls:HeartIcon Size="14" ShowWhenOff="False"
+                                    HorizontalAlignment="Center" VerticalAlignment="Center"
+                                    IsFavorite="{Binding IsFavorite}"/>
+                            </Panel>
+                            <!-- Col 2: duration — fixed 52px, right-aligned for perfect column -->
+                            <TextBlock Grid.Column="2"
+                                       Text="{Binding DurationFormatted}"
+                                       FontSize="14"
+                                       Opacity="0.5"
+                                       FontFeatures="+tnum"
+                                       HorizontalAlignment="Right"
+                                       VerticalAlignment="Center"/>
+                            <!-- Col 3: 3-dot button — fixed 44px -->
+                            <Button Grid.Column="3"
+                                    Classes="row-more-dots"
+                                    Background="Transparent"
+                                    BorderThickness="0"
+                                    Padding="0"
+                                    Width="28" Height="28"
+                                    HorizontalAlignment="Center"
+                                    VerticalAlignment="Center"
+                                    Cursor="Hand"
+                                    ToolTip.Tip="{loc:T AlbumDetail.OptionsTip}"
+                                    Click="OnTrackOptionsButtonClick"
+                                    Tag="{Binding}">
+                                <PathIcon Classes="row-dots-icon"
+                                          Data="{StaticResource MoreDotsIcon}"
+                                          Width="14" Height="14"
+                                          HorizontalAlignment="Center"
+                                          VerticalAlignment="Center" />
+                            </Button>
+                        </Grid>
+                    </Grid>
+                    </Border>
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+                        </ListBox>
+                    </StackPanel>
+                </DataTemplate>
+            </ItemsControl.ItemTemplate>
+        </ItemsControl>
+        </StackPanel>
+        </DockPanel>
+        </Grid>
+
+        <!-- Related sections: app background, theme foreground (not the tint's) — unless
+             the tint covers the whole page, then the .page-tint class gives their text the
+             page colour. -->
+        <!-- Carries the player-bar clearance itself when shown; hidden when empty so an
+             album with no related rows ends on its (padded) coloured block. -->
+        <StackPanel x:Name="RelatedSections" Grid.Row="1" Margin="10,0,16,115">
+            <StackPanel.IsVisible>
+                <MultiBinding Converter="{x:Static BoolConverters.Or}">
+                    <Binding Path="HasOtherVersions" />
+                    <Binding Path="HasMoreByArtist" />
+                </MultiBinding>
+            </StackPanel.IsVisible>
+
+        <!-- Other Versions: same artist, normalized base title (Deluxe/Explicit/Clean/Remaster/etc.) -->
+        <!-- No Spacing: the 10px gap rides inside the fold (body Margin) so it can't snap on close. -->
+        <StackPanel Margin="0,28,0,0"
+                    IsVisible="{Binding HasOtherVersions}">
+            <Button Classes="section-toggle" Classes.expanded="{Binding IsOtherVersionsExpanded}"
+                    Command="{Binding ToggleOtherVersionsSectionCommand}"
+                    AutomationProperties.Name="{loc:T AlbumDetail.OtherVersions}">
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <TextBlock Text="{loc:T AlbumDetail.OtherVersions}"
+                               Classes="page-text"
+                               FontSize="20"
+                               FontWeight="Bold"
+                               VerticalAlignment="Center" />
+                    <Border Classes="section-chevron-box">
+                        <Path Classes="section-chevron page-text"
+                              Width="28" Height="28"
+                              Data="M 9,11.5 L 14,16.5 L 19,11.5"
+                              StrokeThickness="1.8" StrokeLineCap="Round" StrokeJoin="Round" />
+                    </Border>
+                </StackPanel>
+            </Button>
+            <controls:CollapsibleContent IsOpen="{Binding IsOtherVersionsExpanded}" Lift="10" Motion="Glide">
+            <Grid Margin="0,10,0,0">
+            <ScrollViewer x:Name="OtherVersionsScroll"
+                          HorizontalScrollBarVisibility="Hidden"
+                          VerticalScrollBarVisibility="Disabled">
+                <ItemsControl ItemsSource="{Binding OtherVersions}">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <StackPanel Orientation="Horizontal" Spacing="14" />
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="m:Album">
+                            <Button Classes="album-tile related-album-tile"
+                                    AutomationProperties.Name="{Binding Name}"
+                                    Background="Transparent"
+                                    BorderThickness="0"
+                                    Padding="0"
+                                    Cursor="Hand"
+                                    Width="220"
+                                    VerticalAlignment="Top"
+                                    HorizontalContentAlignment="Stretch"
+                                    VerticalContentAlignment="Top"
+                                    Command="{Binding $parent[UserControl].((vm:AlbumDetailViewModel)DataContext).OpenRelatedAlbumCommand}"
+                                    CommandParameter="{Binding}"
+                                    ContextRequested="OnRelatedAlbumContextRequested">
+                                <!-- Right-click / dots: one shared v2 menu built in code (OnRelatedAlbumContextRequested). -->
+                                <StackPanel Spacing="6" VerticalAlignment="Top">
+                                    <Border Width="220" Height="220"
+                                            CornerRadius="6"
+                                            ClipToBounds="True"
+                                            Background="#1AFFFFFF">
+                                        <Panel>
+                                            <TextBlock Text="{loc:T AlbumDetail.Text}"
+                                                       FontSize="40"
+                                                       HorizontalAlignment="Center"
+                                                       VerticalAlignment="Center"
+                                                       Opacity="0.15"
+                                                       IsVisible="{Binding ArtworkPath, Converter={x:Static StringConverters.IsNullOrEmpty}}" />
+                                            <controls:CachedImage SourcePath="{Binding ArtworkPath}"
+                                                                  Stretch="UniformToFill"
+                                                                  RenderOptions.BitmapInterpolationMode="HighQuality"
+                                                                  IsVisible="{Binding ArtworkPath, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                                            <!-- Hover overlay: same dim + Play/Pause + dots as the Albums grid; styles in Styles.axaml -->
+                                            <Border Classes="tile-dim" />
+                                            <Button Classes="tile-play"
+                                                    Command="{Binding $parent[UserControl].((vm:AlbumDetailViewModel)DataContext).TogglePlayRelatedAlbumCommand}"
+                                                    CommandParameter="{Binding}">
+                                                <Panel>
+                                                    <Viewbox Width="12" Height="12" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="1,0,0,0" IsVisible="{Binding !IsNowPlaying}"><Path Data="{StaticResource PlayIcon}" Fill="White" /></Viewbox>
+                                                    <Viewbox Width="12" Height="12" HorizontalAlignment="Center" VerticalAlignment="Center" IsVisible="{Binding IsNowPlaying}"><Path Data="{StaticResource PauseIcon}" Fill="White" /></Viewbox>
+                                                </Panel>
+                                            </Button>
+                                            <Button Classes="tile-more" Click="OnTileMoreClick">
+                                                <Viewbox Width="14" Height="14" HorizontalAlignment="Center" VerticalAlignment="Center"><Path Data="{StaticResource MoreDotsIcon}" Fill="White" /></Viewbox>
+                                            </Button>
+                                        </Panel>
+                                    </Border>
+                                    <TextBlock Classes="page-text"
+                                               FontSize="13"
+                                               FontWeight="SemiBold"
+                                               TextWrapping="NoWrap"
+                                               MaxLines="1"
+                                               TextTrimming="CharacterEllipsis"
+                                               MaxWidth="200"
+                                               HorizontalAlignment="Left"
+                                               VerticalAlignment="Top">
+                                        <Run Text="{Binding Name}" />
+                                        <InlineUIContainer BaselineAlignment="Center">
+                                            <Border Classes="explicit-badge compact"
+                                                    Margin="4,0,0,0"
+                                                    IsVisible="{Binding IsExplicit}"
+                                                    ToolTip.Tip="{loc:T AlbumDetail.ExplicitTip}">
+                                                <TextBlock Text="E"
+                                                           Classes="explicit-badge-text compact"
+                                                           FontSize="8"
+                                                           Opacity="0.9" />
+                                            </Border>
+                                        </InlineUIContainer>
+                                    </TextBlock>
+                                    <TextBlock Classes="page-text"
+                                               FontSize="12"
+                                               Opacity="0.55"
+                                               Width="220"
+                                               HorizontalAlignment="Left"
+                                               TextTrimming="CharacterEllipsis"
+                                               Text="{Binding YearSongsLine}" />
+                                </StackPanel>
+                            </Button>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </ScrollViewer>
+            <Button x:Name="OtherVersionsLeft"
+                    AutomationProperties.Name="{loc:T A11y.ScrollLeft}"
+                    Classes="hscroll-arrow"
+                    HorizontalAlignment="Left"
+                    VerticalAlignment="Center"
+                    Margin="6,0,0,30"
+                    Click="OnOtherVersionsLeftClick"
+                    IsVisible="False">
+                <PathIcon Data="{StaticResource ChevronLeftIcon}"
+                          Width="11" Height="11"
+                          Margin="-1,0,0,0"
+                          Foreground="White" />
+            </Button>
+            <Button x:Name="OtherVersionsRight"
+                    AutomationProperties.Name="{loc:T A11y.ScrollRight}"
+                    Classes="hscroll-arrow"
+                    HorizontalAlignment="Right"
+                    VerticalAlignment="Center"
+                    Margin="0,0,6,30"
+                    Click="OnOtherVersionsRightClick"
+                    IsVisible="False">
+                <PathIcon Data="{StaticResource ChevronRightIcon}"
+                          Width="11" Height="11"
+                          Margin="1,0,0,0"
+                          Foreground="White" />
+            </Button>
+            </Grid>
+            </controls:CollapsibleContent>
+        </StackPanel>
+
+        <!-- More By {Artist}: up to 20 random albums by the same artist (excludes self + Other Versions) -->
+        <StackPanel Margin="0,28,0,0"
+                    IsVisible="{Binding HasMoreByArtist}">
+            <!-- The title folds the row (grey chevron box, like Other Versions and the sidebar
+                 folders, owner ask 10-05); "See discography" on the right opens the artist page.
+                 This replaces the 09-03 plain header (Discord: the old bare chevron read as a
+                 mystery button) with the boxed, rotating one used everywhere else. -->
+            <Grid ColumnDefinitions="*,Auto" Margin="0,0,16,0">
+                <Button Grid.Column="0" Classes="section-toggle" Classes.expanded="{Binding IsMoreByExpanded}"
+                        Command="{Binding ToggleMoreBySectionCommand}" VerticalAlignment="Center"
+                        AutomationProperties.Name="{Binding MoreByArtistTitle}">
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <TextBlock Classes="page-text"
+                                   Text="{Binding MoreByArtistTitle}"
+                                   FontSize="20"
+                                   FontWeight="Bold"
+                                   VerticalAlignment="Center" />
+                        <Border Classes="section-chevron-box">
+                            <Path Classes="section-chevron page-text"
+                                  Width="28" Height="28"
+                                  Data="M 9,11.5 L 14,16.5 L 19,11.5"
+                                  StrokeThickness="1.8" StrokeLineCap="Round" StrokeJoin="Round" />
+                        </Border>
+                    </StackPanel>
+                </Button>
+                <!-- Accent pill like the artist page's "See all" and the Play / Shuffle buttons. -->
+                <Button Grid.Column="1"
+                        Classes="accent-btn album-header-action see-discography"
+                        Background="{DynamicResource AccentButtonBackground}"
+                        Foreground="{DynamicResource AccentForegroundBrush}"
+                        CornerRadius="999"
+                        Padding="14,5"
+                        MinHeight="0"
+                        VerticalAlignment="Center"
+                        Cursor="Hand"
+                        Command="{Binding ViewArtistCommand}"
+                        ToolTip.Tip="{loc:T AlbumDetail.OpenArtistPageTip}">
+                    <TextBlock Text="{loc:T AlbumDetail.SeeDiscography}"
+                               FontSize="13"
+                               FontWeight="Bold" />
+                </Button>
+            </Grid>
+            <controls:CollapsibleContent IsOpen="{Binding IsMoreByExpanded}" Lift="10" Motion="Glide">
+            <Grid Margin="0,10,0,0">
+            <ScrollViewer x:Name="MoreByArtistScroll"
+                          HorizontalScrollBarVisibility="Hidden"
+                          VerticalScrollBarVisibility="Disabled">
+                <ItemsControl ItemsSource="{Binding MoreByArtist}">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <StackPanel Orientation="Horizontal" Spacing="14" />
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="m:Album">
+                            <Button Classes="album-tile related-album-tile"
+                                    AutomationProperties.Name="{Binding Name}"
+                                    Background="Transparent"
+                                    BorderThickness="0"
+                                    Padding="0"
+                                    Cursor="Hand"
+                                    Width="220"
+                                    VerticalAlignment="Top"
+                                    HorizontalContentAlignment="Stretch"
+                                    VerticalContentAlignment="Top"
+                                    Command="{Binding $parent[UserControl].((vm:AlbumDetailViewModel)DataContext).OpenRelatedAlbumCommand}"
+                                    CommandParameter="{Binding}"
+                                    ContextRequested="OnRelatedAlbumContextRequested">
+                                <!-- Right-click / dots: one shared v2 menu built in code (OnRelatedAlbumContextRequested). -->
+                                <StackPanel Spacing="6" VerticalAlignment="Top">
+                                    <Border Width="220" Height="220"
+                                            CornerRadius="6"
+                                            ClipToBounds="True"
+                                            Background="#1AFFFFFF">
+                                        <Panel>
+                                            <TextBlock Text="{loc:T AlbumDetail.Text}"
+                                                       FontSize="40"
+                                                       HorizontalAlignment="Center"
+                                                       VerticalAlignment="Center"
+                                                       Opacity="0.15"
+                                                       IsVisible="{Binding ArtworkPath, Converter={x:Static StringConverters.IsNullOrEmpty}}" />
+                                            <controls:CachedImage SourcePath="{Binding ArtworkPath}"
+                                                                  Stretch="UniformToFill"
+                                                                  RenderOptions.BitmapInterpolationMode="HighQuality"
+                                                                  IsVisible="{Binding ArtworkPath, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                                            <!-- Hover overlay: same dim + Play/Pause + dots as the Albums grid; styles in Styles.axaml -->
+                                            <Border Classes="tile-dim" />
+                                            <Button Classes="tile-play"
+                                                    Command="{Binding $parent[UserControl].((vm:AlbumDetailViewModel)DataContext).TogglePlayRelatedAlbumCommand}"
+                                                    CommandParameter="{Binding}">
+                                                <Panel>
+                                                    <Viewbox Width="12" Height="12" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="1,0,0,0" IsVisible="{Binding !IsNowPlaying}"><Path Data="{StaticResource PlayIcon}" Fill="White" /></Viewbox>
+                                                    <Viewbox Width="12" Height="12" HorizontalAlignment="Center" VerticalAlignment="Center" IsVisible="{Binding IsNowPlaying}"><Path Data="{StaticResource PauseIcon}" Fill="White" /></Viewbox>
+                                                </Panel>
+                                            </Button>
+                                            <Button Classes="tile-more" Click="OnTileMoreClick">
+                                                <Viewbox Width="14" Height="14" HorizontalAlignment="Center" VerticalAlignment="Center"><Path Data="{StaticResource MoreDotsIcon}" Fill="White" /></Viewbox>
+                                            </Button>
+                                        </Panel>
+                                    </Border>
+                                    <TextBlock Classes="page-text"
+                                               FontSize="13"
+                                               FontWeight="SemiBold"
+                                               TextWrapping="NoWrap"
+                                               MaxLines="1"
+                                               TextTrimming="CharacterEllipsis"
+                                               MaxWidth="200"
+                                               HorizontalAlignment="Left"
+                                               VerticalAlignment="Top">
+                                        <Run Text="{Binding Name}" />
+                                        <InlineUIContainer BaselineAlignment="Center">
+                                            <Border Classes="explicit-badge compact"
+                                                    Margin="4,0,0,0"
+                                                    IsVisible="{Binding IsExplicit}"
+                                                    ToolTip.Tip="{loc:T AlbumDetail.ExplicitTip}">
+                                                <TextBlock Text="E"
+                                                           Classes="explicit-badge-text compact"
+                                                           FontSize="8"
+                                                           Opacity="0.9" />
+                                            </Border>
+                                        </InlineUIContainer>
+                                    </TextBlock>
+                                    <TextBlock Classes="page-text"
+                                               FontSize="12"
+                                               Opacity="0.55"
+                                               Width="220"
+                                               HorizontalAlignment="Left"
+                                               TextTrimming="CharacterEllipsis"
+                                               Text="{Binding YearSongsLine}" />
+                                </StackPanel>
+                            </Button>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </ScrollViewer>
+            <Button x:Name="MoreByArtistLeft"
+                    AutomationProperties.Name="{loc:T A11y.ScrollLeft}"
+                    Classes="hscroll-arrow"
+                    HorizontalAlignment="Left"
+                    VerticalAlignment="Center"
+                    Margin="6,0,0,30"
+                    Click="OnMoreByArtistLeftClick"
+                    IsVisible="False">
+                <PathIcon Data="{StaticResource ChevronLeftIcon}"
+                          Width="11" Height="11"
+                          Margin="-1,0,0,0"
+                          Foreground="White" />
+            </Button>
+            <Button x:Name="MoreByArtistRight"
+                    AutomationProperties.Name="{loc:T A11y.ScrollRight}"
+                    Classes="hscroll-arrow"
+                    HorizontalAlignment="Right"
+                    VerticalAlignment="Center"
+                    Margin="0,0,6,30"
+                    Click="OnMoreByArtistRightClick"
+                    IsVisible="False">
+                <PathIcon Data="{StaticResource ChevronRightIcon}"
+                          Width="11" Height="11"
+                          Margin="1,0,0,0"
+                          Foreground="White" />
+            </Button>
+            </Grid>
+            </controls:CollapsibleContent>
+        </StackPanel>
+
+        </StackPanel>
+
+    </Grid>
+    </ScrollViewer>
+
+    <!-- Album description popup is now shown via AlbumDescriptionDialog window -->
+    </Grid>
+
+</UserControl>

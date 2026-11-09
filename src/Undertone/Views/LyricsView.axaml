@@ -1,0 +1,1485 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:loc="using:Undertone.Localization"
+             xmlns:vm="using:Undertone.ViewModels"
+             xmlns:m="using:Undertone.Models"
+             xmlns:conv="using:Undertone.Converters"
+             xmlns:controls="using:Undertone.Controls"
+             xmlns:views="using:Undertone.Views"
+             xmlns:helpers="using:Undertone.Helpers"
+             x:Class="Undertone.Views.LyricsView"
+             x:DataType="vm:LyricsViewModel"
+             x:Name="LyricsRoot"
+             Background="Transparent">
+
+    <UserControl.Resources>
+        <conv:ArtworkPathConverter x:Key="ArtworkConverter"/>
+        <conv:EmphasisGlowConverter x:Key="EmphasisGlow"/>
+        <conv:EmphasisGlowBlurConverter x:Key="EmphasisGlowBlur"/>
+        <conv:WordOverflowPaddingConverter x:Key="WordOverflowPad"/>
+        <conv:BlurRadiusToEffectConverter x:Key="BlurToEffect"/>
+        <conv:PreBlurredArtworkConverter x:Key="PreBlurArt"/>
+        <conv:MetadataLineConverter x:Key="MetadataLine"/>
+        <conv:DoubleScaleConverter x:Key="FontScale"/>
+        <conv:InterludeDotOpacityConverter x:Key="InterludeDot"/>
+
+        <!-- Duet layout (ELRC v1:/v2:/v3: voice markers): voice 2 lines anchor right,
+             group lines center. Same keys exist in LyricsPanelView — keep in sync. -->
+        <conv:LyricVoiceToAlignmentConverter x:Key="VoiceAlign"/>
+        <conv:LyricLineAlignmentConverter x:Key="LyricLineAlign"/>
+        <conv:LyricVoiceToTextAlignmentConverter x:Key="VoiceTextAlign"/>
+        <conv:LyricVoiceToItemsAlignmentConverter x:Key="VoiceItemsAlign"/>
+        <conv:LyricVoiceToTransformOriginConverter x:Key="VoiceOrigin"/>
+        <conv:DuetMinWidthConverter x:Key="DuetMinWidth"/>
+
+        <!-- Shared karaoke word cell (held-note glow / swept word), used by the
+             main word layer and the background-vocal (adlib) layer below it. -->
+        <DataTemplate x:Key="WordCellTemplate" x:DataType="m:WordTiming">
+            <Panel Classes="word-cell"
+                   Classes.current="{Binding IsCurrent}"
+                   Classes.emphasis="{Binding IsEmphasis}">
+                <!-- DownOnly viewbox: a merged melisma word ("No-o-o-o-…") can outgrow
+                     the line MaxWidth, and a WrapPanel cell can't break mid-word — the
+                     overflow ran past the line box and was hard-clipped by the button
+                     (ClipToBounds, see lyric-line-btn). Scaling the whole cell down
+                     keeps glow/base/sweep pixel-aligned; words that fit the constraint
+                     render 1:1 as before. -->
+                <Viewbox Stretch="Uniform" StretchDirection="DownOnly" ClipToBounds="False">
+                <Panel>
+                <!-- Soft glow under held-note words: the sung part of the word only
+                     (BaseOpacity 0, same sweep, letter swell and float as the word on top),
+                     blurred by the word-glow style, opacity off the hold below.
+                     Hosted in a Canvas so its blur surface can be padded out for the
+                     gaussian tail WITHOUT growing the word cell (which would space words
+                     apart). A negative Margin does NOT work here: unlike WPF, Avalonia
+                     collapses the arrange bounds to the layout slot, so the padded
+                     headroom never reaches the effect surface and blur(6) clips into a
+                     hard box. The Canvas reports zero desired size and never clips; the
+                     glow's Padding gives the blur room and the matching negative offset
+                     re-aligns its glyphs onto the base layer. -->
+                <Canvas ClipToBounds="False">
+                    <controls:KaraokeWordText Text="{Binding Text}"
+                                              Classes="word-glow"
+                                              IsVisible="{Binding IsEmphasis}"
+                                              Canvas.Left="-60"
+                                              Canvas.Top="-60"
+                                              Padding="60"
+                                              FontWeight="Bold"
+                                              Foreground="{Binding $parent[UserControl].((vm:LyricsViewModel)DataContext).LyricsPrimaryFg}"
+                                              BaseOpacity="0"
+                                              Effect="{Binding $self.FontSize, Converter={StaticResource EmphasisGlowBlur}}"
+                                              Progress="{Binding Progress}"
+                                              LeadIn="{Binding SweepLeadIn}"
+                                              TrailOut="{Binding SweepTrailOut}"
+                                              IsEmphasis="{Binding IsEmphasis}"
+                                              EmphasisMs="{Binding EmphasisMs}"
+                                              HeldDurationMs="{Binding HeldDurationMs}"
+                                              IsLastInLine="{Binding IsLastInLine}"
+                                              Lift="{Binding Lift}"
+                                              RightToLeft="{Binding IsRightToLeft}">
+                        <!-- AMLL per-letter glow bells (mean over the word): they rise and
+                             release letter by letter across the hold, peak scaled by hold
+                             length. Driven per frame off the word's EmphasisMs clock. -->
+                        <controls:KaraokeWordText.Opacity>
+                            <MultiBinding Converter="{StaticResource EmphasisGlow}">
+                                <Binding Path="EmphasisMs"/>
+                                <Binding Path="HeldDurationMs"/>
+                                <Binding Path="IsLastInLine"/>
+                                <Binding Path="EmphasisCharCount"/>
+                            </MultiBinding>
+                        </controls:KaraokeWordText.Opacity>
+                    </controls:KaraokeWordText>
+                </Canvas>
+                <!-- The word: unsung text (full opacity while the line is inactive, a soft
+                     ghost while active — word-sweep styles) and sung text in one draw, split
+                     by the soft edge at Progress; held-note words swell and lift letter by
+                     letter (KaraokeWordText). Padding keeps the cell geometry the old base
+                     TextBlock had (WordOverflowPaddingConverter). -->
+                <controls:KaraokeWordText Text="{Binding Text}"
+                                          Classes="word-sweep"
+                                          Padding="{Binding Converter={StaticResource WordOverflowPad}}"
+                                          FontWeight="Bold"
+                                          Foreground="{Binding $parent[UserControl].((vm:LyricsViewModel)DataContext).LyricsPrimaryFg}"
+                                          Progress="{Binding Progress}"
+                                          LeadIn="{Binding SweepLeadIn}"
+                                          TrailOut="{Binding SweepTrailOut}"
+                                          IsEmphasis="{Binding IsEmphasis}"
+                                          EmphasisMs="{Binding EmphasisMs}"
+                                          HeldDurationMs="{Binding HeldDurationMs}"
+                                          IsLastInLine="{Binding IsLastInLine}"
+                                          Lift="{Binding Lift}"
+                                              RightToLeft="{Binding IsRightToLeft}"/>
+                </Panel>
+                </Viewbox>
+            </Panel>
+        </DataTemplate>
+        <!-- Adaptive button/slider brushes (updated from code-behind) -->
+        <SolidColorBrush x:Key="LyricsBtnBgRes" Color="#33FFFFFF"/>
+        <SolidColorBrush x:Key="LyricsBtnBgHoverRes" Color="#55FFFFFF"/>
+        <SolidColorBrush x:Key="LyricsSecBtnBgRes" Color="#22FFFFFF"/>
+        <SolidColorBrush x:Key="LyricsSecBtnBgHoverRes" Color="#33FFFFFF"/>
+    </UserControl.Resources>
+
+    <UserControl.Styles>
+        <!-- Explicit badge -->
+        <Style Selector="Border.lyrics-explicit">
+            <Setter Property="Background" Value="#88888888"/>
+            <Setter Property="CornerRadius" Value="2"/>
+            <Setter Property="Padding" Value="4,0"/>
+            <Setter Property="Height" Value="16"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+
+        <!-- Clickable text style -->
+        <Style Selector="Button.link-btn">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+        </Style>
+        <Style Selector="Button.link-btn:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="#22FFFFFF"/>
+            <Setter Property="Opacity" Value="0.7"/>
+        </Style>
+        <Style Selector="Button.link-btn:pressed /template/ ContentPresenter">
+            <Setter Property="Background" Value="#33FFFFFF"/>
+        </Style>
+        <Style Selector="Button.link-btn:pointerover">
+            <Setter Property="RenderTransform" Value="scale(1)"/>
+        </Style>
+
+        <!-- Play/Pause prominent button -->
+        <Style Selector="Button.lyrics-play-btn">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="CornerRadius" Value="24"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Opacity" Value="0.85"/>
+        </Style>
+        <Style Selector="Button.lyrics-play-btn:pointerover">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="RenderTransform" Value="scale(1)"/>
+        </Style>
+        <Style Selector="Button.lyrics-play-btn:pressed">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="RenderTransform" Value="scale(1)"/>
+        </Style>
+        <Style Selector="Button.lyrics-play-btn:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+        </Style>
+        <Style Selector="Button.lyrics-play-btn:pressed /template/ ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+        </Style>
+
+        <!-- Pill button style -->
+        <Style Selector="Button.pill-btn">
+            <Setter Property="Background" Value="{DynamicResource LyricsBtnBgRes}"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="16,8"/>
+            <Setter Property="CornerRadius" Value="18"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Cursor" Value="Hand"/>
+        </Style>
+        <Style Selector="Button.pill-btn:pointerover">
+            <Setter Property="Background" Value="{DynamicResource LyricsBtnBgHoverRes}"/>
+        </Style>
+        <!-- The lrc.red sync pill is disabled while its model runs: it keeps its look and only
+             its label changes ("Timing every word…"), instead of Fluent's grey disabled box. -->
+        <Style Selector="Button.lrcred-sync:disabled /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="{DynamicResource LyricsBtnBgRes}"/>
+        </Style>
+
+        <!-- Audio / Video switch (music video): a two-segment frosted pill; the chosen side is
+             filled and full-strength, the other one recedes. -->
+        <Style Selector="Button.mv-seg">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="16,6"/>
+            <Setter Property="MinWidth" Value="64"/>
+            <Setter Property="CornerRadius" Value="999"/>
+            <Setter Property="FontSize" Value="12.5"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="HorizontalContentAlignment" Value="Center"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Opacity" Value="0.6"/>
+        </Style>
+        <Style Selector="Button.mv-seg:pointerover">
+            <Setter Property="Opacity" Value="0.85"/>
+        </Style>
+        <Style Selector="Button.mv-seg:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="White"/>
+        </Style>
+        <Style Selector="Button.mv-seg.on">
+            <Setter Property="Opacity" Value="1"/>
+            <Setter Property="Background" Value="{DynamicResource LyricsBtnBgHoverRes}"/>
+        </Style>
+        <Style Selector="Button.mv-seg.on:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="{DynamicResource LyricsBtnBgHoverRes}"/>
+        </Style>
+
+        <!-- Color picker circle button -->
+        <Style Selector="Button.icon-circle-btn">
+            <Setter Property="Background" Value="{DynamicResource LyricsBtnBgRes}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="Width" Value="32"/>
+            <Setter Property="Height" Value="32"/>
+            <Setter Property="CornerRadius" Value="16"/>
+            <Setter Property="Cursor" Value="Hand"/>
+        </Style>
+        <Style Selector="Button.icon-circle-btn:pointerover">
+            <Setter Property="Background" Value="{DynamicResource LyricsBtnBgHoverRes}"/>
+        </Style>
+
+        <!-- Secondary control button (bottom row) -->
+        <Style Selector="Button.lyrics-secondary-btn">
+            <Setter Property="Background" Value="{DynamicResource LyricsSecBtnBgRes}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="CornerRadius" Value="14"/>
+            <Setter Property="Padding" Value="12,6"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Foreground" Value="#BBBBBB"/>
+            <Setter Property="FontSize" Value="12"/>
+        </Style>
+        <Style Selector="Button.lyrics-secondary-btn:pointerover">
+            <Setter Property="Background" Value="{DynamicResource LyricsSecBtnBgHoverRes}"/>
+        </Style>
+
+        <!-- AMLL-style active-line presentation: inactive lines sit at 0.96× and the
+             active line grows to natural size (same visual zoom as scaling up, but
+             nothing ever renders outside its layout bounds, so the viewport can't
+             clip the grown line at the right edge). Origin pinned to the left edge
+             so text grows in place instead of drifting. No translate: the active
+             line used to lift 2px as well, which read as the lyric hopping up while
+             it was sung. -->
+        <Style Selector="Button.lyric-line-btn">
+            <Setter Property="RenderTransformOrigin" Value="0,0.5"/>
+            <Setter Property="RenderTransform" Value="scale(0.96)"/>
+            <!-- Button defaults to ClipToBounds=True, which hard-clips anything the
+                 word layer renders past the line's layout box: the emphasis swell
+                 (1.04, centre origin) nibbled edge glyphs of full-width melisma words
+                 and the held-note glow spill got boxed. Verified via headless render:
+                 the button is the clipper, not the ScrollViewer or OpacityMask. -->
+            <Setter Property="ClipToBounds" Value="False"/>
+            <Setter Property="Transitions">
+                <Transitions>
+                    <!-- Same curve and length as the scroll glide (LineMotion): the line
+                         grows WHILE the list moves, one motion — a faster spring here
+                         popped the line to full size before the glide had visibly
+                         started. Duration is pinned to LineMotion.DurationMs by test. -->
+                    <TransformOperationsTransition Property="RenderTransform" Duration="0:0:1">
+                        <TransformOperationsTransition.Easing>
+                            <helpers:LineMotionEase/>
+                        </TransformOperationsTransition.Easing>
+                    </TransformOperationsTransition>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.5" Easing="CubicEaseInOut"/>
+                    <!-- Depth blur eases instead of snapping: Apple Music's outgoing line
+                         blurs within ~100 ms of the glide starting, the incoming one
+                         sharpens along the glide (half-way ~160 ms). Ease-out lands
+                         between the two; a spring would overshoot the radius below 0. -->
+                    <EffectTransition Property="Effect" Duration="0:0:0.4" Easing="CubicEaseOut"/>
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Button.lyric-line-btn.active">
+            <Setter Property="RenderTransform" Value="scale(1)"/>
+        </Style>
+        <!-- No hover/press box on lyric lines: the line stays clickable (Cursor=Hand
+             on the button) but reads as text, not as a button. -->
+        <Style Selector="Button.lyric-line-btn:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+        </Style>
+        <Style Selector="Button.lyric-line-btn:pressed /template/ ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+        </Style>
+        <!-- Suppress global hover-scale on lyric lines (match the resting transforms). -->
+        <Style Selector="ItemsControl#LyricsItemsControl Button:pointerover">
+            <Setter Property="RenderTransform" Value="scale(0.96)"/>
+        </Style>
+        <Style Selector="ItemsControl#LyricsItemsControl Button.lyric-line-btn.active:pointerover">
+            <Setter Property="RenderTransform" Value="scale(1)"/>
+        </Style>
+
+        <!-- No transform on the cell: every sung word floats up inside KaraokeWordText
+             (Lift, a smooth ~1 s ease-out per word, as in Apple Music) and held notes
+             swell letter by letter there. (Cells used to lift 1px and grow 1% through
+             transitions, a chain of small hops on every fast passage.) -->
+        <Style Selector="Panel.word-cell">
+            <Setter Property="RenderTransformOrigin" Value="0.5,1"/>
+            <Setter Property="RenderTransform" Value="translate(0px,0px) scale(1)"/>
+        </Style>
+
+        <!-- Glow opacity (per frame) and blur (per font size) are bound in the template (EmphasisGlowConverter
+             bell over the hold). No Opacity setter or transition here: a transition
+             would low-pass the per-frame values and lag the vocal. -->
+
+        <!-- Word base layer: full brightness on inactive lines (matches plain line text),
+             fades to a soft ghost while the line is active so the sweep reads on top. The
+             word layers' "active" class is IsSweepFocused: also on while the list leads
+             into the line, which already sits at full line opacity then. -->
+        <Style Selector="ItemsControl.word-layer TextBlock.word-sweep">
+            <Setter Property="controls:KaraokeWordText.BaseOpacity" Value="1.0"/>
+            <Setter Property="Transitions">
+                <Transitions>
+                    <DoubleTransition Property="controls:KaraokeWordText.BaseOpacity" Duration="0:0:0.35" Easing="CubicEaseInOut"/>
+                </Transitions>
+            </Setter>
+        </Style>
+        <!-- 0.4: Apple Music's unsung text measured at ~41% white over the backdrop. -->
+        <Style Selector="ItemsControl.word-layer.active TextBlock.word-sweep">
+            <Setter Property="controls:KaraokeWordText.BaseOpacity" Value="0.4"/>
+        </Style>
+
+        <!-- Lyric line: keep active emphasis in opacity/color only, without size/position zoom. -->
+        <Style Selector="TextBlock.lyric-line">
+            <Setter Property="Transitions">
+                <Transitions>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.5" Easing="CubicEaseInOut"/>
+                </Transitions>
+            </Setter>
+        </Style>
+
+        <!-- Lyrics scrollbar -->
+        <Style Selector="ScrollViewer#LyricsScrollViewer /template/ ScrollBar:vertical">
+            <Setter Property="Width" Value="6"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Margin" Value="0,8,3,8"/>
+        </Style>
+        <Style Selector="ScrollViewer#LyricsScrollViewer /template/ ScrollBar:vertical /template/ Border">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+        </Style>
+        <Style Selector="ScrollViewer#LyricsScrollViewer /template/ ScrollBar:vertical /template/ Thumb">
+            <Setter Property="Background" Value="#33FFFFFF"/>
+            <Setter Property="CornerRadius" Value="3"/>
+            <Setter Property="Width" Value="5"/>
+            <Setter Property="MinHeight" Value="24"/>
+        </Style>
+        <Style Selector="ScrollViewer#LyricsScrollViewer /template/ ScrollBar:vertical /template/ Thumb:pointerover">
+            <Setter Property="Background" Value="#66FFFFFF"/>
+        </Style>
+        <Style Selector="ScrollViewer#LyricsScrollViewer /template/ ScrollBar:vertical /template/ RepeatButton">
+            <Setter Property="IsVisible" Value="False"/>
+            <Setter Property="Height" Value="0"/>
+        </Style>
+        <Style Selector="ScrollViewer#LyricsScrollViewer /template/ ScrollBar:vertical /template/ Rectangle">
+            <Setter Property="IsVisible" Value="False"/>
+        </Style>
+
+        <!-- Karaoke word styles (Lyricsfile word-level sync) -->
+        <Style Selector="TextBlock.word">
+            <Setter Property="Opacity" Value="0.55"/>
+            <Setter Property="Transitions">
+                <Transitions>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.22" Easing="CubicEaseOut"/>
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="TextBlock.word.past">
+            <Setter Property="Opacity" Value="1.0"/>
+        </Style>
+        <Style Selector="TextBlock.word.current">
+            <!-- Base layer goes invisible while the accent overlay renders on top. -->
+            <Setter Property="Opacity" Value="0.0"/>
+        </Style>
+        <Style Selector="TextBlock.word-accent">
+            <Setter Property="Opacity" Value="0"/>
+            <Setter Property="Transitions">
+                <Transitions>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.18" Easing="CubicEaseOut"/>
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="TextBlock.word-accent.current">
+            <Setter Property="Opacity" Value="1.0"/>
+        </Style>
+
+        <Style Selector="Slider.lyrics-timeline-slider">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="{Binding LyricsSliderFilled}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Height" Value="24"/>
+            <Setter Property="Opacity" Value="0"/>
+            <Setter Property="Template">
+                <ControlTemplate>
+                    <Border Background="Transparent"/>
+                </ControlTemplate>
+            </Setter>
+        </Style>
+    </UserControl.Styles>
+
+    <!-- Row/column definitions are fixed; wide vs narrow mode is expressed purely
+         through Grid.Row/Column/Span attached properties from code-behind. -->
+    <Grid x:Name="MainLayoutGrid" ColumnDefinitions="*,*" RowDefinitions="Auto,*"
+          Background="{Binding FullBackgroundBrush}">
+        <!-- AMLL/Apple-Music–style background: heavily-blurred album cover filling the page.
+             A subtle scrim on top keeps lyric text legible against bright art. -->
+        <Grid x:Name="LyricsBlurBackdrop"
+              Grid.ColumnSpan="2"
+              Grid.RowSpan="2"
+              ZIndex="-1"
+              ClipToBounds="True"
+              IsHitTestVisible="False"
+              IsVisible="{Binding IsColorModeArtwork}">
+            <!-- Pre-blurred ONCE per artwork (PreBlurredArtworkConverter): a live
+                 BlurEffect here was re-executed every rendered frame, and during the
+                 line-change scroll glide two stacked fullscreen radius-72 gaussians
+                 dropped the whole page to ~25fps on software rendering / weak GPUs
+                 (issue #11). Player.AlbumArt (the mini-player's in-memory 768px
+                 bitmap) paints synchronously on page mount, and after this much blur
+                 a higher-res source adds nothing — so the old hi-res CachedImage
+                 layer is gone entirely. -->
+            <!-- Pulse host: FlowingArtworkAnimator breathes this whole stack about its
+                 centre on every beat (BeatMeter) and drifts/rotates the two extra copies
+                 below, so the background keeps the artwork's own colours — the old
+                 palette-tinted blobs recoloured the whole page when the toggle went on. -->
+            <Panel x:Name="FlowBackdrop">
+                <Image x:Name="FlowBaseArt"
+                Stretch="UniformToFill"
+                RenderOptions.BitmapInterpolationMode="HighQuality"
+                IsVisible="{Binding Player.AlbumArt, Converter={x:Static ObjectConverters.IsNotNull}}">
+                <!-- Drift's Blur / Saturation knobs (GitHub #111) are baked into the same
+                     pre-blurred bitmap while the flowing background is on; the drifting
+                     copies below take this image's Source. -->
+                <Image.Source>
+                <MultiBinding Converter="{StaticResource PreBlurArt}">
+                    <Binding Path="Player.AlbumArt"/>
+                    <Binding Path="Player.LyricsFlowingLightEnabled"/>
+                    <Binding Path="Player.LyricsDriftBlur"/>
+                    <Binding Path="Player.LyricsDriftSaturation"/>
+                </MultiBinding>
+                </Image.Source>
+                <!-- Gentle outward scale so blur edges never reveal the underlying solid fill. -->
+                <Image.RenderTransform>
+                <ScaleTransform ScaleX="1.18" ScaleY="1.18"/>
+                </Image.RenderTransform>
+                </Image>
+                <!-- Flowing-artwork layer (issue #22): two more copies of the same
+                     pre-blurred cover slowly rotate in opposite directions over the static
+                     one. Transform/opacity only — no live blur, no layout, so a frame is a
+                     handful of property writes on the compositor's own clock. -->
+                <!-- Visibility is set from code-behind (UpdateFlowAnimationState): on only when the
+                     toggle is on AND the style is the built-in Drift — a plugin style replaces it. -->
+                <Panel x:Name="FlowLayerHost" IsHitTestVisible="False" IsVisible="False">
+                    <Image x:Name="FlowLayer1"
+                           Source="{Binding #FlowBaseArt.Source}"
+                           Stretch="UniformToFill"
+                           RenderOptions.BitmapInterpolationMode="HighQuality"
+                           Opacity="0.5"/>
+                    <Image x:Name="FlowLayer2"
+                           Source="{Binding #FlowBaseArt.Source}"
+                           Stretch="UniformToFill"
+                           RenderOptions.BitmapInterpolationMode="HighQuality"
+                           Opacity="0.36"/>
+                </Panel>
+            </Panel>
+            <!-- Beat glow: a white wash the animator lifts for a few frames on each beat. -->
+            <Rectangle x:Name="BeatGlow" Fill="White" Opacity="0" IsHitTestVisible="False" IsVisible="False"/>
+            <!-- Dark scrim: drops the cover's brightness so white lyrics stay readable.
+                 Kept strong enough that bright/near-white covers don't bleed a light
+                 halo around the title/artist/album text. -->
+            <Rectangle Fill="#99000000"/>
+        </Grid>
+
+        <!-- Optional looping video/GIF background (Settings → Appearance → Lyrics
+             Background Video). Sits over the artwork backdrop (same ZIndex, later in
+             document order) so the blurred cover stays visible until the first decoded
+             frame lands — no black flash. Its own scrim keeps the lyrics legible on
+             bright clips. Decoding runs only while this page is attached and the window
+             isn't minimized (VideoBackdrop). -->
+        <Grid x:Name="LyricsMediaBackdrop"
+              Grid.ColumnSpan="2"
+              Grid.RowSpan="2"
+              ZIndex="-1"
+              ClipToBounds="True"
+              IsHitTestVisible="False"
+              IsVisible="{Binding Player.ShowsLyricsBackgroundMedia}">
+            <controls:VideoBackdrop x:Name="MediaBackdrop"
+                                    Source="{Binding Player.LyricsBackgroundMediaPath}"
+                                    IsPaused="{Binding Player.LyricsBackgroundHoldsWhilePaused}"
+                                    IsActive="{Binding $self.IsVisible}" />
+            <Rectangle Fill="#8C000000"/>
+        </Grid>
+
+        <!-- Music video behind the lyrics (Settings → Lyrics Studio → Music videos → Behind
+             lyrics): the song's clip fills the page, muted, paused with the song and kept in
+             step with it (position, speed). Replaces the lyrics background video above while it
+             shows; code-behind parks the flowing layers below it. Decodes only while visible
+             and the window isn't minimized (VideoBackdrop). -->
+        <Grid x:Name="MusicVideoBackdropLayer"
+              Grid.ColumnSpan="2"
+              Grid.RowSpan="2"
+              ZIndex="-1"
+              ClipToBounds="True"
+              IsHitTestVisible="False"
+              IsVisible="{Binding Player.ShowsMusicVideoBackdrop}">
+            <controls:VideoBackdrop x:Name="MusicVideoBackdrop"
+                                    Source="{Binding Player.CurrentMusicVideoPath}"
+                                    SyncPosition="{Binding Player.MusicVideoSyncPosition}"
+                                    Rate="{Binding Player.PlaybackRate}"
+                                    IsPaused="{Binding !Player.IsPlaying}"
+                                    IsActive="{Binding $self.IsVisible}" />
+            <Rectangle Fill="#8C000000"/>
+        </Grid>
+
+        <!-- Kawarp (GitHub #58): built-in liquid warp of the cover, one of the Flowing Lyrics
+             Background styles. Code-behind (UpdateFlowAnimationState) shows/activates it in
+             place of the Drift layers; parked (no frame loop) otherwise. -->
+        <controls:KawarpBackground x:Name="KawarpLayer"
+                                   Grid.ColumnSpan="2"
+                                   Grid.RowSpan="2"
+                                   ZIndex="-1"
+                                   IsVisible="False"
+                                   ArtworkPath="{Binding Player.CurrentArtPath}"
+                                   WarpIntensity="{Binding Player.LyricsKawarpWarp}"
+                                   BlurPasses="{Binding Player.LyricsKawarpBlur}"/>
+
+        <!-- Plugin visual layer: the IVisualLayerProvider picked by Settings → Appearance →
+             Flowing Lyrics Background → Style, filled by code-behind (RebuildPluginLayers) only
+             while the toggle is on, the background is Artwork and no video covers the page; behind the lyrics,
+             above the backdrop. Empty (and its RAF loops stopped) otherwise. -->
+        <Panel x:Name="PluginLayerHost"
+               Grid.ColumnSpan="2"
+               Grid.RowSpan="2"
+               ZIndex="-1"
+               ClipToBounds="True"
+               IsHitTestVisible="False"/>
+
+        <!-- Live audio visualizer (Settings → Appearance → Audio Visualizer): the spectrum
+             of what is being heard, drawn along the bottom of the page over every background
+             mode (declared after Kawarp and the plugin host, which paint opaquely, so
+             it stays on top of them) and under the lyrics. Reads SpectrumMeter, which the output chains feed
+             from the same post-gain tap as the beat pulse; runs only while this page is
+             visible and the toggle is on (SpectrumVisualizer parks itself otherwise). -->
+        <controls:SpectrumVisualizer x:Name="LyricsSpectrum"
+                                     Grid.ColumnSpan="2"
+                                     Grid.RowSpan="2"
+                                     ZIndex="-1"
+                                     VerticalAlignment="Bottom"
+                                     Height="220"
+                                     Margin="24,0,24,0"
+                                     Opacity="0.55"
+                                     IsHitTestVisible="False"
+                                     Fill="White"
+                                     ArtworkColor="{Binding Player.ArtworkAccentColor}"
+                                     UseArtworkColor="{Binding Player.LyricsVisualizerArtworkColor}"
+                                     StyleName="{Binding Player.LyricsVisualizerStyle}"
+                                     IsActive="{Binding $self.IsVisible}"
+                                     IsVisible="{Binding Player.LyricsVisualizerEnabled}"/>
+
+
+        <!-- ══════════════════════════════════════════════════════ -->
+        <!-- LEFT PANEL: Cover Art + Track Info + Controls         -->
+        <!-- ══════════════════════════════════════════════════════ -->
+        <Border x:Name="LeftPanel"
+                Grid.Column="0"
+                Grid.RowSpan="2"
+                Background="Transparent"
+                Padding="48,42"
+                IsVisible="{Binding !Player.ShowsMusicVideoFullSize}">
+            <StackPanel x:Name="LeftContentStack" VerticalAlignment="Center"
+                        HorizontalAlignment="Center"
+                        ClipToBounds="False"
+                        Width="760">
+                <!-- No size transitions here: code-behind sizes the cover/stack/lyrics
+                     from the window on attach and resize, and any transition turned
+                     those instant layout snaps into a visible grow/zoom every time the
+                     page opened or the window was minimized/maximized. -->
+
+                <!-- Header: cover + track info. Wide mode stacks them (cover centered
+                     above the text); narrow mode flips to a compact row (small cover
+                     beside left-aligned text) via attached properties from code-behind,
+                     so the header never eats a short window's height. -->
+                <Grid x:Name="HeaderGrid" ColumnDefinitions="Auto,*" RowDefinitions="Auto,Auto">
+                <!-- Album Art -->
+                <Border x:Name="AlbumArtBorder"
+                        Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="2"
+                        Width="630" Height="630"
+                        HorizontalAlignment="Center">
+                    <!-- The cover, or the same art on a CD / vinyl sleeve / cassette
+                         (Appearance → Now Playing Artwork). The control owns the corner
+                         radius, clip and shadow: a spinning disc cannot sit inside a
+                         square shadow, so this Border is only the sizing box that the
+                         code-behind drives (Width/Height/Margin/alignment).
+                         FallbackSource is the mini-player's already-decoded 768px bitmap:
+                         it prevents the gray placeholder flashing between page-attach and
+                         the 1280px CachedImage decode. -->
+                    <Panel>
+                        <controls:MediaArtwork
+                            SourcePath="{Binding Player.CurrentTrack.AlbumArtworkPath}"
+                            FallbackSource="{Binding Player.AlbumArt}"
+                            DecodeWidth="1280"
+                            AnimatedSource="{Binding Player.CurrentAnimatedCoverPath}"
+                            AnimatedActive="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Settings.EnableAnimatedCovers, FallbackValue=False}"
+                            Medium="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Settings.NowPlayingArtworkMedium, FallbackValue={x:Static m:ArtworkMedium.Cover}}"
+                            IsSpinning="{Binding Player.IsPlaying}">
+                            <!-- Also stays up for a clip with no video stream (an audio-only file). -->
+                            <controls:MediaArtwork.IsVisible>
+                                <MultiBinding Converter="{x:Static BoolConverters.Or}">
+                                    <Binding Path="!Player.ShowsMusicVideoInCover"/>
+                                    <Binding ElementName="MusicVideo" Path="!HasVideoStream"/>
+                                </MultiBinding>
+                            </controls:MediaArtwork.IsVisible>
+                        </controls:MediaArtwork>
+                        <!-- Music video (Settings → Lyrics Studio → Music videos): the clip found next
+                             to the song plays here in place of the cover, letterboxed to the slot and
+                             kept in step with what is heard (the song's own audio, or the clip's with
+                             Music video audio on). -->
+                        <controls:VideoBackdrop x:Name="MusicVideo"
+                                                Source="{Binding Player.CurrentMusicVideoPath}"
+                                                SyncPosition="{Binding Player.MusicVideoSyncPosition}"
+                                                Rate="{Binding Player.PlaybackRate}"
+                                                IsPaused="{Binding !Player.IsPlaying}"
+                                                Stretch="Uniform"
+                                                CornerRadius="{Binding Player.MusicVideoCornerRadius}"
+                                                IsVisible="{Binding Player.ShowsMusicVideoInCover}"
+                                                IsActive="{Binding $self.IsVisible}" />
+                    </Panel>
+                </Border>
+
+                <!-- Track Info -->
+                <StackPanel x:Name="TrackInfoStack"
+                            Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2"
+                            Spacing="4" HorizontalAlignment="Center" Margin="0,24,0,0">
+                    <!-- Title + Explicit badge -->
+                    <controls:MarqueeTextBlock x:Name="TitleMarquee"
+                                               Text="{Binding Player.CurrentTrack.Title, FallbackValue='No track playing'}"
+                                               FontSize="22"
+                                               FontWeight="Bold"
+                                               Foreground="{Binding LyricsPrimaryFg}"
+                                               MaxDisplayWidth="520"
+                                               HorizontalAlignment="Center"
+                                               IsLyricsPage="True"
+                                               IsForArtist="False">
+                        <controls:MarqueeTextBlock.InlineContent>
+                            <Border Classes="lyrics-explicit"
+                                    IsVisible="{Binding Player.CurrentTrack.IsExplicit, FallbackValue=False}"
+                                    ToolTip.Tip="{loc:T Lyrics.ExplicitTip}">
+                                <TextBlock Text="E"
+                                           FontSize="9"
+                                           FontWeight="Bold"
+                                           Foreground="{Binding LyricsPrimaryFg}"
+                                           HorizontalAlignment="Center"
+                                           VerticalAlignment="Center"/>
+                            </Border>
+                        </controls:MarqueeTextBlock.InlineContent>
+                    </controls:MarqueeTextBlock>
+
+                    <!-- Artist. A single credit keeps the marquee button (a long name still
+                         scrolls); a multi-artist credit renders one link per name, like the
+                         album page (Discord, aaron 09-21: "Kanye West, GLC, Consequence" was
+                         one button that always opened the first name). -->
+                    <!-- Named by the text it shows: the marquee inside read as
+                         "Undertone.Controls.MarqueeTextBlock" (UIA 10-13). -->
+                    <Button x:Name="ArtistLinkButton"
+                            Classes="link-btn"
+                            Command="{Binding ViewArtistCommand}"
+                            AutomationProperties.Name="{Binding Player.CurrentTrack.ArtistDisplay}"
+                            HorizontalAlignment="Center"
+                            IsVisible="{Binding !HasMultipleArtists}">
+                        <controls:MarqueeTextBlock x:Name="ArtistMarquee"
+                                                   Text="{Binding Player.CurrentTrack.ArtistDisplay, FallbackValue=''}"
+                                                   FontSize="17"
+                                                   Foreground="{Binding LyricsAccentFg}"
+                                                   MaxDisplayWidth="520"
+                                                   IsLyricsPage="True"
+                                                   IsForArtist="True"/>
+                    </Button>
+                    <ItemsControl x:Name="ArtistCreditLinks"
+                                  ItemsSource="{Binding ArtistTokens}"
+                                  HorizontalAlignment="Center"
+                                  MaxWidth="520"
+                                  IsVisible="{Binding HasMultipleArtists}">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <WrapPanel Orientation="Horizontal" HorizontalAlignment="Center"/>
+                            </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="vm:ArtistTokenItem">
+                                <StackPanel Orientation="Horizontal">
+                                    <Button Classes="link-btn"
+                                            Command="{Binding $parent[ItemsControl].((vm:LyricsViewModel)DataContext).ViewArtistNamedCommand}"
+                                            CommandParameter="{Binding Name}">
+                                        <TextBlock Text="{Binding Name}"
+                                                   FontSize="17"
+                                                   Foreground="{Binding $parent[ItemsControl].((vm:LyricsViewModel)DataContext).LyricsAccentFg}"/>
+                                    </Button>
+                                    <TextBlock Text=", "
+                                               FontSize="17"
+                                               Opacity="0.7"
+                                               Foreground="{Binding $parent[ItemsControl].((vm:LyricsViewModel)DataContext).LyricsAccentFg}"
+                                               IsVisible="{Binding !IsLast}"/>
+                                </StackPanel>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+
+                    <!-- Album -->
+                    <Button x:Name="AlbumLinkButton"
+                            Classes="link-btn"
+                            Command="{Binding ViewAlbumCommand}"
+                            AutomationProperties.Name="{Binding Player.CurrentTrack.Album}"
+                            HorizontalAlignment="Center"
+                            IsVisible="{Binding Player.CurrentTrack.Album, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+                        <controls:MarqueeTextBlock x:Name="AlbumMarquee"
+                                                   Text="{Binding Player.CurrentTrack.Album, FallbackValue=''}"
+                                                   FontSize="14"
+                                                   Foreground="{Binding LyricsAccentFg}"
+                                                   MaxDisplayWidth="520"
+                                                   IsLyricsPage="True"
+                                                   IsForArtist="True"/>
+                    </Button>
+
+                <!-- Genre · Year · Tracks · Lossless info (inside the info stack;
+                     Spacing 4 + Margin 4 preserves the previous 8px gap) -->
+                <StackPanel x:Name="MetadataRow"
+                            Orientation="Horizontal"
+                            HorizontalAlignment="Center"
+                            MaxWidth="560"
+                            Spacing="0"
+                            Margin="0,4,0,0"
+                            ClipToBounds="True"
+                            IsVisible="{Binding Player.CurrentTrack, Converter={x:Static ObjectConverters.IsNotNull}}">
+                    <TextBlock FontSize="12" Foreground="{Binding LyricsSubtleFg}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis">
+                        <TextBlock.Text>
+                            <!-- MetadataLine skips empty segments: untagged files (no genre/year)
+                                 otherwise render a stray leading "· 2018 · 24 tracks" dot. -->
+                            <MultiBinding Converter="{StaticResource MetadataLine}" ConverterParameter="track">
+                                <Binding Path="Player.CurrentTrack.GenreDisplay" FallbackValue=""/>
+                                <Binding Path="Player.CurrentTrack.DisplayYear" FallbackValue="0"/>
+                                <!-- Album-wide count (every disc), not the file's per-disc TRCK
+                                     total: "9 tracks" on a 19-song, 3-disc album (Discord, aaron 09-21). -->
+                                <Binding Path="AlbumTrackCount" FallbackValue="0"/>
+                            </MultiBinding>
+                        </TextBlock.Text>
+                    </TextBlock>
+                    <!-- The song file's quality badge hides while a music video's own audio plays. -->
+                    <TextBlock Text=" · "
+                               FontSize="12"
+                               Foreground="{Binding LyricsSubtleFg}"
+                               VerticalAlignment="Center">
+                        <TextBlock.IsVisible>
+                            <MultiBinding Converter="{x:Static BoolConverters.And}" FallbackValue="{x:False}">
+                                <Binding Path="Player.CurrentTrack.AudioQualityBadge" Converter="{x:Static StringConverters.IsNotNullOrEmpty}"/>
+                                <Binding Path="!Player.IsPlayingMusicVideoAudio"/>
+                            </MultiBinding>
+                        </TextBlock.IsVisible>
+                    </TextBlock>
+                    <StackPanel Orientation="Horizontal"
+                                Spacing="4"
+                                VerticalAlignment="Center">
+                        <StackPanel.IsVisible>
+                            <MultiBinding Converter="{x:Static BoolConverters.And}" FallbackValue="{x:False}">
+                                <Binding Path="Player.CurrentTrack.AudioQualityBadge" Converter="{x:Static StringConverters.IsNotNullOrEmpty}"/>
+                                <Binding Path="!Player.IsPlayingMusicVideoAudio"/>
+                            </MultiBinding>
+                        </StackPanel.IsVisible>
+                        <ToolTip.Tip>
+                            <StackPanel Width="220" Spacing="4">
+                                <TextBlock Text="{Binding Player.CurrentTrack.AudioQualityBadge}"
+                                           FontSize="13"
+                                           FontWeight="SemiBold"
+                                           Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" />
+                                <TextBlock Text="{Binding Player.CurrentTrack.AudioQualityDetailedInfo}"
+                                           FontSize="12"
+                                           Opacity="0.9"
+                                           Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+                                <TextBlock Text="{Binding Player.CurrentTrack.AudioQualityDescription, FallbackValue=''}"
+                                           FontSize="11"
+                                           TextWrapping="Wrap"
+                                           Opacity="0.85"
+                                           Margin="0,4,0,0"
+                                           Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+                            </StackPanel>
+                        </ToolTip.Tip>
+                        <Viewbox Width="16" Height="11" VerticalAlignment="Center" Margin="0,1,0,0">
+                            <!-- Match the adjacent "Lossless" label colour so the badge reads as one
+                                 inline element instead of an icon-plus-label with mismatched tones.
+                                 No Opacity here — it would dim the icon relative to the text. -->
+                            <Path Data="M8.184,0.35C9.944,0.35 10.703,3.296 11.338,5.238C11.673,3.842 11.497,3.542 11.857,3.542C11.99,3.542 12.126,3.633 12.126,3.798C12.126,3.809 12.123,3.839 12.117,3.883L12.091,4.058C12.02,4.522 11.845,5.494 11.654,6.144C13.198,10.191 14.345,4.861 14.474,3.772C14.493,3.615 14.612,3.542 14.731,3.542C14.891,3.542 15.022,3.662 14.997,3.843C14.72,5.605 14.295,8.35 12.547,8.35C11.582,8.35 11.04,7.595 10.611,6.73C9.54,4.626 9.047,1.093 7.997,1.093C7.66,1.093 7.411,1.444 7.394,1.444C7.362,1.444 7.337,1.301 7.023,0.909C7.322,0.567 7.734,0.35 8.184,0.35ZM2.458,0.354C5.211,0.354 5.456,7.618 7.014,7.618C7.197,7.618 7.394,7.507 7.61,7.256C7.729,7.458 7.851,7.638 7.978,7.796C7.667,8.151 7.28,8.35 6.795,8.35C5.054,8.349 4.306,5.434 3.663,3.466C3.511,4.097 3.432,4.669 3.402,4.925C3.382,5.088 3.263,5.163 3.143,5.163C3.009,5.163 2.874,5.071 2.874,4.908L2.874,4.908L2.877,4.87C2.966,4.223 3.146,3.243 3.347,2.56C3.079,1.858 2.745,1.091 2.252,1.091C1.257,1.091 0.687,3.591 0.527,4.925C0.508,5.088 0.388,5.163 0.268,5.163C0.135,5.163 0,5.071 0,4.908C0,4.896 0.001,4.883 0.002,4.87C0.283,2.836 0.808,0.354 2.458,0.354ZM5.315,0.35C5.809,0.35 6.339,0.608 6.797,1.211C6.822,1.241 7.078,1.639 7.159,1.777C8.277,3.802 8.818,7.627 9.881,7.627C10.065,7.627 10.264,7.513 10.484,7.256C10.604,7.458 10.726,7.638 10.852,7.796C10.542,8.15 10.155,8.35 9.67,8.35C6.933,8.349 6.636,1.09 5.128,1.09C4.788,1.09 4.536,1.444 4.519,1.444C4.487,1.444 4.462,1.301 4.148,0.909C4.455,0.558 4.87,0.35 5.315,0.35Z"
+                                  Fill="{Binding LyricsSubtleFg}" />
+                        </Viewbox>
+                        <TextBlock Text="{Binding Player.CurrentTrack.AudioQualityBadge}"
+                                   FontSize="12"
+                                   FontWeight="SemiBold"
+                                   Foreground="{Binding LyricsSubtleFg}"
+                                   VerticalAlignment="Center" />
+                    </StackPanel>
+                    <!-- Favorite heart inline (only for singles) -->
+                    <TextBlock Text=" · "
+                               FontSize="12"
+                               Foreground="{Binding LyricsSubtleFg}"
+                               VerticalAlignment="Center"
+                               IsVisible="{Binding ShowMetadataFavoriteHeart}" />
+                    <controls:HeartIcon Size="12" ShowWhenOff="False"
+                                        VerticalAlignment="Center"
+                                        IsFavorite="{Binding ShowMetadataFavoriteHeart}"/>
+                </StackPanel>
+                </StackPanel>
+                </Grid>
+
+                <Grid x:Name="LyricsTimeline"
+                      Margin="0,14,0,0"
+                      RowDefinitions="Auto,24"
+                      IsVisible="{Binding Player.CurrentTrack, Converter={x:Static ObjectConverters.IsNotNull}}">
+                    <Grid ColumnDefinitions="*,Auto">
+                        <TextBlock Text="{Binding Player.PositionText}"
+                                   FontSize="14"
+                                   FontWeight="SemiBold"
+                                   Foreground="{Binding LyricsSubtleFg}"
+                                   VerticalAlignment="Center"
+                                   Margin="10,0,0,0"/>
+                        <TextBlock Grid.Column="1"
+                                   Text="{Binding Player.RemainingTimeText}"
+                                   FontSize="14"
+                                   FontWeight="SemiBold"
+                                   Foreground="{Binding LyricsSubtleFg}"
+                                   VerticalAlignment="Center"
+                                   Margin="0,0,10,0"/>
+                    </Grid>
+
+                    <Grid Grid.Row="1"
+                          Height="24"
+                          ClipToBounds="False">
+                        <Canvas Height="24"
+                                ClipToBounds="False"
+                                IsHitTestVisible="False">
+                            <Border x:Name="LyricsTimelineTrackBackground"
+                                    Height="7"
+                                    CornerRadius="3.5"
+                                    Background="{Binding LyricsSliderUnfilled}"
+                                    Canvas.Top="8.5"/>
+                            <Border x:Name="LyricsTimelineTrackFill"
+                                    Height="7"
+                                    CornerRadius="3.5"
+                                    Background="{Binding LyricsAccentFg}"
+                                    Canvas.Top="8.5"/>
+                            <Border x:Name="LyricsTimelineThumb"
+                                    Width="16"
+                                    Height="16"
+                                    CornerRadius="8"
+                                    Background="{Binding LyricsAccentFg}"
+                                    BoxShadow="0 2 5 0 #40000000"
+                                    Canvas.Top="4"/>
+                        </Canvas>
+                        <Slider x:Name="LyricsTimelineSlider"
+                                Classes="lyrics-timeline-slider"
+                                AutomationProperties.Name="{loc:T PlaybackBar.Seek}"
+                                Value="{Binding Player.PositionFraction, Mode=TwoWay}"
+                                Minimum="0"
+                                Maximum="1"
+                                Focusable="False"
+                                VerticalAlignment="Center"/>
+                    </Grid>
+                </Grid>
+
+                <!-- Lyrics-page playback controls; timeline and track metadata live above. -->
+                <views:PlaybackBarView DataContext="{Binding Player}"
+                                        HorizontalAlignment="Stretch"
+                                        Margin="0,12,0,0"/>
+
+                <!-- Bottom action row: Alternate source + save status (Share moved into player-bar ⋯ menu) -->
+                <StackPanel Orientation="Horizontal"
+                            HorizontalAlignment="Center"
+                            Spacing="8"
+                            Margin="0,24,0,0">
+                    <!-- Switch to alternate lyrics source -->
+                    <Button Classes="pill-btn"
+                            Padding="10,5"
+                            Height="30" MinHeight="30"
+                            IsVisible="{Binding HasAlternateLyrics}"
+                            Command="{Binding SwitchToAlternateLyricsCommand}"
+                            AutomationProperties.Name="{Binding AlternateLyricsLabel}">
+                        <StackPanel Orientation="Horizontal" Spacing="5">
+                            <!-- Swap arrows, not the paperclip (AttachIcon) this used to borrow. -->
+                            <controls:LineIcon Data="{DynamicResource PageLineSwapSource}"
+                                               Width="13" Height="13" Foreground="{Binding LyricsPrimaryFg}"
+                                               VerticalAlignment="Center"/>
+                            <TextBlock Text="{Binding AlternateLyricsLabel}" FontSize="11" Foreground="{Binding LyricsPrimaryFg}" VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </Button>
+
+                    <!-- lrc.red has this song only line-synced or plain: its in-house model can time
+                         every word. One request per press; reads "Timing every word…" while it runs
+                         and "Try again" after a failure (the reason beside it). -->
+                    <Button Classes="pill-btn lrcred-sync"
+                            Padding="10,5"
+                            Height="30" MinHeight="30"
+                            IsVisible="{Binding ShowLrcRedSync}"
+                            Command="{Binding WordSyncWithLrcRedCommand}"
+                            AutomationProperties.Name="{Binding LrcRedSyncLabel}">
+                        <StackPanel Orientation="Horizontal" Spacing="5">
+                            <controls:LineIcon Data="{DynamicResource MenuLineTimer}"
+                                               Width="13" Height="13" Foreground="{Binding LyricsPrimaryFg}"
+                                               VerticalAlignment="Center"/>
+                            <TextBlock Text="{Binding LrcRedSyncLabel}" FontSize="11" Foreground="{Binding LyricsPrimaryFg}" VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </Button>
+                    <TextBlock Text="{Binding LrcRedSyncError}"
+                               FontSize="11"
+                               MaxWidth="260"
+                               TextWrapping="Wrap"
+                               Foreground="{Binding LyricsSubtleFg}"
+                               VerticalAlignment="Center"
+                               IsVisible="{Binding LrcRedSyncError, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+
+                    <!-- Lyrics Studio preview: the lines shown are unsaved -->
+                    <Border Background="{DynamicResource LyricsBtnBgRes}"
+                            CornerRadius="18"
+                            Padding="10,5"
+                            Height="30"
+                            IsVisible="{Binding IsPreviewActive}">
+                        <TextBlock Text="{loc:T Lyrics.PreviewUnsaved}" FontSize="11" Foreground="{Binding LyricsPrimaryFg}" VerticalAlignment="Center"/>
+                    </Border>
+
+                    <!-- Save status text -->
+                    <TextBlock Text="{Binding SaveStatusText}"
+                               FontSize="11"
+                               Foreground="{Binding LyricsSubtleFg}"
+                               VerticalAlignment="Center"
+                               IsVisible="{Binding SaveStatusText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+
+                    <!-- lrc.red's API asks to be credited: "Lyrics from lrc.red" under its lyrics,
+                         "Word-synced by lrc.red's model" after its model timed them. -->
+                    <TextBlock Text="{Binding LyricsCreditText}"
+                               FontSize="11"
+                               Foreground="{Binding LyricsSubtleFg}"
+                               VerticalAlignment="Center"
+                               IsVisible="{Binding LyricsCreditText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+                </StackPanel>
+            </StackPanel>
+        </Border>
+
+        <!-- ══════════════════════════════════════════════════════ -->
+        <!-- RIGHT PANEL: Lyrics Column                           -->
+        <!-- ══════════════════════════════════════════════════════ -->
+        <Grid x:Name="RightPanel" Grid.Column="1" Grid.RowSpan="2"
+              RenderTransformOrigin="0.5,0.5"
+              IsVisible="{Binding !Player.ShowsMusicVideoFullSize}">
+            <!-- No RenderTransform transition: the wide-mode 1.1x scale is applied
+                 by code-behind on attach/resize; a transition made it zoom in every
+                 time the page opened or the window was minimized/maximized. -->
+
+            <!-- (Color picker moved to left panel bottom) -->
+
+            <!-- Search Lyrics Button (when no lyrics) — frosted pill so it sits
+                 naturally on the blurred-artwork backdrop like the other
+                 lyrics-page pills. -->
+            <StackPanel HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Margin="-50,0,0,0"
+                        Spacing="14"
+                        IsVisible="{Binding ShowSearchButton}"
+                        ZIndex="3">
+                <TextBlock Text="{Binding SearchFailedMessage}"
+                           FontSize="14"
+                           Foreground="{Binding LyricsSubtleFg}"
+                           HorizontalAlignment="Center"
+                           IsVisible="{Binding SearchFailedMessage, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+                <!-- Opens the Search Lyrics dialog (issue #113): Auto searches every enabled
+                     source straight away, and any one source can be picked there. -->
+                <Button Classes="pill-btn"
+                        Padding="20,9"
+                        CornerRadius="22"
+                        Command="{Binding OpenLyricsSearchCommand}"
+                        HorizontalAlignment="Center">
+                    <TextBlock Text="{loc:T Lyrics.SearchLyrics}"
+                               FontSize="13"
+                               FontWeight="SemiBold"
+                               Foreground="White"
+                               VerticalAlignment="Center"/>
+                </Button>
+            </StackPanel>
+
+            <!-- GitHub #162: the song is marked as having no lyrics — a calm note in the
+                 search pill's place, with Undo to take the mark off. -->
+            <StackPanel x:Name="MarkedNoLyricsState"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Margin="-50,0,0,0"
+                        Spacing="14"
+                        IsVisible="{Binding IsMarkedNoLyrics}"
+                        ZIndex="3">
+                <TextBlock Text="{loc:T Lyrics.MarkedNoLyrics}"
+                           FontSize="14"
+                           Foreground="{Binding LyricsSubtleFg}"
+                           HorizontalAlignment="Center"/>
+                <Button Classes="pill-btn"
+                        Padding="20,9"
+                        CornerRadius="22"
+                        Command="{Binding UnmarkNoLyricsCommand}"
+                        HorizontalAlignment="Center">
+                    <TextBlock Text="{loc:T Lyrics.UndoNoLyrics}"
+                               FontSize="13"
+                               FontWeight="SemiBold"
+                               Foreground="White"
+                               VerticalAlignment="Center"/>
+                </Button>
+            </StackPanel>
+
+            <!-- Searching indicator: three staggered pulsing dots + label -->
+            <StackPanel x:Name="SearchingIndicator"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Margin="-50,0,0,0"
+                        Spacing="14"
+                        IsVisible="{Binding IsSearching}"
+                        ZIndex="3">
+                <StackPanel.Styles>
+                    <!-- Animations keyed on [IsVisible=True] so they only run while
+                         searching (same pattern as the previous pulse text). -->
+                    <Style Selector="StackPanel#SearchingIndicator[IsVisible=True] Ellipse.dot1">
+                        <Style.Animations>
+                            <Animation Duration="0:0:0.9" IterationCount="INFINITE"
+                                       Easing="SineEaseInOut" PlaybackDirection="Alternate">
+                                <KeyFrame Cue="0%">
+                                    <Setter Property="Opacity" Value="0.25"/>
+                                </KeyFrame>
+                                <KeyFrame Cue="100%">
+                                    <Setter Property="Opacity" Value="1.0"/>
+                                </KeyFrame>
+                            </Animation>
+                        </Style.Animations>
+                    </Style>
+                    <Style Selector="StackPanel#SearchingIndicator[IsVisible=True] Ellipse.dot2">
+                        <Style.Animations>
+                            <Animation Duration="0:0:0.9" Delay="0:0:0.2" IterationCount="INFINITE"
+                                       Easing="SineEaseInOut" PlaybackDirection="Alternate">
+                                <KeyFrame Cue="0%">
+                                    <Setter Property="Opacity" Value="0.25"/>
+                                </KeyFrame>
+                                <KeyFrame Cue="100%">
+                                    <Setter Property="Opacity" Value="1.0"/>
+                                </KeyFrame>
+                            </Animation>
+                        </Style.Animations>
+                    </Style>
+                    <Style Selector="StackPanel#SearchingIndicator[IsVisible=True] Ellipse.dot3">
+                        <Style.Animations>
+                            <Animation Duration="0:0:0.9" Delay="0:0:0.4" IterationCount="INFINITE"
+                                       Easing="SineEaseInOut" PlaybackDirection="Alternate">
+                                <KeyFrame Cue="0%">
+                                    <Setter Property="Opacity" Value="0.25"/>
+                                </KeyFrame>
+                                <KeyFrame Cue="100%">
+                                    <Setter Property="Opacity" Value="1.0"/>
+                                </KeyFrame>
+                            </Animation>
+                        </Style.Animations>
+                    </Style>
+                </StackPanel.Styles>
+                <StackPanel Orientation="Horizontal" Spacing="9" HorizontalAlignment="Center">
+                    <Ellipse Classes="dot1" Width="9" Height="9" Fill="{Binding LyricsPrimaryFg}" Opacity="0.25"/>
+                    <Ellipse Classes="dot2" Width="9" Height="9" Fill="{Binding LyricsPrimaryFg}" Opacity="0.25"/>
+                    <Ellipse Classes="dot3" Width="9" Height="9" Fill="{Binding LyricsPrimaryFg}" Opacity="0.25"/>
+                </StackPanel>
+                <TextBlock Text="{loc:T Lyrics.SearchingLyrics}"
+                           FontSize="14"
+                           Foreground="{Binding LyricsSubtleFg}"
+                           HorizontalAlignment="Center"/>
+            </StackPanel>
+
+            <!-- Opacity-masked lyrics container.
+                 ClipToBounds=False so the active line's 1.07× scale doesn't get hard-clipped
+                 on the right edge ("…GOA" → "…GOAT"). Vertical clipping still handled by the
+                 ScrollViewer below; the OpacityMask handles the soft top/bottom fade. -->
+            <Border x:Name="LyricsContentHost"
+                    ClipToBounds="False"
+                    VerticalAlignment="Stretch"
+                    Margin="0,20,0,20">
+                <Border.OpacityMask>
+                    <LinearGradientBrush StartPoint="50%,0%" EndPoint="50%,100%">
+                        <GradientStop Color="#A0FFFFFF" Offset="0.0"/>
+                        <GradientStop Color="#E0FFFFFF" Offset="0.06"/>
+                        <GradientStop Color="#FFFFFFFF" Offset="0.15"/>
+                        <GradientStop Color="#FFFFFFFF" Offset="0.80"/>
+                        <GradientStop Color="#E0FFFFFF" Offset="0.93"/>
+                        <GradientStop Color="#A0FFFFFF" Offset="1.0"/>
+                    </LinearGradientBrush>
+                </Border.OpacityMask>
+
+                <ScrollViewer x:Name="LyricsScrollViewer"
+                              VerticalScrollBarVisibility="Hidden"
+                              HorizontalScrollBarVisibility="Disabled"
+                              Padding="24,0,48,0">
+                    <!-- Scroll content = lyric lines + the Written-By footer, one extent.
+                         The ItemsControl stays this panel's FIRST child at Y=0 with no
+                         header above it: the anchor math (TryComputeAnchorOffset and the
+                         jump path) converts item-panel coordinates to extent space as
+                         panel Y + LyricsItemsControl.Margin.Top, which only holds while
+                         nothing precedes the ItemsControl. The run-out bottom pad lives
+                         on this wrapper (UpdateLyricsCenterPadding) so the footer sits
+                         just after the last line, before the empty run-out. -->
+                    <StackPanel x:Name="LyricsScrollContent" ClipToBounds="False">
+                    <!-- FontSize set here (and adjusted from code-behind per window size)
+                         is inherited by the lyric-line and karaoke TextBlocks below. -->
+                    <!-- ClipToBounds=False here, on the word-layer ItemsControl and on the
+                         word-cell Viewbox below: all three clip by default and each one
+                         hard-cuts the active word's 1.04 emphasis swell (and the glow
+                         spill) at its own box. Verified per-element via headless render
+                         bisect; the ScrollViewer still provides the viewport clip. -->
+                    <ItemsControl ItemsSource="{Binding ActiveLyricLines}"
+                                  x:Name="LyricsItemsControl"
+                                  MaxWidth="640"
+                                  FontSize="46"
+                                  ClipToBounds="False"
+                                  HorizontalAlignment="Left">
+                        <!-- No MaxWidth transition: width is set from the window on
+                             attach/resize and a transition animated the lyric column
+                             width on every open and minimize/maximize. -->
+                        <!-- Duet files pin the column to full MaxWidth so voice-2 lines
+                             right-align against a stable edge; otherwise MinWidth is 0
+                             and the column hugs content exactly as before. -->
+                        <ItemsControl.MinWidth>
+                            <MultiBinding Converter="{StaticResource DuetMinWidth}">
+                                <Binding Path="HasDuetLines"/>
+                                <Binding Path="$self.MaxWidth"/>
+                            </MultiBinding>
+                        </ItemsControl.MinWidth>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="m:LyricLine">
+                                <!-- Reads its line (UIA read "Avalonia.Controls.StackPanel", 10-13). -->
+                                <Button Background="Transparent"
+                                        Classes="lyric-line-btn"
+                                        AutomationProperties.Name="{Binding Converter={x:Static helpers:AccessibleNames.ItemName}}"
+                                        Classes.active="{Binding IsActive}"
+                                        BorderThickness="0"
+                                        Padding="0"
+                                        Margin="0,10"
+                                        MaxWidth="{Binding $parent[ItemsControl].MaxWidth}"
+                                        RenderTransformOrigin="{Binding Voice, Converter={StaticResource VoiceOrigin}}"
+                                        HorizontalContentAlignment="Left"
+                                        Cursor="Hand"
+                                        IsHitTestVisible="{Binding IsClickable}"
+                                        Command="{Binding $parent[ItemsControl].((vm:LyricsViewModel)DataContext).SeekToLineCommand}"
+                                        CommandParameter="{Binding}"
+                                        Effect="{Binding BlurRadius, Converter={StaticResource BlurToEffect}}">
+                                        <Button.HorizontalAlignment>
+                                            <MultiBinding Converter="{StaticResource LyricLineAlign}">
+                                                <Binding Path="Voice"/>
+                                                <Binding Path="IsRightToLeft"/>
+                                            </MultiBinding>
+                                        </Button.HorizontalAlignment>
+                                    <StackPanel HorizontalAlignment="Left"
+                                                MaxWidth="{Binding $parent[ItemsControl].MaxWidth}">
+                                    <Panel HorizontalAlignment="{Binding Voice, Converter={StaticResource VoiceAlign}}">
+                                        <!-- Main text layer (only for lines without word timings; intro uses dots) -->
+                                        <TextBlock Text="{Binding Text}"
+                                                   Classes="lyric-line"
+                                                   Classes.active="{Binding IsActive}"
+                                                   FontWeight="Bold"
+                                                   Foreground="{Binding $parent[UserControl].((vm:LyricsViewModel)DataContext).LyricsPrimaryFg}"
+                                                   HorizontalAlignment="Left"
+                                                   TextAlignment="{Binding Voice, Converter={StaticResource VoiceTextAlign}}"
+                                                   MaxWidth="{Binding $parent[ItemsControl].MaxWidth}"
+                                                   Opacity="{Binding LineOpacity}"
+                                                   IsVisible="{Binding ShowLineText}"
+                                                   TextWrapping="Wrap"/>
+
+                                        <!-- Word-level karaoke layer. Rendered for word-timed lines whether active
+                                             or not, so the wrap geometry never changes on activation (the old
+                                             TextBlock swap re-wrapped the line mid-song). Inactive lines show the
+                                             base layer at full opacity — indistinguishable from plain line text.
+                                             Very long lyrics build it only near the sung line; elsewhere the
+                                             resting control below draws the same words in the same places. -->
+                                        <ItemsControl ItemsSource="{Binding LiveWords}"
+                                                      Classes="word-layer"
+                                                      Classes.active="{Binding IsSweepFocused}"
+                                                      IsVisible="{Binding ShowLiveWords}"
+                                                      Opacity="{Binding LineOpacity}"
+                                                      HorizontalAlignment="Left"
+                                                      ClipToBounds="False"
+                                                      MaxWidth="{Binding $parent[ItemsControl].MaxWidth}"
+                                                      ItemTemplate="{StaticResource WordCellTemplate}">
+                                            <ItemsControl.Transitions>
+                                                <Transitions>
+                                                    <DoubleTransition Property="Opacity" Duration="0:0:0.5" Easing="CubicEaseInOut"/>
+                                                </Transitions>
+                                            </ItemsControl.Transitions>
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate>
+                                                    <controls:LyricWrapPanel Orientation="Horizontal" ItemsAlignment="{Binding Voice, Converter={StaticResource VoiceItemsAlign}}" RightToLeft="{Binding IsRightToLeft}"/>
+                                                </ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                        </ItemsControl>
+                                        <controls:KaraokeRestingWords Words="{Binding Words}"
+                                                                      RightToLeft="{Binding IsRightToLeft}"
+                                                                      IsVisible="{Binding ShowRestingWords}"
+                                                                      Opacity="{Binding LineOpacity}"
+                                                                      Foreground="{Binding $parent[UserControl].((vm:LyricsViewModel)DataContext).LyricsPrimaryFg}"
+                                                                      ItemsAlignment="{Binding Voice, Converter={StaticResource VoiceItemsAlign}}"
+                                                                      HorizontalAlignment="Left"
+                                                                      MaxWidth="{Binding $parent[ItemsControl].MaxWidth}">
+                                            <controls:KaraokeRestingWords.Transitions>
+                                                <Transitions>
+                                                    <DoubleTransition Property="Opacity" Duration="0:0:0.5" Easing="CubicEaseInOut"/>
+                                                </Transitions>
+                                            </controls:KaraokeRestingWords.Transitions>
+                                        </controls:KaraokeRestingWords>
+                                        <!-- Intro / interlude dots. Left margin centers the first dot over
+                                             the first letter of the lyric below. The dots fill one after
+                                             another with the gap's progress (LyricLine.InterludeProgress,
+                                             a per-frame value: plain bindings, no transitions), and while
+                                             the row is the active line it breathes slowly in scale (Joy
+                                             Tunes measured 0.78-1.0 on a ~4.25 s period; gentler here).
+                                             Inactive, every dot is full and the row dims as a line. -->
+                                        <StackPanel Orientation="Horizontal"
+                                                    Spacing="8"
+                                                    HorizontalAlignment="Left"
+                                                    VerticalAlignment="Center"
+                                                    Margin="10,8,0,8"
+                                                    Classes="interlude-dots"
+                                                    Opacity="{Binding LineOpacity}"
+                                                    IsVisible="{Binding IsIntroPlaceholder}"
+                                                    Classes.active="{Binding IsActive}"
+                                                    RenderTransformOrigin="0%,50%">
+                                            <StackPanel.RenderTransform>
+                                                <ScaleTransform/>
+                                            </StackPanel.RenderTransform>
+                                            <StackPanel.Transitions>
+                                                <Transitions>
+                                                    <DoubleTransition Property="Opacity" Duration="0:0:0.5" Easing="CubicEaseInOut"/>
+                                                </Transitions>
+                                            </StackPanel.Transitions>
+                                            <StackPanel.Styles>
+                                                <Style Selector="StackPanel.interlude-dots.active">
+                                                    <Style.Animations>
+                                                        <Animation Duration="0:0:2.1" IterationCount="INFINITE" PlaybackDirection="Alternate" Easing="SineEaseInOut">
+                                                            <KeyFrame Cue="0%">
+                                                                <Setter Property="ScaleTransform.ScaleX" Value="1.0"/>
+                                                                <Setter Property="ScaleTransform.ScaleY" Value="1.0"/>
+                                                            </KeyFrame>
+                                                            <KeyFrame Cue="100%">
+                                                                <Setter Property="ScaleTransform.ScaleX" Value="0.88"/>
+                                                                <Setter Property="ScaleTransform.ScaleY" Value="0.88"/>
+                                                            </KeyFrame>
+                                                        </Animation>
+                                                    </Style.Animations>
+                                                </Style>
+                                            </StackPanel.Styles>
+                                            <Ellipse Width="12" Height="12" Fill="{Binding $parent[UserControl].((vm:LyricsViewModel)DataContext).LyricsControlFill}"
+                                                     Opacity="{Binding InterludeProgress, Converter={StaticResource InterludeDot}, ConverterParameter=0}"/>
+                                            <Ellipse Width="12" Height="12" Fill="{Binding $parent[UserControl].((vm:LyricsViewModel)DataContext).LyricsControlFill}"
+                                                     Opacity="{Binding InterludeProgress, Converter={StaticResource InterludeDot}, ConverterParameter=1}"/>
+                                            <Ellipse Width="12" Height="12" Fill="{Binding $parent[UserControl].((vm:LyricsViewModel)DataContext).LyricsControlFill}"
+                                                     Opacity="{Binding InterludeProgress, Converter={StaticResource InterludeDot}, ConverterParameter=2}"/>
+                                        </StackPanel>
+                                    </Panel>
+
+                                    <!-- Background vocals (adlibs): smaller karaoke row under the
+                                         main words, Apple Music style. Same cell template, so it
+                                         gets the full glow/base/sweep treatment; font size tracks
+                                         the responsive lyrics size at 60%. Present whenever the
+                                         line has one, so wrap geometry never changes on activation. -->
+                                    <ItemsControl ItemsSource="{Binding BackgroundWords}"
+                                                  Classes="word-layer bg-vocals"
+                                                  Classes.active="{Binding IsSweepFocused}"
+                                                  Opacity="{Binding LineOpacity}"
+                                                  HorizontalAlignment="{Binding Voice, Converter={StaticResource VoiceAlign}}"
+                                                  ClipToBounds="False"
+                                                  Margin="0,6,0,0"
+                                                  FontSize="{Binding $parent[ItemsControl].FontSize, Converter={StaticResource FontScale}, ConverterParameter=0.6}"
+                                                  MaxWidth="{Binding $parent[ItemsControl].MaxWidth}"
+                                                  ItemTemplate="{StaticResource WordCellTemplate}">
+                                        <ItemsControl.IsVisible>
+                                            <MultiBinding Converter="{x:Static BoolConverters.And}" FallbackValue="{x:False}">
+                                                <Binding Path="ShowBackgroundWords"/>
+                                                <Binding Path="$parent[UserControl].((vm:LyricsViewModel)DataContext).ShowBackgroundVocals"/>
+                                            </MultiBinding>
+                                        </ItemsControl.IsVisible>
+                                        <ItemsControl.Transitions>
+                                            <Transitions>
+                                                <DoubleTransition Property="Opacity" Duration="0:0:0.5" Easing="CubicEaseInOut"/>
+                                            </Transitions>
+                                        </ItemsControl.Transitions>
+                                        <ItemsControl.ItemsPanel>
+                                            <ItemsPanelTemplate>
+                                                <controls:LyricWrapPanel Orientation="Horizontal" ItemsAlignment="{Binding Voice, Converter={StaticResource VoiceItemsAlign}}" RightToLeft="{Binding IsRightToLeft}"/>
+                                            </ItemsPanelTemplate>
+                                        </ItemsControl.ItemsPanel>
+                                    </ItemsControl>
+
+                                    <!-- Romanization, then translation (Apple TTML layers, issue #78), under the
+                                         adlibs at the adlib row's 60% size. Word-timed romanization sweeps like the
+                                         adlib row; untimed romanization and translations are static text that
+                                         lights and dims with the line. Each row also answers its Settings toggle. -->
+                                    <ItemsControl ItemsSource="{Binding TransliterationWords}"
+                                                  Classes="word-layer romanization"
+                                                  Classes.active="{Binding IsSweepFocused}"
+                                                  Opacity="{Binding LineOpacity}"
+                                                  HorizontalAlignment="{Binding Voice, Converter={StaticResource VoiceAlign}}"
+                                                  ClipToBounds="False"
+                                                  Margin="0,6,0,0"
+                                                  FontSize="{Binding $parent[ItemsControl].FontSize, Converter={StaticResource FontScale}, ConverterParameter=0.6}"
+                                                  MaxWidth="{Binding $parent[ItemsControl].MaxWidth}"
+                                                  ItemTemplate="{StaticResource WordCellTemplate}">
+                                        <ItemsControl.IsVisible>
+                                            <MultiBinding Converter="{x:Static BoolConverters.And}" FallbackValue="{x:False}">
+                                                <Binding Path="ShowTransliterationWords"/>
+                                                <Binding Path="$parent[UserControl].((vm:LyricsViewModel)DataContext).ShowRomanization"/>
+                                            </MultiBinding>
+                                        </ItemsControl.IsVisible>
+                                        <ItemsControl.Transitions>
+                                            <Transitions>
+                                                <DoubleTransition Property="Opacity" Duration="0:0:0.5" Easing="CubicEaseInOut"/>
+                                            </Transitions>
+                                        </ItemsControl.Transitions>
+                                        <ItemsControl.ItemsPanel>
+                                            <ItemsPanelTemplate>
+                                                <controls:LyricWrapPanel Orientation="Horizontal" ItemsAlignment="{Binding Voice, Converter={StaticResource VoiceItemsAlign}}" RightToLeft="{Binding IsRightToLeft}"/>
+                                            </ItemsPanelTemplate>
+                                        </ItemsControl.ItemsPanel>
+                                    </ItemsControl>
+                                    <TextBlock Text="{Binding Transliteration}"
+                                               Classes="romanization-text"
+                                               FontWeight="Bold"
+                                               Foreground="{Binding $parent[UserControl].((vm:LyricsViewModel)DataContext).LyricsPrimaryFg}"
+                                               Opacity="{Binding LineOpacity}"
+                                               HorizontalAlignment="{Binding Voice, Converter={StaticResource VoiceAlign}}"
+                                               TextAlignment="{Binding Voice, Converter={StaticResource VoiceTextAlign}}"
+                                               Margin="0,6,0,0"
+                                               FontSize="{Binding $parent[ItemsControl].FontSize, Converter={StaticResource FontScale}, ConverterParameter=0.6}"
+                                               MaxWidth="{Binding $parent[ItemsControl].MaxWidth}"
+                                               TextWrapping="Wrap">
+                                        <TextBlock.IsVisible>
+                                            <MultiBinding Converter="{x:Static BoolConverters.And}" FallbackValue="{x:False}">
+                                                <Binding Path="ShowTransliterationText"/>
+                                                <Binding Path="$parent[UserControl].((vm:LyricsViewModel)DataContext).ShowRomanization"/>
+                                            </MultiBinding>
+                                        </TextBlock.IsVisible>
+                                        <TextBlock.Transitions>
+                                            <Transitions>
+                                                <DoubleTransition Property="Opacity" Duration="0:0:0.5" Easing="CubicEaseInOut"/>
+                                            </Transitions>
+                                        </TextBlock.Transitions>
+                                    </TextBlock>
+                                    <TextBlock Text="{Binding Translation}"
+                                               Classes="translation-text"
+                                               FontWeight="Bold"
+                                               Foreground="{Binding $parent[UserControl].((vm:LyricsViewModel)DataContext).LyricsPrimaryFg}"
+                                               Opacity="{Binding LineOpacity}"
+                                               HorizontalAlignment="{Binding Voice, Converter={StaticResource VoiceAlign}}"
+                                               TextAlignment="{Binding Voice, Converter={StaticResource VoiceTextAlign}}"
+                                               Margin="0,6,0,0"
+                                               FontSize="{Binding $parent[ItemsControl].FontSize, Converter={StaticResource FontScale}, ConverterParameter=0.6}"
+                                               MaxWidth="{Binding $parent[ItemsControl].MaxWidth}"
+                                               TextWrapping="Wrap">
+                                        <TextBlock.IsVisible>
+                                            <MultiBinding Converter="{x:Static BoolConverters.And}" FallbackValue="{x:False}">
+                                                <Binding Path="ShowTranslation"/>
+                                                <Binding Path="$parent[UserControl].((vm:LyricsViewModel)DataContext).ShowTranslations"/>
+                                            </MultiBinding>
+                                        </TextBlock.IsVisible>
+                                        <TextBlock.Transitions>
+                                            <Transitions>
+                                                <DoubleTransition Property="Opacity" Duration="0:0:0.5" Easing="CubicEaseInOut"/>
+                                            </Transitions>
+                                        </TextBlock.Transitions>
+                                    </TextBlock>
+                                    </StackPanel>
+                                </Button>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+
+                    <!-- "Written By" credit (Apple Music style): scrolls into view after
+                         the final line. Collapses entirely — no reserved space — when the
+                         track has no composer or no lyrics (WrittenByText is empty then).
+                         Not a lyric line: it lives outside LyricsItemsControl, so line
+                         indices, active-line anchoring and opacity dimming never see it. -->
+                    <!-- 2px optical inset: layout boxes are flush with the lyric lines
+                         (verified by headless pixel probe), but the big bold lyric
+                         glyphs carry ~1-2px of left-side bearing while the 15px "W"
+                         overhangs its box — without this the credit reads as sitting
+                         left of the text above. -->
+                    <TextBlock x:Name="WrittenByFooter"
+                               FontSize="15"
+                               TextWrapping="Wrap"
+                               HorizontalAlignment="Left"
+                               MaxWidth="{Binding #LyricsItemsControl.MaxWidth}"
+                               Margin="2,44,0,0"
+                               IsVisible="{Binding WrittenByText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"><Run Text="{loc:T Lyrics.WrittenBy}" FontWeight="SemiBold" Foreground="{Binding LyricsSecondaryFg}"/><Run Text="{Binding WrittenByText}" Foreground="{Binding LyricsSubtleFg}"/></TextBlock>
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
+
+            <!-- (Source / Save / Alternate buttons moved to left panel bottom) -->
+
+            <!-- Follow Button -->
+            <Button Classes="pill-btn"
+                    HorizontalAlignment="Center"
+                    VerticalAlignment="Bottom"
+                    Margin="0,0,0,30"
+                    ZIndex="2"
+                    IsVisible="{Binding IsAutoFollowPaused}"
+                    Command="{Binding ResumeAutoFollowCommand}"
+                    AutomationProperties.Name="{loc:T Lyrics.Follow}">
+                <StackPanel Orientation="Horizontal" Spacing="6">
+                    <!-- A locate crosshair, not the clipboard (ClipboardIcon is Paste). -->
+                    <controls:LineIcon Data="{DynamicResource PageLineFollow}"
+                                       Width="15" Height="15"
+                                       VerticalAlignment="Center"/>
+                    <TextBlock Text="{loc:T Lyrics.Follow}" VerticalAlignment="Center"/>
+                </StackPanel>
+            </Button>
+        </Grid>
+
+        <!-- Music video full size (the Audio / Video switch on Video): the clip letterboxed on
+             black over the whole page, muted and in step with the song like the other
+             placements; the cover and lyrics panels are hidden meanwhile (nothing renders
+             under it). The cover stands in for a clip with no video stream. The playback
+             island stays on top for transport. -->
+        <Grid x:Name="MusicVideoFullSizeLayer"
+              Grid.ColumnSpan="2"
+              Grid.RowSpan="2"
+              ZIndex="5"
+              Background="Black"
+              IsVisible="{Binding Player.ShowsMusicVideoFullSize}">
+            <Image Source="{Binding Player.AlbumArt}"
+                   Stretch="Uniform"
+                   Margin="48,72,48,110"
+                   IsVisible="{Binding !#MusicVideoFullSize.HasVideoStream}"/>
+            <controls:VideoBackdrop x:Name="MusicVideoFullSize"
+                                    Source="{Binding Player.CurrentMusicVideoPath}"
+                                    SyncPosition="{Binding Player.MusicVideoSyncPosition}"
+                                    Rate="{Binding Player.PlaybackRate}"
+                                    IsPaused="{Binding !Player.IsPlaying}"
+                                    Stretch="Uniform"
+                                    MaxDecodeSide="1920"
+                                    IsActive="{Binding $self.IsVisible}" />
+        </Grid>
+
+        <!-- Audio / Video switch: shown while the song has a music video (Settings → Lyrics
+             Studio → Music videos on). Video plays the clip full size; Audio is the normal
+             page. Sound never changes here: the song keeps the audio it started with. -->
+        <Border x:Name="MusicVideoSwitch"
+                Grid.ColumnSpan="2"
+                ZIndex="6"
+                HorizontalAlignment="Center"
+                VerticalAlignment="Top"
+                Margin="0,14,0,0"
+                Padding="3"
+                CornerRadius="999"
+                Background="{DynamicResource LyricsSecBtnBgRes}"
+                IsVisible="{Binding Player.HasMusicVideo}">
+            <StackPanel Orientation="Horizontal" Spacing="2">
+                <Button Classes="mv-seg"
+                        Classes.on="{Binding !Player.IsWatchingMusicVideo}"
+                        Command="{Binding Player.ShowMusicVideoAudioCommand}"
+                        Content="{loc:T Lyrics.MusicVideoAudioSide}"
+                        AutomationProperties.Name="{loc:T Lyrics.MusicVideoAudioSide}"/>
+                <Button Classes="mv-seg"
+                        Classes.on="{Binding Player.IsWatchingMusicVideo}"
+                        Command="{Binding Player.ShowMusicVideoFullSizeCommand}"
+                        Content="{loc:T Lyrics.MusicVideoVideoSide}"
+                        AutomationProperties.Name="{loc:T Lyrics.MusicVideoVideoSide}"/>
+            </StackPanel>
+        </Border>
+    </Grid>
+</UserControl>

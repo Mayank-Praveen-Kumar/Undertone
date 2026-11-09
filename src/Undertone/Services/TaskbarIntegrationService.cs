@@ -1,0 +1,555 @@
+using System.Runtime.InteropServices;
+using Undertone.Localization;
+using SkiaSharp;
+
+namespace Undertone.Services;
+
+/// <summary>
+/// Adds Previous / Play-Pause / Forward thumbnail toolbar buttons to the
+/// Windows taskbar preview (the popup when you hover over the app icon).
+/// Uses the ITaskbarList3 COM interface (Windows 7+).
+/// Icons rendered via SkiaSharp using the same SVG paths as the playback island.
+/// </summary>
+public sealed class TaskbarIntegrationService : IDisposable
+{
+    // ── COM interface ────────────────────────────────────────────
+
+    [ComImport, Guid("ea1afb91-9e28-4b86-90e9-9e9f8a5eefaf"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface ITaskbarList3
+    {
+        // ITaskbarList
+        [PreserveSig] int HrInit();
+        [PreserveSig] int AddTab(IntPtr hwnd);
+        [PreserveSig] int DeleteTab(IntPtr hwnd);
+        [PreserveSig] int ActivateTab(IntPtr hwnd);
+        [PreserveSig] int SetActiveAlt(IntPtr hwnd);
+
+        // ITaskbarList2
+        [PreserveSig] int MarkFullscreenWindow(IntPtr hwnd, [MarshalAs(UnmanagedType.Bool)] bool fFullscreen);
+
+        // ITaskbarList3
+        [PreserveSig] int SetProgressValue(IntPtr hwnd, ulong ullCompleted, ulong ullTotal);
+        [PreserveSig] int SetProgressState(IntPtr hwnd, int flags);
+        [PreserveSig] int RegisterTab(IntPtr hwndTab, IntPtr hwndMDI);
+        [PreserveSig] int UnregisterTab(IntPtr hwndTab);
+        [PreserveSig] int SetTabOrder(IntPtr hwndTab, IntPtr hwndInsertBefore);
+        [PreserveSig] int SetTabActive(IntPtr hwndTab, IntPtr hwndMDI, uint reserved);
+        [PreserveSig] int ThumbBarAddButtons(IntPtr hwnd, uint count,
+            [MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 1)] THUMBBUTTON[] buttons);
+        [PreserveSig] int ThumbBarUpdateButtons(IntPtr hwnd, uint count,
+            [MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 1)] THUMBBUTTON[] buttons);
+        [PreserveSig] int ThumbBarSetImageList(IntPtr hwnd, IntPtr himl);
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct THUMBBUTTON
+    {
+        public uint dwMask;
+        public uint iId;
+        public uint iBitmap;
+        public IntPtr hIcon;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szTip;
+        public uint dwFlags;
+    }
+
+    // ── P/Invoke ─────────────────────────────────────────────────
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr CreateIconIndirect(ref ICONINFO info);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DestroyIcon(IntPtr hIcon);
+
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr CreateBitmap(int w, int h, uint planes, uint bpp, IntPtr bits);
+
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr CreateDIBSection(IntPtr hdc, ref BITMAPINFOHEADER bmi,
+        uint usage, out IntPtr bits, IntPtr section, uint offset);
+
+    [DllImport("gdi32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DeleteObject(IntPtr obj);
+
+    [DllImport("comctl32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetWindowSubclass(IntPtr hWnd, SubclassProc proc,
+        UIntPtr id, IntPtr refData);
+
+    [DllImport("comctl32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool RemoveWindowSubclass(IntPtr hWnd, SubclassProc proc, UIntPtr id);
+
+    [DllImport("comctl32.dll")]
+    private static extern IntPtr DefSubclassProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, uint attr, ref int value, int size);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint RegisterWindowMessage(string msg);
+
+    private delegate IntPtr SubclassProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam,
+        UIntPtr id, IntPtr refData);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ICONINFO
+    {
+        [MarshalAs(UnmanagedType.Bool)] public bool fIcon;
+        public int xHotspot, yHotspot;
+        public IntPtr hbmMask, hbmColor;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BITMAPINFOHEADER
+    {
+        public int biSize, biWidth, biHeight;
+        public short biPlanes, biBitCount;
+        public int biCompression, biSizeImage, biXPelsPerMeter, biYPelsPerMeter, biClrUsed, biClrImportant;
+    }
+
+    // ── Constants ────────────────────────────────────────────────
+
+    private const uint THB_ICON = 0x0002, THB_TOOLTIP = 0x0004, THB_FLAGS = 0x0008;
+    private const uint THBF_ENABLED = 0x0000, THBF_HIDDEN = 0x0008;
+    private const uint WM_COMMAND = 0x0111, WM_SETTINGCHANGE = 0x001A, THBN_CLICKED = 0x1800;
+    private const uint ID_PREV = 1, ID_PLAY = 2, ID_NEXT = 3, ID_FAVORITE = 4;
+    private const int IconSize = 20;
+    private const uint DWMWA_DISALLOW_PEEK = 11;
+
+    // ── SVG path data (same as Icons.axaml, viewBox 0 0 24 24) ──
+
+    // Previous / Next are the playback bar's rewind / fast-forward glyphs (RewindIcon /
+    // FastForwardIcon in Icons.axaml), so the taskbar thumbnail matches the island.
+    private const string PathPrevious =
+        "M21.5 6.7Q21.5 5.1 20.1 5.9L12.7 11.1Q11.6 12 12.7 12.9L20.1 18.1Q21.5 18.9 21.5 17.3Z" +
+        "M12 6.7Q12 5.1 10.6 5.9L3.2 11.1Q2.1 12 3.2 12.9L10.6 18.1Q12 18.9 12 17.3Z";
+
+    private const string PathPlay =
+        "M5 5.274c0-1.707 1.826-2.792 3.325-1.977l12.362 6.727c1.566.852 1.566 3.1 0 3.952L8.325 20.702C6.826 21.518 5 20.432 5 18.726z";
+
+    private const string PathPause =
+        "M5.746 3a1.75 1.75 0 0 0-1.75 1.75v14.5c0 .966.784 1.75 1.75 1.75h3.5a1.75 1.75 0 0 0 1.75-1.75V4.75A1.75 1.75 0 0 0 9.246 3z" +
+        "m9 0a1.75 1.75 0 0 0-1.75 1.75v14.5c0 .966.784 1.75 1.75 1.75h3.5a1.75 1.75 0 0 0 1.75-1.75V4.75A1.75 1.75 0 0 0 18.246 3z";
+
+    private const string PathNext =
+        "M2.5 6.7Q2.5 5.1 3.9 5.9L11.3 11.1Q12.4 12 11.3 12.9L3.9 18.1Q2.5 18.9 2.5 17.3Z" +
+        "M12 6.7Q12 5.1 13.4 5.9L20.8 11.1Q21.9 12 20.8 12.9L13.4 18.1Q12 18.9 12 17.3Z";
+
+    private const string PathHeartOutline =
+        "m12.82 5.58l-.82.822l-.824-.824a5.375 5.375 0 1 0-7.601 7.602l7.895 7.895a.75.75 0 0 0 1.06 0l7.902-7.897a5.376 5.376 0 0 0-.001-7.599a5.38 5.38 0 0 0-7.611 0" +
+        "m6.548 6.54L12 19.485L4.635 12.12a3.875 3.875 0 1 1 5.48-5.48l1.358 1.357a.75.75 0 0 0 1.073-.012L13.88 6.64a3.88 3.88 0 0 1 5.487 5.48";
+
+    // Solid fill of the same rounded heart silhouette as PathHeartOutline (and the
+    // app's Favorites icon), so the favorited taskbar glyph matches the outline state.
+    private const string PathHeartFilled =
+        "M12.82 5.58l-.82.822l-.824-.824a5.375 5.375 0 1 0-7.601 7.602l7.895 7.895a.75.75 0 0 0 1.06 0l7.902-7.897a5.376 5.376 0 0 0-.001-7.599a5.38 5.38 0 0 0-7.611 0Z";
+
+    // ── Fields ───────────────────────────────────────────────────
+
+    private ITaskbarList3? _taskbar;
+    private IntPtr _hwnd;
+    private SubclassProc? _wndProc; // prevent GC
+    private IntPtr _icoPrev, _icoPlay, _icoPause, _icoNext;
+    private IntPtr _icoHeart, _icoHeartFilled;
+    private bool _ready;
+    private uint _taskbarButtonCreatedMsg;
+    // The thumbnail flyout follows the Windows (taskbar) theme, not the app theme;
+    // glyphs must be dark on a light flyout to stay readable.
+    private bool _lightTaskbar;
+    // Last known UI state, so re-added buttons show the right glyphs after the
+    // taskbar button is recreated (tray hide/show, Explorer restart, DPI change).
+    private bool _isPlaying, _isFavorite;
+    // Settings > "Media Controls on Taskbar". Buttons can't be removed once added, only
+    // hidden, so off sends every button with THBF_HIDDEN.
+    private bool _buttonsVisible = true;
+
+    public event Action? PreviousClicked;
+    public event Action? PlayPauseClicked;
+    public event Action? NextClicked;
+    public event Action? FavoriteClicked;
+
+    // ── Public API ───────────────────────────────────────────────
+
+    public void Initialize(IntPtr hwnd)
+    {
+        if (_ready) return;
+        _hwnd = hwnd;
+
+        try
+        {
+            var type = Type.GetTypeFromCLSID(new Guid("56FDF344-FD6D-11d0-958A-006097C9A090"));
+            if (type == null) return;
+
+            _taskbar = (ITaskbarList3?)Activator.CreateInstance(type);
+            if (_taskbar == null) return;
+            _taskbar.HrInit();
+
+            // Stop Aero Peek from turning every other window (including an auto-hide
+            // taskbar) transparent when the user hovers our taskbar thumbnail.
+            int disallowPeek = 1;
+            DwmSetWindowAttribute(_hwnd, DWMWA_DISALLOW_PEEK, ref disallowPeek, sizeof(int));
+
+            _lightTaskbar = IsLightTaskbarTheme();
+            CreateIcons();
+
+            AddButtons();
+
+            // Windows destroys the thumbnail toolbar whenever the taskbar button is
+            // recreated (window hidden to tray and re-shown, Explorer restart, DPI
+            // change) and broadcasts TaskbarButtonCreated; re-add the buttons then.
+            _taskbarButtonCreatedMsg = RegisterWindowMessage("TaskbarButtonCreated");
+
+            _wndProc = WndProc;
+            SetWindowSubclass(_hwnd, _wndProc, (UIntPtr)1, IntPtr.Zero);
+
+            // The tooltips are UI strings: follow a language switch in Settings live.
+            Loc.Instance.CultureChanged += OnCultureChanged;
+
+            _ready = true;
+        }
+        catch
+        {
+            // Taskbar integration not available
+        }
+    }
+
+    // ITaskbarList3 progress states.
+    private const int TBPF_NOPROGRESS = 0x0, TBPF_NORMAL = 0x2, TBPF_PAUSED = 0x8;
+    private int _lastProgressState = TBPF_NOPROGRESS;
+    private ulong _lastProgressValue = ulong.MaxValue;
+
+    /// <summary>
+    /// GitHub #53: paints the song's progress on the taskbar button (green while
+    /// playing, amber while paused, like AIMP). Values are sent in permille and only
+    /// when they change, so the ~10 Hz position stream doesn't spam COM.
+    /// </summary>
+    public void SetProgress(double position, double duration, bool paused)
+    {
+        if (!_ready || _taskbar == null) return;
+        if (!(duration > 0) || !double.IsFinite(position))
+        {
+            ClearProgress();
+            return;
+        }
+
+        var state = paused ? TBPF_PAUSED : TBPF_NORMAL;
+        var value = (ulong)Math.Clamp(Math.Round(position / duration * 1000), 0, 1000);
+        try
+        {
+            if (state != _lastProgressState)
+            {
+                _taskbar.SetProgressState(_hwnd, state);
+                _lastProgressState = state;
+            }
+            if (value != _lastProgressValue)
+            {
+                _taskbar.SetProgressValue(_hwnd, value, 1000);
+                _lastProgressValue = value;
+            }
+        }
+        catch { /* taskbar gone (Explorer restart) — next update retries */ }
+    }
+
+    /// <summary>Removes the progress overlay (stopped, or the setting switched off).</summary>
+    public void ClearProgress()
+    {
+        if (!_ready || _taskbar == null) return;
+        if (_lastProgressState == TBPF_NOPROGRESS) return;
+        try
+        {
+            _taskbar.SetProgressState(_hwnd, TBPF_NOPROGRESS);
+        }
+        catch { }
+        _lastProgressState = TBPF_NOPROGRESS;
+        _lastProgressValue = ulong.MaxValue;
+    }
+
+    public void UpdatePlayPauseState(bool isPlaying)
+    {
+        _isPlaying = isPlaying;
+        UpdateButton(ID_PLAY);
+    }
+
+    public void UpdateFavoriteState(bool isFavorite)
+    {
+        _isFavorite = isFavorite;
+        UpdateButton(ID_FAVORITE);
+    }
+
+    /// <summary>Shows or hides all thumbnail buttons live. Safe to call before
+    /// <see cref="Initialize"/>: the first add then uses this state.</summary>
+    public void SetButtonsVisible(bool visible)
+    {
+        if (_buttonsVisible == visible) return;
+        _buttonsVisible = visible;
+        if (!_ready || _taskbar == null) return;
+
+        var buttons = BuildButtons();
+        _taskbar.ThumbBarUpdateButtons(_hwnd, (uint)buttons.Length, buttons);
+    }
+
+    private void UpdateButton(uint id)
+    {
+        if (!_ready || _taskbar == null) return;
+
+        var buttons = BuildButtons().Where(b => b.iId == id).ToArray();
+        _taskbar.ThumbBarUpdateButtons(_hwnd, (uint)buttons.Length, buttons);
+    }
+
+    private void OnCultureChanged(object? sender, EventArgs e)
+    {
+        if (!_ready || _taskbar == null) return;
+
+        var buttons = BuildButtons();
+        _taskbar.ThumbBarUpdateButtons(_hwnd, (uint)buttons.Length, buttons);
+    }
+
+    /// <summary>Adds all four buttons reflecting the last known playback/favorite/visibility state.</summary>
+    private void AddButtons()
+    {
+        if (_taskbar == null) return;
+
+        var buttons = BuildButtons();
+        _taskbar.ThumbBarAddButtons(_hwnd, (uint)buttons.Length, buttons);
+    }
+
+    internal enum ThumbGlyph { Previous, Play, Pause, Next, Heart, HeartFilled }
+
+    /// <summary>What each thumbnail button shows, as data (headless-testable). Tooltips are
+    /// the playback bar's own localization keys, so they read the same as the island's.</summary>
+    internal readonly record struct ThumbButtonSpec(uint Id, ThumbGlyph Glyph, string TipKey, uint Flags);
+
+    /// <remarks>Every button carries the visibility flag, single-button updates (play/pause,
+    /// favorite) included: THB_FLAGS replaces the flags, so an update sent without
+    /// THBF_HIDDEN would bring a hidden button back.</remarks>
+    internal static ThumbButtonSpec[] DescribeButtons(bool isPlaying, bool isFavorite, bool visible = true)
+    {
+        var flags = visible ? THBF_ENABLED : THBF_HIDDEN;
+        return new[]
+        {
+            new ThumbButtonSpec(ID_PREV, ThumbGlyph.Previous, "PlaybackBar.PreviousTip", flags),
+            new ThumbButtonSpec(ID_PLAY, isPlaying ? ThumbGlyph.Pause : ThumbGlyph.Play,
+                isPlaying ? "PlaybackBar.Pause" : "PlaybackBar.Play", flags),
+            new ThumbButtonSpec(ID_NEXT, ThumbGlyph.Next, "PlaybackBar.ForwardTip", flags),
+            new ThumbButtonSpec(ID_FAVORITE, isFavorite ? ThumbGlyph.HeartFilled : ThumbGlyph.Heart,
+                isFavorite ? "PlaybackBar.RemoveFromFavorites" : "PlaybackBar.FavoriteTip", flags),
+        };
+    }
+
+    internal const uint HiddenFlag = THBF_HIDDEN;
+
+    private THUMBBUTTON[] BuildButtons() => DescribeButtons(_isPlaying, _isFavorite, _buttonsVisible)
+        .Select(b => Btn(b.Id, IconFor(b.Glyph), Loc.T(b.TipKey), b.Flags))
+        .ToArray();
+
+    private IntPtr IconFor(ThumbGlyph glyph) => glyph switch
+    {
+        ThumbGlyph.Previous => _icoPrev,
+        ThumbGlyph.Play => _icoPlay,
+        ThumbGlyph.Pause => _icoPause,
+        ThumbGlyph.Next => _icoNext,
+        ThumbGlyph.Heart => _icoHeart,
+        _ => _icoHeartFilled,
+    };
+
+    private void CreateIcons()
+    {
+        _icoPrev = MakeIcon(PathPrevious);
+        _icoPlay = MakeIcon(PathPlay);
+        _icoPause = MakeIcon(PathPause);
+        _icoNext = MakeIcon(PathNext);
+        // The outline heart is a thin-outline glyph that reads lighter than the solid
+        // play/prev/next icons. Add a bold stroke pass so its visual weight matches at 20×20.
+        _icoHeart = MakeIcon(PathHeartOutline, boldenOutline: true);
+        _icoHeartFilled = MakeIcon(PathHeartFilled);
+    }
+
+    private void DestroyIcons()
+    {
+        if (_icoPrev != IntPtr.Zero) DestroyIcon(_icoPrev);
+        if (_icoPlay != IntPtr.Zero) DestroyIcon(_icoPlay);
+        if (_icoPause != IntPtr.Zero) DestroyIcon(_icoPause);
+        if (_icoNext != IntPtr.Zero) DestroyIcon(_icoNext);
+        if (_icoHeart != IntPtr.Zero) DestroyIcon(_icoHeart);
+        if (_icoHeartFilled != IntPtr.Zero) DestroyIcon(_icoHeartFilled);
+        _icoPrev = _icoPlay = _icoPause = _icoNext = _icoHeart = _icoHeartFilled = IntPtr.Zero;
+    }
+
+    /// <summary>
+    /// True when the Windows shell (taskbar/flyouts) uses the light theme —
+    /// "SystemUsesLightTheme", distinct from the app theme ("AppsUseLightTheme").
+    /// </summary>
+    private static bool IsLightTaskbarTheme()
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+            return key?.GetValue("SystemUsesLightTheme") is int i && i != 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // ── WndProc hook ─────────────────────────────────────────────
+
+    private IntPtr WndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam,
+        UIntPtr id, IntPtr refData)
+    {
+        if (_taskbarButtonCreatedMsg != 0 && msg == _taskbarButtonCreatedMsg)
+        {
+            // Taskbar button was recreated — the old thumbnail toolbar is gone.
+            AddButtons();
+        }
+        else if (msg == WM_SETTINGCHANGE && lParam != IntPtr.Zero &&
+                 Marshal.PtrToStringUni(lParam) == "ImmersiveColorSet")
+        {
+            // Windows theme changed while running — re-render the glyphs so they
+            // stay readable against the new flyout background.
+            bool light = IsLightTaskbarTheme();
+            if (light != _lightTaskbar && _taskbar != null)
+            {
+                _lightTaskbar = light;
+                var old = new[] { _icoPrev, _icoPlay, _icoPause, _icoNext, _icoHeart, _icoHeartFilled };
+                CreateIcons();
+                var buttons = BuildButtons();
+                _taskbar.ThumbBarUpdateButtons(_hwnd, (uint)buttons.Length, buttons);
+                foreach (var h in old)
+                    if (h != IntPtr.Zero) DestroyIcon(h);
+            }
+        }
+        else if (msg == WM_COMMAND)
+        {
+            uint hi = ((uint)(int)wParam >> 16) & 0xFFFF;
+            uint lo = (uint)(int)wParam & 0xFFFF;
+
+            if (hi == THBN_CLICKED)
+            {
+                switch (lo)
+                {
+                    case ID_PREV: PreviousClicked?.Invoke(); break;
+                    case ID_PLAY: PlayPauseClicked?.Invoke(); break;
+                    case ID_NEXT: NextClicked?.Invoke(); break;
+                    case ID_FAVORITE: FavoriteClicked?.Invoke(); break;
+                }
+            }
+        }
+        return DefSubclassProc(hWnd, msg, wParam, lParam);
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────
+
+    private static THUMBBUTTON Btn(uint id, IntPtr icon, string tip, uint flags) => new()
+    {
+        dwMask = THB_ICON | THB_TOOLTIP | THB_FLAGS,
+        iId = id,
+        hIcon = icon,
+        szTip = tip,
+        dwFlags = flags,
+    };
+
+    // ── Icon creation via SkiaSharp (SVG path rendering) ─────────
+
+    private IntPtr MakeIcon(string svgPathData, byte alpha = 0xFF, bool boldenOutline = false)
+    {
+        const float viewBox = 24f;
+        const float padding = 2f;
+
+        using var path = SKPath.ParseSvgPathData(svgPathData);
+        if (path == null) return IntPtr.Zero;
+
+        using var bitmap = new SKBitmap(IconSize, IconSize, SKColorType.Bgra8888, SKAlphaType.Unpremul);
+        using var canvas = new SKCanvas(bitmap);
+
+        canvas.Clear(SKColors.Transparent);
+
+        // Scale from 24x24 viewBox to icon size with padding for crispness
+        float scale = (IconSize - padding * 2) / viewBox;
+        canvas.Translate(padding, padding);
+        canvas.Scale(scale, scale);
+
+        // White glyphs on the dark flyout, near-black on the light one (matches
+        // Windows' own light-theme glyph color).
+        byte lum = _lightTaskbar ? (byte)0x1B : (byte)0xFF;
+        using var paint = new SKPaint
+        {
+            Color = new SKColor(lum, lum, lum, alpha),
+            IsAntialias = true,
+            Style = SKPaintStyle.Fill,
+        };
+
+        canvas.DrawPath(path, paint);
+
+        // Outline-style glyphs (shuffle, outline heart) read lighter than the solid
+        // play/prev/next icons. Stroke the same path on top to thicken the visible
+        // edges so all five taskbar icons share the same weight.
+        if (boldenOutline)
+        {
+            using var stroke = new SKPaint
+            {
+                Color = paint.Color,
+                IsAntialias = true,
+                Style = SKPaintStyle.Stroke,
+                StrokeWidth = 1.6f, // in 24-unit viewBox space
+                StrokeJoin = SKStrokeJoin.Round,
+                StrokeCap = SKStrokeCap.Round,
+            };
+            canvas.DrawPath(path, stroke);
+        }
+
+        canvas.Flush();
+
+        // Create Win32 HICON from the SkiaSharp bitmap pixel data
+        var bmi = new BITMAPINFOHEADER
+        {
+            biSize = Marshal.SizeOf<BITMAPINFOHEADER>(),
+            biWidth = IconSize,
+            biHeight = -IconSize, // top-down
+            biPlanes = 1,
+            biBitCount = 32,
+        };
+
+        var hColor = CreateDIBSection(IntPtr.Zero, ref bmi, 0, out var bits, IntPtr.Zero, 0);
+        if (hColor == IntPtr.Zero) return IntPtr.Zero;
+
+        Marshal.Copy(bitmap.Bytes, 0, bits, bitmap.Bytes.Length);
+
+        var hMask = CreateBitmap(IconSize, IconSize, 1, 1, IntPtr.Zero);
+        var info = new ICONINFO { fIcon = true, hbmColor = hColor, hbmMask = hMask };
+        var hIcon = CreateIconIndirect(ref info);
+
+        DeleteObject(hColor);
+        DeleteObject(hMask);
+        return hIcon;
+    }
+
+    // ── Dispose ──────────────────────────────────────────────────
+
+    public void Dispose()
+    {
+        Loc.Instance.CultureChanged -= OnCultureChanged;
+        if (_ready && _hwnd != IntPtr.Zero && _wndProc != null)
+            RemoveWindowSubclass(_hwnd, _wndProc, (UIntPtr)1);
+
+        DestroyIcons();
+
+        _ready = false;
+
+        // Release what the subclass and the RCW were holding. Clearing _ready stops us
+        // using them, but the ITaskbarList3 reference and the pinned delegate outlived
+        // the window they were bound to.
+        if (_taskbar != null)
+        {
+            try { System.Runtime.InteropServices.Marshal.FinalReleaseComObject(_taskbar); }
+            catch { /* already released, or never marshalled */ }
+            _taskbar = null;
+        }
+        _wndProc = null;
+    }
+}

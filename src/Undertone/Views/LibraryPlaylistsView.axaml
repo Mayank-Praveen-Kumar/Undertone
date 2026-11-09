@@ -1,0 +1,168 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:loc="using:Undertone.Localization"
+             xmlns:vm="using:Undertone.ViewModels"
+             xmlns:m="using:Undertone.Models"
+             xmlns:conv="using:Undertone.Converters"
+             xmlns:ctrl="using:Undertone.Controls"
+             x:Class="Undertone.Views.LibraryPlaylistsView"
+             x:DataType="vm:LibraryPlaylistsViewModel"
+             Background="{DynamicResource AppMainBackground}">
+
+    <UserControl.Resources>
+        <conv:HexColorToBrushConverter x:Key="HexColorConverter" />
+        <conv:ArtworkPathConverter x:Key="ArtworkConverter" />
+    </UserControl.Resources>
+
+    <Grid RowDefinitions="*">
+        <!-- Right margin trimmed to 2 so the vertical scrollbar sits at the window edge. -->
+        <DockPanel Grid.Row="0" Margin="16,8,2,16">
+
+        <!-- Content area with overlay for empty state -->
+        <Grid>
+            <!-- Playlist grid (responsive wrap panel). Bar pinned Visible like the Albums
+                 page: the square tiles make the grid's height follow its width, so an Auto
+                 bar showed/hid on every layout pass in a narrow window-height band (#83). -->
+            <ScrollViewer HorizontalScrollBarVisibility="Disabled"
+                          VerticalScrollBarVisibility="Visible">
+                <ItemsControl ItemsSource="{Binding FilteredPlaylists}"
+                              Margin="0,0,0,115">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <UniformGrid Columns="5" VerticalAlignment="Top" />
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="m:PlaylistNavItem">
+                            <Button Classes="album-tile"
+                                    AutomationProperties.Name="{Binding Label}"
+                                    Margin="2"
+                                    HorizontalAlignment="Stretch"
+                                    VerticalAlignment="Top"
+                                    Command="{Binding $parent[ItemsControl].((vm:LibraryPlaylistsViewModel)DataContext).OpenPlaylistCommand}"
+                                    CommandParameter="{Binding}"
+                                    ContextRequested="OnPlaylistTileContextRequested">
+                                <!-- Right-click / dots: one shared v2 menu built in code (OnPlaylistTileContextRequested). -->
+
+                                <StackPanel Spacing="0">
+                                    <!-- Playlist artwork with layered fallback (synced with sidebar) -->
+                                    <Border CornerRadius="8"
+                                            ClipToBounds="True"
+                                            Background="{Binding Color, Converter={StaticResource HexColorConverter}}">
+                                        <Border.Styles>
+                                            <Style Selector="Border">
+                                                <Setter Property="Height" Value="{Binding $self.Bounds.Width}" />
+                                            </Style>
+                                        </Border.Styles>
+                                        <Panel>
+                                            <!-- Layer 1: Fallback playlist icon -->
+                                            <PathIcon Data="{StaticResource PlaylistsIcon}"
+                                                      Width="48" Height="48"
+                                                      Foreground="{DynamicResource TertiaryTextBrush}"
+                                                      HorizontalAlignment="Center"
+                                                      VerticalAlignment="Center"
+                                                      IsVisible="{Binding ShowFallbackIcon}" />
+
+                                            <!-- Layer 2: Single album art (only 1 unique art) -->
+                                            <ctrl:CachedImage SourcePath="{Binding Art1}"
+                                                              Stretch="UniformToFill"
+                                                              IsVisible="{Binding HasSingleArt}" />
+
+                                            <!-- Layer 3: 2x2 collage (2+ unique arts) -->
+                                            <Grid RowDefinitions="*,*"
+                                                  ColumnDefinitions="*,*"
+                                                  IsVisible="{Binding HasCollageArt}">
+                                                <ctrl:CachedImage Grid.Row="0" Grid.Column="0"
+                                                                  SourcePath="{Binding Art1}"
+                                                                  Stretch="UniformToFill" />
+                                                <ctrl:CachedImage Grid.Row="0" Grid.Column="1"
+                                                                  SourcePath="{Binding Art2}"
+                                                                  Stretch="UniformToFill" />
+                                                <ctrl:CachedImage Grid.Row="1" Grid.Column="0"
+                                                                  SourcePath="{Binding Art3}"
+                                                                  Stretch="UniformToFill" />
+                                                <ctrl:CachedImage Grid.Row="1" Grid.Column="1"
+                                                                  SourcePath="{Binding Art4}"
+                                                                  Stretch="UniformToFill" />
+                                            </Grid>
+
+                                            <!-- Layer 4: Custom cover art (highest priority) -->
+                                            <ctrl:CachedImage SourcePath="{Binding CoverArtPath}"
+                                                              Stretch="UniformToFill"
+                                                              IsVisible="{Binding HasCustomArt}" />
+                                            <!-- Hover overlay (09-14): the album tile's dim + Play + dots
+                                                 (styles in Styles.axaml, keyed on the tile's album-tile
+                                                 class); the dots open this tile's context menu. -->
+                                            <Border Classes="tile-dim" />
+                                            <Button Classes="tile-play"
+                                                    Command="{Binding $parent[UserControl].((vm:LibraryPlaylistsViewModel)DataContext).PlayPlaylistCommand}"
+                                                    CommandParameter="{Binding}">
+                                                <Viewbox Width="12" Height="12" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="1,0,0,0"><Path Data="{StaticResource PlayIcon}" Fill="White" /></Viewbox>
+                                            </Button>
+                                            <Button Classes="tile-more" Click="OnTileMoreClick">
+                                                <Viewbox Width="14" Height="14" HorizontalAlignment="Center" VerticalAlignment="Center"><Path Data="{StaticResource MoreDotsIcon}" Fill="White" /></Viewbox>
+                                            </Button>
+                                        </Panel>
+                                    </Border>
+                                    <!-- Playlist name -->
+                                    <ctrl:HighlightTextBlock DisplayText="{Binding Label}"
+                                                             HighlightText="{Binding $parent[UserControl].((vm:LibraryPlaylistsViewModel)DataContext).SearchText}"
+                                                             FontSize="14"
+                                                             FontWeight="SemiBold"
+                                                             TextTrimming="CharacterEllipsis"
+                                                             MaxLines="1"
+                                                             Margin="2,6,2,0" />
+                                    <!-- "16 tracks · 54 min" -->
+                                    <TextBlock Text="{Binding MetaText}"
+                                               FontSize="12"
+                                               Opacity="0.55"
+                                               TextTrimming="CharacterEllipsis"
+                                               MaxLines="1"
+                                               Margin="2,2,2,0"
+                                               IsVisible="{Binding MetaText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                                </StackPanel>
+                            </Button>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </ScrollViewer>
+
+            <!-- Empty state overlay: no playlists at all -->
+            <StackPanel IsVisible="{Binding ShowNoPlaylists}"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Spacing="8">
+                <TextBlock Text="{loc:T LibraryPlaylists.NoPlaylistsYet}"
+                           FontSize="18"
+                           Opacity="0.5"
+                           HorizontalAlignment="Center"
+                           TextAlignment="Center" />
+                <TextBlock Text="{loc:T LibraryPlaylists.CreateNewPlaylistGet}"
+                           FontSize="13"
+                           Opacity="0.3"
+                           HorizontalAlignment="Center"
+                           TextAlignment="Center" />
+            </StackPanel>
+
+            <!-- Empty state overlay: search matched nothing -->
+            <StackPanel IsVisible="{Binding ShowNoResults}"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Spacing="8">
+                <TextBlock Text="{loc:T LibraryPlaylists.NoResults}"
+                           FontSize="18"
+                           Opacity="0.5"
+                           HorizontalAlignment="Center"
+                           TextAlignment="Center" />
+                <TextBlock Text="{loc:T LibraryPlaylists.NoPlaylistsMatchSearch}"
+                           FontSize="13"
+                           Opacity="0.3"
+                           HorizontalAlignment="Center"
+                           TextAlignment="Center" />
+            </StackPanel>
+        </Grid>
+
+        </DockPanel>
+    </Grid>
+
+</UserControl>

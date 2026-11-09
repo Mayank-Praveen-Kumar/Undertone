@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: heartached.Undertone
+PackageVersion: 1.1.14
+PackageLocale: en-US
+Publisher: heartached
+PublisherUrl: https://github.com/heartached
+PublisherSupportUrl: https://github.com/Mayank-Praveen-Kumar/Undertone/issues
+PackageName: Undertone
+PackageUrl: https://github.com/Mayank-Praveen-Kumar/Undertone
+License: MIT
+LicenseUrl: https://github.com/Mayank-Praveen-Kumar/Undertone/blob/main/LICENSE
+Copyright: Copyright (c) 2026 heartached
+ShortDescription: A music player that respects what's yours.
+Description: |-
+  Undertone is a desktop music player for your local library — fast browsing,
+  synced lyrics, metadata editing, EQ, and more.
+Tags:
+  - music
+  - music-player
+  - audio
+  - player
+  - lyrics
+  - avalonia
+ReleaseNotesUrl: https://github.com/Mayank-Praveen-Kumar/Undertone/releases/tag/v1.1.14
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

@@ -1,0 +1,737 @@
+using System;
+using System.Collections.ObjectModel;
+using System.Windows.Input;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using Undertone.Localization;
+using Undertone.Services;
+
+namespace Undertone.ViewModels;
+
+/// <summary>
+/// Manages the top search bar state.
+/// Search text changes are debounced and forwarded to the active content ViewModel.
+/// </summary>
+public partial class TopBarViewModel : ViewModelBase
+{
+    [ObservableProperty] private string _searchText = string.Empty;
+    [ObservableProperty] private bool _isSearchFocused;
+    /// <summary>The current section's ENGLISH tab name — an identifier, compared in several
+    /// places ("Home", "Settings", "Lyrics", …). Never shown directly: the header and the
+    /// search watermark use <see cref="CurrentTabTitle"/>, its localized form.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(PageTitleDisplay))]
+    [NotifyPropertyChangedFor(nameof(CurrentTabTitle))]
+    [NotifyPropertyChangedFor(nameof(IsSearchActionAvailable))]
+    [NotifyPropertyChangedFor(nameof(IsBetaPage))]
+    private string _currentTabName = "Library";
+
+    /// <summary>Sections still in beta carry a "Beta" pill next to the header title (Lyrics Studio, 09-23).</summary>
+    public bool IsBetaPage => CurrentTabName == "Lyrics Studio";
+
+    /// <summary>Localized display name of the current section.</summary>
+    public string CurrentTabTitle => Loc.T(TabTitleKey(CurrentTabName));
+
+    /// <summary>Resource key for a tab name; unknown names (a playlist's own title) pass through
+    /// unchanged because <see cref="Loc.T(string)"/> returns unknown keys verbatim.</summary>
+    public static string TabTitleKey(string tabName) => tabName switch
+    {
+        "Home" => "Nav.Home", "Songs" => "Nav.Songs", "Albums" => "Nav.Albums", "Artists" => "Nav.Artists",
+        "Folders" => "Nav.Folders", "Playlists" => "Nav.Playlists", "Favorites" => "Nav.Favorites",
+        "Visualizer" => "Nav.Visualizer", "Lyrics Studio" => "Nav.LyricsStudio", "Settings" => "Nav.Settings", "Server" => "Nav.Server", "Audio CD" => "Nav.AudioCd",
+        "Statistics" => "Tab.Statistics", "Queue" => "Tab.Queue", "Lyrics" => "Tab.Lyrics",
+        "Playlist" => "Tab.Playlist", "Library" => "Tab.Library",
+        _ => tabName,
+    };
+
+    /// <summary>Header title: reflects the Cover Flow / Collage view when active, otherwise the section name.
+    /// Collage is a Cover Flow sub-mode, so its label only applies while Cover Flow is active.</summary>
+    public string PageTitleDisplay => IsCoverFlowMode
+        ? Loc.T(IsCollageMode ? "TopBar.CoverCollage" : "TopBar.CoverFlow")
+        : CurrentTabTitle;
+    [ObservableProperty] private string _searchWatermark = Loc.T("TopBar.SearchIn", Loc.T("Tab.Library"));
+
+    /// <summary>Re-reads the localized header/watermark after a language switch (the watermark
+    /// is owned by MainWindowViewModel.RefreshBackButton, which listens for the same event).</summary>
+    public void RefreshLocalizedTitles()
+    {
+        OnPropertyChanged(nameof(CurrentTabTitle));
+        OnPropertyChanged(nameof(PageTitleDisplay));
+    }
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsSearchActionAvailable))]
+    private bool _isSearchVisible = true;
+
+    /// <summary>Enables the sidebar magnifier. Home itself is not searchable, but the
+    /// button stays clickable there because invoking search on Home redirects to the
+    /// Songs page (see <see cref="OpenSearch"/>).</summary>
+    public bool IsSearchActionAvailable => IsSearchVisible || CurrentTabName == "Home";
+    // The search pill is a persistent (non-light-dismiss) popup: it stays open while
+    // the user browses/filters and only closes explicitly (toggle, Esc, or navigating
+    // to a page without search).
+    [ObservableProperty] private bool _isSearchOpen;
+
+    // Back button (shown in detail views like Album Detail, Genre Detail, etc.)
+    [ObservableProperty] private bool _isBackButtonVisible;
+    [ObservableProperty] private bool _isGenericBackButtonVisible;
+    [ObservableProperty] private bool _isAlbumDetailBackButtonVisible;
+    [ObservableProperty] private string _backButtonText = "";
+    [ObservableProperty] private string _backButtonDisplayText = "Back";
+    [ObservableProperty] private string _albumDetailBackButtonDisplayText = "Back";
+    [ObservableProperty] private ICommand? _backCommand;
+
+    // Optional title shown next to the Back button (e.g., "More By {Artist}")
+    [ObservableProperty] private string _backContextTitle = "";
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasBarContent))]
+    private bool _isBackContextTitleVisible;
+
+    /// <summary>
+    /// True when the top bar actually renders something (title, context title, chips,
+    /// action buttons, or the view-mode toggle). Detail pages like Album Detail show
+    /// none of these — Back/Search live in the sidebar rail — so the bar row collapses
+    /// there instead of leaving a fixed empty strip above the content.
+    /// </summary>
+    public bool HasBarContent =>
+        IsPageTitleVisible
+        || IsBackContextTitleVisible
+        || HasReleaseTypeChips
+        || PageActionsVisible
+        || HasPlaylistActions
+        || HasViewModeToggle
+        || HasArtistActions
+        || HasFavoritesActions
+        || HasFoldersActions
+        || HasArtistSort
+        || SongsFiltersVisible;
+
+    public void ShowBackButton(string text, ICommand command, string? contextTitle = null)
+    {
+        var displayText = string.IsNullOrWhiteSpace(text) ? "Back" : text;
+        BackButtonText = displayText;
+        BackButtonDisplayText = displayText;
+        BackCommand = command;
+        IsBackButtonVisible = true;
+        IsGenericBackButtonVisible = true;
+        IsAlbumDetailBackButtonVisible = false;
+        BackContextTitle = contextTitle ?? string.Empty;
+        IsBackContextTitleVisible = !string.IsNullOrWhiteSpace(contextTitle);
+    }
+
+    public void ShowAlbumDetailBackButton(string text, ICommand command)
+    {
+        var displayText = string.IsNullOrWhiteSpace(text) ? "Back" : text;
+        AlbumDetailBackButtonDisplayText = displayText;
+        BackButtonText = displayText;
+        BackButtonDisplayText = displayText;
+        BackCommand = command;
+        IsBackButtonVisible = true;
+        IsGenericBackButtonVisible = false;
+        IsAlbumDetailBackButtonVisible = true;
+        BackContextTitle = string.Empty;
+        IsBackContextTitleVisible = false;
+    }
+
+    public void HideBackButton()
+    {
+        IsBackButtonVisible = false;
+        IsGenericBackButtonVisible = false;
+        IsAlbumDetailBackButtonVisible = false;
+        BackCommand = null;
+        BackButtonText = "";
+        BackButtonDisplayText = "Back";
+        AlbumDetailBackButtonDisplayText = "Back";
+        BackContextTitle = "";
+        IsBackContextTitleVisible = false;
+        UpdatePageTitleVisibility();
+    }
+
+    // Page title (shown on left when back button is hidden and on a library page)
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasBarContent))]
+    private bool _isPageTitleVisible;
+
+    // Page action buttons (set by navigation for pages that have them)
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(PageActionsVisible))]
+    [NotifyPropertyChangedFor(nameof(HasBarContent))]
+    private bool _hasPageActions;
+    [ObservableProperty] private ICommand? _pageShuffleCommand;
+    [ObservableProperty] private ICommand? _pageQueueCommand;
+
+    /// <summary>Page actions (Shuffle/Options) are hidden in Cover Flow mode — they don't apply there.</summary>
+    public bool PageActionsVisible => HasPageActions && !IsCoverFlowMode;
+
+    // Songs page: library summary ("2,144 songs · 138 hours") + quality filter chips
+    // (All / Lossless / Hi-Res). Owned by LibrarySongsViewModel, mirrored here for
+    // top-bar placement — same pattern as the Albums release-type chips.
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(SongsFiltersVisible))]
+    [NotifyPropertyChangedFor(nameof(HasBarContent))]
+    [NotifyPropertyChangedFor(nameof(IsSongsFilterActive))]
+    private bool _hasSongsFilters;
+    [ObservableProperty] private string _songsSummaryText = string.Empty;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(SongsQualityAll))]
+    [NotifyPropertyChangedFor(nameof(SongsQualityLossless))]
+    [NotifyPropertyChangedFor(nameof(SongsQualityHiRes))]
+    [NotifyPropertyChangedFor(nameof(IsSongsFilterActive))]
+    private string _songsQualityFilter = "All";
+    [ObservableProperty] private ICommand? _songsQualityCommand;
+
+    /// <summary>Songs filter chips are hidden in Cover Flow mode, like the page actions.</summary>
+    public bool SongsFiltersVisible => HasSongsFilters && !IsCoverFlowMode;
+
+    public bool SongsQualityAll => SongsQualityFilter == "All";
+    public bool SongsQualityLossless => SongsQualityFilter == "Lossless";
+    public bool SongsQualityHiRes => SongsQualityFilter == "HiRes";
+
+    public void ShowSongsFilters(string summaryText, string qualityFilter, ICommand qualityCommand)
+    {
+        SongsSummaryText = summaryText;
+        SongsQualityFilter = qualityFilter;
+        SongsQualityCommand = qualityCommand;
+        HasSongsFilters = true;
+    }
+
+    public void HideSongsFilters()
+    {
+        HasSongsFilters = false;
+        SongsSummaryText = string.Empty;
+        SongsQualityCommand = null;
+    }
+
+    // Playlist-specific action buttons
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasBarContent))]
+    [NotifyPropertyChangedFor(nameof(PlaylistActionsVisible))]
+    private bool _hasPlaylistActions;
+
+    // Section actions don't apply while the Cover Flow overlay is up (its content is
+    // the queue, not the section underneath), so every section's action group is gated
+    // the same way the Songs actions already were. Previously only Songs was gated,
+    // which is why Folders/Playlists/Favorites buttons leaked into Cover Flow.
+    public bool PlaylistActionsVisible => HasPlaylistActions && !IsCoverFlowMode;
+    public bool FoldersActionsVisible => HasFoldersActions && !IsCoverFlowMode;
+    public bool FavoritesActionsVisible => HasFavoritesActions && !IsCoverFlowMode;
+
+    // Cover Flow layout picker (Carousel / Cascade / Collage), shown as a labelled
+    // dropdown segment on the view-mode pill while Cover Flow is active.
+    [ObservableProperty] private ICommand? _setCoverFlowLayoutCommand;
+    [ObservableProperty] private string _coverFlowLayoutLabel = "Carousel";
+
+    // Artists grid sort (Name / Songs / Albums + direction), mirrored here for top-bar
+    // placement — same pattern as the Albums sort chip.
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasBarContent))]
+    [NotifyPropertyChangedFor(nameof(ArtistSortVisible))]
+    private bool _hasArtistSort;
+    /// <summary>Cover Flow shows albums over the section, so the Artists sort and view icons
+    /// hide there like the Folders / Playlists / Favorites actions do.</summary>
+    public bool ArtistSortVisible => HasArtistSort && !IsCoverFlowMode;
+    [ObservableProperty] private ICommand? _artistSortCommand;
+    /// <summary>Artists page grid ↔ list icon (rides <see cref="ArtistSortVisible"/>).</summary>
+    [ObservableProperty] private ICommand? _toggleArtistViewCommand;
+    [ObservableProperty] private bool _isArtistListView;
+    [ObservableProperty] private string _artistSortLabel = "Name";
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ArtistSortDescending))]
+    private bool _artistSortAscending = true;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsArtistSortActive))]
+    private string _artistSortMode = "name";
+    public bool ArtistSortDescending => !ArtistSortAscending;
+
+    public void ShowArtistSort(ICommand sortCommand, string label, string mode, bool ascending,
+        ICommand? toggleViewCommand = null, bool isListView = false)
+    {
+        ArtistSortCommand = sortCommand;
+        ArtistSortLabel = label;
+        ArtistSortMode = mode;
+        ArtistSortAscending = ascending;
+        ToggleArtistViewCommand = toggleViewCommand;
+        IsArtistListView = isListView;
+        HasArtistSort = true;
+    }
+
+    public void HideArtistSort()
+    {
+        HasArtistSort = false;
+        ArtistSortCommand = null;
+        ToggleArtistViewCommand = null;
+    }
+
+    /// <summary>Artists View menu (Grid / List): picks a layout, toggling only when it differs,
+    /// so choosing the checked item is a no-op rather than a flip.</summary>
+    [RelayCommand]
+    private void SetArtistView(string? mode)
+    {
+        var wantList = string.Equals(mode, "list", StringComparison.OrdinalIgnoreCase);
+        if (wantList != IsArtistListView)
+            ToggleArtistViewCommand?.Execute(null);
+    }
+    [ObservableProperty] private ICommand? _pageCreatePlaylistCommand;
+    [ObservableProperty] private ICommand? _pageCreateSmartPlaylistCommand;
+    [ObservableProperty] private ICommand? _pageImportPlaylistCommand;
+    /// <summary>Playlists page New ▸ "Playlist from a Genre or Artist" (Discord, Cosmo 11-02).</summary>
+    [ObservableProperty] private ICommand? _pageQuickPlaylistCommand;
+
+    // Playlists grid sort, mirrored here for top-bar placement — same pattern as the
+    // Albums sort chip above. Rides HasPlaylistActions so it appears and disappears with
+    // the New button rather than needing its own visibility flag.
+    [ObservableProperty] private string _playlistSortLabel = "Default";
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsPlaylistSortActive))]
+    private string _playlistSortMode = "default";
+    [ObservableProperty] private ICommand? _playlistSortCommand;
+
+    // Global view mode toggle (Library / Cover Flow) — shown on Home, Songs, Albums, Artists, Folders, Playlists, Favorites
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasBarContent))]
+    private bool _hasViewModeToggle;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(PageActionsVisible))]
+    [NotifyPropertyChangedFor(nameof(SongsFiltersVisible))]
+    [NotifyPropertyChangedFor(nameof(PlaylistActionsVisible))]
+    [NotifyPropertyChangedFor(nameof(FoldersActionsVisible))]
+    [NotifyPropertyChangedFor(nameof(FavoritesActionsVisible))]
+    [NotifyPropertyChangedFor(nameof(ArtistSortVisible))]
+    [NotifyPropertyChangedFor(nameof(PageTitleDisplay))]
+    [NotifyPropertyChangedFor(nameof(HasBarContent))]
+    [NotifyPropertyChangedFor(nameof(CoverFlowToggleVisible))]
+    [NotifyPropertyChangedFor(nameof(AlbumsViewToggleVisible))]
+    private bool _isCoverFlowMode;
+    [ObservableProperty] private ICommand? _setLibraryModeCommand;
+    [ObservableProperty] private ICommand? _setCoverFlowModeCommand;
+
+    // Cover Flow sub-mode (Carousel / Collage) — icon segment shown on the pill only while Cover Flow is active
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(PageTitleDisplay))]
+    private bool _isCollageMode;
+    [ObservableProperty] private ICommand? _toggleCollageModeCommand;
+
+    // Artist discography action buttons
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasBarContent))]
+    private bool _hasArtistActions;
+    [ObservableProperty] private ICommand? _pageShuffleArtistCommand;
+    [ObservableProperty] private ICommand? _pagePlayArtistCommand;
+
+    // Folders action buttons (Play / Shuffle / Manage Folders)
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasBarContent))]
+    [NotifyPropertyChangedFor(nameof(FoldersActionsVisible))]
+    private bool _hasFoldersActions;
+    [ObservableProperty] private ICommand? _pagePlayFolderCommand;
+    [ObservableProperty] private ICommand? _pageShuffleFolderCommand;
+    [ObservableProperty] private ICommand? _pageManageFoldersCommand;
+
+    // Folders track-pane sort (GitHub #89), mirrored from LibraryFoldersViewModel like
+    // the Playlists sort; rides HasFoldersActions for visibility.
+    [ObservableProperty] private ICommand? _foldersSortCommand;
+    [ObservableProperty] private string _foldersSortLabel = "Folder Order";
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsFoldersSortActive))]
+    private string _foldersSortMode = "default";
+
+    // Favorites action buttons
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasBarContent))]
+    [NotifyPropertyChangedFor(nameof(FavoritesActionsVisible))]
+    private bool _hasFavoritesActions;
+    [ObservableProperty] private ICommand? _pageShuffleFavoritesCommand;
+    [ObservableProperty] private ICommand? _pagePlayFavoritesCommand;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsSongsFilterActive))]
+    private bool _pageShowOnlyFavorites;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsSongsSortActive))]
+    private bool _pageSortAscending = true;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsSongsSortActive))]
+    private string _pageSortColumn = string.Empty;
+    [ObservableProperty] private ICommand? _pageSetShowAllItemsCommand;
+    [ObservableProperty] private ICommand? _pageSetShowOnlyFavoritesCommand;
+    [ObservableProperty] private ICommand? _pageSortCommand;
+    [ObservableProperty] private ICommand? _pageViewOptionsCommand;
+
+    // Computed inverses for non-compiled binding compatibility
+    public bool PageShowAllItems => !PageShowOnlyFavorites;
+    public bool PageSortDescending => !PageSortAscending;
+
+    // Checkmarks in the Sort Options submenu compare each item's key against
+    // PageSortColumn through StringEqualsConverter. This replaced three hand-written
+    // per-field flags that covered only Album Artist / Year / Date Added — sorting by
+    // any other field (every one reachable from a column header) left the whole submenu
+    // rendering unchecked, as if nothing were selected.
+
+    partial void OnPageShowOnlyFavoritesChanged(bool value) => OnPropertyChanged(nameof(PageShowAllItems));
+    partial void OnPageSortAscendingChanged(bool value) => OnPropertyChanged(nameof(PageSortDescending));
+
+    public void ShowPageActions(
+        ICommand shuffleCommand,
+        ICommand queueCommand,
+        bool showOnlyFavorites,
+        bool sortAscending,
+        string sortColumn,
+        ICommand setShowAllItemsCommand,
+        ICommand setShowOnlyFavoritesCommand,
+        ICommand sortCommand,
+        ICommand viewOptionsCommand)
+    {
+        PageShuffleCommand = shuffleCommand;
+        PageQueueCommand = queueCommand;
+        PageShowOnlyFavorites = showOnlyFavorites;
+        PageSortAscending = sortAscending;
+        PageSortColumn = sortColumn ?? string.Empty;
+        PageSetShowAllItemsCommand = setShowAllItemsCommand;
+        PageSetShowOnlyFavoritesCommand = setShowOnlyFavoritesCommand;
+        PageSortCommand = sortCommand;
+        PageViewOptionsCommand = viewOptionsCommand;
+        HasPageActions = true;
+    }
+
+    public void HidePageActions()
+    {
+        HasPageActions = false;
+        PageShuffleCommand = null;
+        PageQueueCommand = null;
+        PageSetShowAllItemsCommand = null;
+        PageSetShowOnlyFavoritesCommand = null;
+        PageSortCommand = null;
+        PageViewOptionsCommand = null;
+    }
+
+    public void ShowPlaylistActions(ICommand createPlaylistCommand, ICommand createSmartPlaylistCommand,
+        ICommand importPlaylistCommand, ICommand sortCommand, string sortLabel, ICommand? quickPlaylistCommand = null)
+    {
+        PageQuickPlaylistCommand = quickPlaylistCommand;
+        PageCreatePlaylistCommand = createPlaylistCommand;
+        PageCreateSmartPlaylistCommand = createSmartPlaylistCommand;
+        PageImportPlaylistCommand = importPlaylistCommand;
+        PlaylistSortCommand = sortCommand;
+        PlaylistSortLabel = sortLabel;
+        HasPlaylistActions = true;
+    }
+
+    public void HidePlaylistActions()
+    {
+        HasPlaylistActions = false;
+        PageCreatePlaylistCommand = null;
+        PageCreateSmartPlaylistCommand = null;
+        PageImportPlaylistCommand = null;
+        PageQuickPlaylistCommand = null;
+        PlaylistSortCommand = null;
+    }
+
+    public void ShowArtistActions(ICommand shuffleCommand, ICommand playCommand)
+    {
+        PageShuffleArtistCommand = shuffleCommand;
+        PagePlayArtistCommand = playCommand;
+        HasArtistActions = true;
+    }
+
+    public void HideArtistActions()
+    {
+        HasArtistActions = false;
+        PageShuffleArtistCommand = null;
+        PagePlayArtistCommand = null;
+    }
+
+    public void ShowFoldersActions(ICommand playCommand, ICommand shuffleCommand, ICommand manageCommand,
+        ICommand? sortCommand = null)
+    {
+        PagePlayFolderCommand = playCommand;
+        PageShuffleFolderCommand = shuffleCommand;
+        PageManageFoldersCommand = manageCommand;
+        FoldersSortCommand = sortCommand;
+        HasFoldersActions = true;
+    }
+
+    public void HideFoldersActions()
+    {
+        HasFoldersActions = false;
+        PagePlayFolderCommand = null;
+        PageShuffleFolderCommand = null;
+        PageManageFoldersCommand = null;
+        FoldersSortCommand = null;
+    }
+
+    public void ShowFavoritesActions(ICommand shuffleCommand, ICommand playCommand)
+    {
+        PageShuffleFavoritesCommand = shuffleCommand;
+        PagePlayFavoritesCommand = playCommand;
+        HasFavoritesActions = true;
+    }
+
+    public void HideFavoritesActions()
+    {
+        HasFavoritesActions = false;
+        PageShuffleFavoritesCommand = null;
+        PagePlayFavoritesCommand = null;
+    }
+
+    public void ShowViewModeToggle(ICommand setLibraryMode, ICommand setCoverFlowMode, bool isCoverFlowMode,
+        ICommand? toggleCollageMode = null, bool isCollageMode = false,
+        ICommand? setLayoutCommand = null, string? layoutLabel = null)
+    {
+        SetLibraryModeCommand = setLibraryMode;
+        SetCoverFlowModeCommand = setCoverFlowMode;
+        IsCoverFlowMode = isCoverFlowMode;
+        ToggleCollageModeCommand = toggleCollageMode;
+        IsCollageMode = isCollageMode;
+        SetCoverFlowLayoutCommand = setLayoutCommand;
+        if (layoutLabel != null) CoverFlowLayoutLabel = layoutLabel;
+        HasViewModeToggle = true;
+    }
+
+    public void HideViewModeToggle()
+    {
+        HasViewModeToggle = false;
+        SetLibraryModeCommand = null;
+        SetCoverFlowModeCommand = null;
+        IsCoverFlowMode = false;
+        ToggleCollageModeCommand = null;
+        IsCollageMode = false;
+    }
+
+    // Release-type filter chips (All / Albums / Singles / EPs / Other) — shown next
+    // to the title on the Albums page. The collection and command are owned by
+    // LibraryAlbumsViewModel; the top bar just mirrors them for placement.
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasBarContent))]
+    [NotifyPropertyChangedFor(nameof(CoverFlowToggleVisible))]
+    [NotifyPropertyChangedFor(nameof(AlbumsViewToggleVisible))]
+    private bool _hasReleaseTypeChips;
+    [ObservableProperty] private ObservableCollection<ReleaseTypeChip>? _releaseTypeChips;
+    [ObservableProperty] private ICommand? _releaseTypeChipCommand;
+
+    // Quality chips + sort dropdown shown alongside the release-type strip;
+    // owned by LibraryAlbumsViewModel, mirrored here for top-bar placement.
+    [ObservableProperty] private ObservableCollection<QualityChip>? _qualityChips;
+    [ObservableProperty] private ICommand? _qualityChipCommand;
+    [ObservableProperty] private ICommand? _albumSortCommand;
+    [ObservableProperty] private string _albumSortLabel = "Default";
+
+    // Sort mode/direction mirrored for the dropdown's checkmarks, the same way the label
+    // is. AlbumSortMode is compared per item via StringEqualsConverter.
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(AlbumSortDirectionEnabled))]
+    [NotifyPropertyChangedFor(nameof(AlbumSortNewestFirstEnabled))]
+    [NotifyPropertyChangedFor(nameof(IsAlbumSortActive))]
+    private string _albumSortMode = "default";
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(AlbumSortDescending))]
+    private bool _albumSortAscending = true;
+
+    public bool AlbumSortDescending => !AlbumSortAscending;
+
+    /// <summary>GitHub #106 "Newest Albums First" toggle; only the Album Artist sort uses it.</summary>
+    [ObservableProperty] private bool _albumSortNewestFirst;
+    public bool AlbumSortNewestFirstEnabled => AlbumSortMode == "albumartist";
+
+    /// <summary>"Default" floats recent imports instead of ordering by a single key,
+    /// and "Random" is a shuffle — no direction applies to either.</summary>
+    public bool AlbumSortDirectionEnabled => AlbumSortMode is not ("default" or "random");
+
+    // Albums View menu (GitHub #149): grid / carousel and the carousel's case style,
+    // mirrored from LibraryAlbumsViewModel like the sort.
+    [ObservableProperty] private ICommand? _albumViewCommand;
+    [ObservableProperty] private ICommand? _albumCarouselStyleCommand;
+    /// <summary>Flips the Albums page between grid and carousel (GitHub #164 top-right icon).</summary>
+    [ObservableProperty] private ICommand? _albumViewToggleCommand;
+    [ObservableProperty] private bool _isAlbumCarouselView;
+
+    // GitHub #164: on the Albums page the top-right view-mode icon switches the page between
+    // its grid and the album carousel (every album, like the artist page's toggle) instead of
+    // opening the queue-driven Cover Flow, which showed the playing album's tracks and nothing
+    // at all with nothing playing. Cover Flow stays one click away on every other page and in
+    // the Albums View menu. HasReleaseTypeChips is set exactly while the Albums grid is current.
+
+    /// <summary>The "Switch to Cover Flow" icon: every toggle page but Albums (Albums too while
+    /// the Album Carousel feature is off: its View menu, the other way to Cover Flow, is hidden then).</summary>
+    public bool CoverFlowToggleVisible => !IsCoverFlowMode && !(HasReleaseTypeChips && AlbumCarouselAvailable);
+
+    /// <summary>The Albums page's grid / carousel icon in the Cover Flow icon's place.</summary>
+    public bool AlbumsViewToggleVisible => !IsCoverFlowMode && HasReleaseTypeChips && AlbumCarouselAvailable;
+
+    /// <summary>Settings › Plugins › Built-in Features › Album Carousel (mirrored by the main window).</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CoverFlowToggleVisible))]
+    [NotifyPropertyChangedFor(nameof(AlbumsViewToggleVisible))]
+    private bool _albumCarouselAvailable = true;
+    /// <summary>Case style name ("Cover" / "JewelCase" / "Vinyl" / "Cassette") for the checkmarks.</summary>
+    [ObservableProperty] private string _albumCarouselStyle = "Cover";
+
+    // Dropdown variants of the release-type / quality filters (albums grid top bar).
+    [ObservableProperty] private ICommand? _releaseTypeFilterCommand;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsReleaseTypeFiltered))]
+    [NotifyPropertyChangedFor(nameof(IsAlbumFilterActive))]
+    private string _releaseTypeFilterLabel = "All";
+    [ObservableProperty] private ICommand? _qualityFilterCommand;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(AlbumQualityAll))]
+    [NotifyPropertyChangedFor(nameof(AlbumQualityLossless))]
+    [NotifyPropertyChangedFor(nameof(AlbumQualityHiRes))]
+    [NotifyPropertyChangedFor(nameof(IsAlbumFilterActive))]
+    private string _qualityFilterLabel = "All";
+
+    // Albums quality pill segments (mirrors the Songs pill; label is what the albums VM reports).
+    public bool AlbumQualityAll => QualityFilterLabel == "All";
+    public bool AlbumQualityLossless => QualityFilterLabel == "Lossless";
+    public bool AlbumQualityHiRes => QualityFilterLabel == "Hi-Res";
+
+    // ── Corner icon "not at default" dots ──
+    //
+    // The top-right corner shows filter / sort as round icon buttons (no label, no
+    // value at rest); a small accent dot on the icon says the control is away from its
+    // default, so a filtered or re-sorted grid never looks like the plain one. The
+    // labels compared here are the raw keys the grid view-models report, not localized
+    // text (LibraryAlbumsViewModel.ReleaseTypeFilterLabel etc. are English constants).
+    public bool IsReleaseTypeFiltered => ReleaseTypeFilterLabel != "All";
+    public bool IsAlbumFilterActive => IsReleaseTypeFiltered || QualityFilterLabel != "All";
+    public bool IsAlbumSortActive => AlbumSortMode != "default";
+    /// <summary>The quality part only counts where the quality items are offered (Songs page);
+    /// the filter string is not reset when another page hides them.</summary>
+    public bool IsSongsFilterActive => PageShowOnlyFavorites || (HasSongsFilters && SongsQualityFilter != "All");
+    /// <summary>
+    /// Songs default order is "Date Added", newest first (LibrarySongsViewModel); empty = not
+    /// reported yet. Oldest first counts as changed too, so the dot always means "Reset to
+    /// Date Added" in the Sort menu has something to do (GitHub #156).
+    /// </summary>
+    public bool IsSongsSortActive => PageSortColumn switch
+    {
+        "" => false,
+        "Date Added" => PageSortAscending,
+        _ => true,
+    };
+    public bool IsArtistSortActive => ArtistSortMode != "name";
+    public bool IsPlaylistSortActive => PlaylistSortMode != "default";
+    public bool IsFoldersSortActive => FoldersSortMode != "default";
+
+    public void ShowReleaseTypeChips(ObservableCollection<ReleaseTypeChip> chips, ICommand selectCommand,
+        ObservableCollection<QualityChip>? qualityChips = null, ICommand? qualityCommand = null,
+        ICommand? sortCommand = null, ICommand? releaseTypeFilterCommand = null, ICommand? qualityFilterCommand = null)
+    {
+        ReleaseTypeChips = chips;
+        ReleaseTypeChipCommand = selectCommand;
+        QualityChips = qualityChips;
+        QualityChipCommand = qualityCommand;
+        AlbumSortCommand = sortCommand;
+        ReleaseTypeFilterCommand = releaseTypeFilterCommand;
+        QualityFilterCommand = qualityFilterCommand;
+        HasReleaseTypeChips = true;
+    }
+
+    public void HideReleaseTypeChips()
+    {
+        HasReleaseTypeChips = false;
+    }
+
+    private void UpdatePageTitleVisibility()
+    {
+        IsPageTitleVisible = !IsBackButtonVisible
+            && CurrentTabName is not ("Lyrics" or "Queue");
+    }
+
+    /// <summary>Fires when the debounced search text changes.</summary>
+    public event EventHandler<string>? SearchTextChanged;
+
+    private CancellationTokenSource? _debounceToken;
+
+    partial void OnCurrentTabNameChanged(string value)
+    {
+        IsSearchVisible = value is not ("Home" or "Settings" or "Lyrics");
+        // Localized, like every other watermark path: this one built "Search in Songs" in
+        // English from the identifier, and it survived on paths that skip the shell's refresh.
+        SearchWatermark = Loc.T("TopBar.SearchIn", CurrentTabTitle);
+        UpdatePageTitleVisibility();
+    }
+
+    partial void OnIsSearchVisibleChanged(bool value)
+    {
+        // Search is disabled from several places (tab switches here, Cover Flow and
+        // Home directly from the shell). Whoever disables it, the pill must close
+        // with it — otherwise it sits orphaned on screen while the toggle button
+        // that could dismiss it is greyed out.
+        if (!value) IsSearchOpen = false;
+    }
+
+    partial void OnIsBackButtonVisibleChanged(bool value)
+    {
+        UpdatePageTitleVisibility();
+    }
+
+    partial void OnSearchTextChanged(string value)
+    {
+        // Cancel and dispose previous debounce
+        _debounceToken?.Cancel();
+        _debounceToken?.Dispose();
+        _debounceToken = new CancellationTokenSource();
+        var token = _debounceToken.Token;
+
+        // Debounce: wait 300ms before applying the filter
+        Task.Delay(300, token).ContinueWith(_ =>
+        {
+            if (!token.IsCancellationRequested)
+            {
+                DebugLogger.Info(DebugLogger.Category.Search, "SearchDebounced", $"query=\"{value}\"");
+                Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                {
+                    SearchTextChanged?.Invoke(this, value);
+                });
+            }
+        }, token);
+    }
+
+    [RelayCommand]
+    private void ClearSearch()
+    {
+        SearchText = string.Empty;
+        IsSearchFocused = false;
+    }
+
+    [RelayCommand]
+    private void FocusSearch()
+    {
+        IsSearchFocused = true;
+    }
+
+    /// <summary>Raised when search should open/focus, even if already open.</summary>
+    public event EventHandler? SearchOpenRequested;
+
+    /// <summary>Raised when Ctrl+F toggles an open pill shut. The collapse
+    /// animation lives in the view, so closing routes through it instead of
+    /// flipping <see cref="IsSearchOpen"/> here (which would snap the popup
+    /// shut without the morph).</summary>
+    public event EventHandler? SearchCloseRequested;
+
+    /// <summary>Raised when search is invoked on Home, which has nothing to filter.
+    /// The shell answers by navigating to the Songs page and opening search there.</summary>
+    public event EventHandler? HomeSearchRedirectRequested;
+
+    [RelayCommand]
+    private void OpenSearch()
+    {
+        if (!IsSearchVisible)
+        {
+            // Home redirects to the searchable Songs page; Settings stays a silent
+            // no-op and Lyrics has its own in-page search.
+            if (CurrentTabName == "Home")
+                HomeSearchRedirectRequested?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+        IsSearchOpen = true;
+        SearchOpenRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    [RelayCommand]
+    private void ToggleSearch()
+    {
+        if (IsSearchOpen)
+            SearchCloseRequested?.Invoke(this, EventArgs.Empty);
+        else
+            OpenSearch();
+    }
+}

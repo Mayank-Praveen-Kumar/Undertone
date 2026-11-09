@@ -1,0 +1,218 @@
+using Undertone.Models;
+using YamlDotNet.Core;
+using YamlDotNet.Core.Events;
+using YamlDotNet.Serialization;
+using YamlDotNet.Serialization.NamingConventions;
+
+namespace Undertone.Services;
+
+/// <summary>
+/// Parses Lyricsfile v1.0 YAML (LRCGET v2.0+) into <see cref="LyricLine"/> objects,
+/// preserving optional per-word karaoke timing.
+///
+/// Spec: https://github.com/tranxuanthang/lrcget/blob/main/LYRICSFILE_CONCEPT.md
+/// </summary>
+public static class LyricsfileParser
+{
+    // YamlDotNet is thread-safe for Deserializer instances once built.
+    private static readonly IDeserializer _yaml = new DeserializerBuilder()
+        .WithNamingConvention(UnderscoredNamingConvention.Instance)
+        .IgnoreUnmatchedProperties()
+        .Build();
+
+    /// <summary>Cheap discriminator — Lyricsfiles start with a top-level 'version:' key.</summary>
+    public static bool LooksLikeLyricsfile(string? content)
+    {
+        if (string.IsNullOrWhiteSpace(content)) return false;
+        var span = content.AsSpan().TrimStart();
+        return span.StartsWith("version:") || span.StartsWith("version :");
+    }
+
+    /// <summary>
+    /// Parses YAML Lyricsfile content. Returns (lines, plainText) where plainText is the
+    /// unsynchronized block for the Unsync tab. Returns nulls when the content is malformed.
+    /// </summary>
+    public static (List<LyricLine>? Lines, string? Plain) Parse(string? content)
+    {
+        if (string.IsNullOrWhiteSpace(content)) return (null, null);
+
+        LyricsfileDto? dto;
+        try
+        {
+            // Aliases are refused: "- *l" repeats a whole line (or "text: *t" a whole string)
+            // for five bytes, so a tiny file could still fill every line up to the caps below.
+            dto = _yaml.Deserialize<LyricsfileDto>(new NoAliasParser(new Parser(new StringReader(content))));
+        }
+        catch
+        {
+            return (null, null);
+        }
+
+        if (dto == null) return (null, null);
+
+        var offset = TimeSpan.FromMilliseconds(dto.Metadata?.OffsetMs ?? 0);
+        var lines = new List<LyricLine>();
+
+        if (dto.Lines != null)
+        {
+            foreach (var raw in dto.Lines)
+            {
+                if (lines.Count >= EnhancedLrcParser.MaxLyricLines) break;
+                if (raw == null) continue;
+
+                var text = raw.Text ?? string.Empty;
+                var start = TimeSpan.FromMilliseconds(raw.StartMs) + offset;
+                if (start < TimeSpan.Zero) start = TimeSpan.Zero;
+
+                TimeSpan? end = null;
+                if (raw.EndMs.HasValue)
+                {
+                    var e = TimeSpan.FromMilliseconds(raw.EndMs.Value) + offset;
+                    if (e >= start) end = e;
+                }
+
+                var line = new LyricLine
+                {
+                    Timestamp = start,
+                    EndTimestamp = end,
+                    Text = text,
+                };
+
+                // Too many words to be a real karaoke line: keep the text, drop word timing.
+                if (raw.Words != null && raw.Words.Count > 0
+                    && raw.Words.Count <= EnhancedLrcParser.MaxWordsPerLine)
+                {
+                    var words = new List<WordTiming>(raw.Words.Count);
+                    foreach (var w in raw.Words)
+                    {
+                        if (w == null || string.IsNullOrEmpty(w.Text)) continue;
+                        var ws = TimeSpan.FromMilliseconds(w.StartMs) + offset;
+                        if (ws < TimeSpan.Zero) ws = TimeSpan.Zero;
+                        TimeSpan? we = null;
+                        if (w.EndMs.HasValue)
+                        {
+                            var candidate = TimeSpan.FromMilliseconds(w.EndMs.Value) + offset;
+                            if (candidate >= ws) we = candidate;
+                        }
+                        words.Add(new WordTiming { Text = w.Text, Start = ws, End = we });
+                    }
+
+                    // Backfill missing End times from the next word's Start, and the final word
+                    // from the line end (falls back to last word's Start + 300ms as a minimum).
+                    for (int i = 0; i < words.Count; i++)
+                    {
+                        if (words[i].End.HasValue) continue;
+                        TimeSpan fallback;
+                        if (i + 1 < words.Count)
+                            fallback = words[i + 1].Start;
+                        else if (end.HasValue)
+                            fallback = end.Value;
+                        else
+                            fallback = words[i].Start + TimeSpan.FromMilliseconds(300);
+
+                        words[i] = new WordTiming
+                        {
+                            Text = words[i].Text,
+                            Start = words[i].Start,
+                            End = fallback,
+                        };
+                    }
+
+                    line.Words = EnhancedLrcParser.MergeSyllables(words);
+                }
+
+                lines.Add(line);
+            }
+        }
+
+        // Lines are already emitted in source order; sort defensively.
+        lines.Sort((a, b) =>
+            Nullable.Compare(a.Timestamp, b.Timestamp));
+
+        return (lines, dto.Plain);
+    }
+
+    /// <summary>
+    /// The Lyricsfile as enhanced LRC — <c>[mm:ss.xx]&lt;mm:ss.xx&gt;word … &lt;end&gt;</c> for lines with
+    /// word timings, <c>[mm:ss.xx]text</c> for the rest — so its word timings can be written
+    /// beside the song. Null when it is malformed or has no word timings at all (then its
+    /// line-level <c>syncedLyrics</c> twin says the same thing).
+    /// </summary>
+    public static string? ToElrc(string? content)
+    {
+        var (lines, _) = Parse(content);
+        if (lines is not { Count: > 0 } || !lines.Any(l => l.Words is { Count: > 0 })) return null;
+        var sb = new System.Text.StringBuilder();
+        foreach (var line in lines)
+        {
+            if (line.Timestamp is not { } start) continue;
+            sb.Append('[').Append(LyricsStudio.TimedLyricsBuilder.FormatTimestamp(start)).Append(']');
+            if (line.Words is { Count: > 0 } words)
+            {
+                for (var i = 0; i < words.Count; i++)
+                {
+                    if (i > 0) sb.Append(' ');
+                    sb.Append('<').Append(LyricsStudio.TimedLyricsBuilder.FormatTimestamp(words[i].Start)).Append('>')
+                      .Append(words[i].Text.Trim());
+                }
+                var end = words[^1].End ?? line.EndTimestamp ?? words[^1].Start;
+                sb.Append('<').Append(LyricsStudio.TimedLyricsBuilder.FormatTimestamp(end)).Append('>');
+            }
+            else sb.Append(line.Text.Trim());
+            sb.Append('\n');
+        }
+        return sb.ToString().TrimEnd('\n');
+    }
+
+    /// <summary>Passes parser events through, throwing on any alias (<c>*name</c>).</summary>
+    private sealed class NoAliasParser : IParser
+    {
+        private readonly IParser _inner;
+        public NoAliasParser(IParser inner) => _inner = inner;
+        public ParsingEvent? Current => _inner.Current;
+
+        public bool MoveNext()
+        {
+            if (!_inner.MoveNext()) return false;
+            if (_inner.Current is AnchorAlias alias)
+                throw new YamlException(alias.Start, alias.End, "YAML aliases are not allowed in a Lyricsfile.");
+            return true;
+        }
+    }
+
+    // ── YAML DTOs (local to the parser — external shape isn't used elsewhere) ──
+
+    private sealed class LyricsfileDto
+    {
+        public string? Version { get; set; }
+        public MetadataDto? Metadata { get; set; }
+        public List<LineDto>? Lines { get; set; }
+        public string? Plain { get; set; }
+    }
+
+    private sealed class MetadataDto
+    {
+        public string? Title { get; set; }
+        public string? Artist { get; set; }
+        public string? Album { get; set; }
+        public int? DurationMs { get; set; }
+        public int OffsetMs { get; set; }
+        public string? Language { get; set; }
+        public bool Instrumental { get; set; }
+    }
+
+    private sealed class LineDto
+    {
+        public string? Text { get; set; }
+        public int StartMs { get; set; }
+        public int? EndMs { get; set; }
+        public List<WordDto>? Words { get; set; }
+    }
+
+    private sealed class WordDto
+    {
+        public string? Text { get; set; }
+        public int StartMs { get; set; }
+        public int? EndMs { get; set; }
+    }
+}

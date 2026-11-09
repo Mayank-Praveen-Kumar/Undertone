@@ -1,0 +1,37 @@
+using CommunityToolkit.Mvvm.ComponentModel;
+
+namespace Undertone.Models;
+
+/// <summary>
+/// Represents a navigation entry in the sidebar.
+/// </summary>
+public partial class NavItem : ObservableObject
+{
+    /// <summary>Unique key used for routing ("songs", "albums", "artists", "queue", "settings").</summary>
+    public string Key { get; set; } = string.Empty;
+
+    /// <summary>Display label shown in the sidebar.</summary>
+    [ObservableProperty] private string _label = string.Empty;
+
+    /// <summary>When true, the sidebar shows a small accent dot on this item
+    /// (used to flag an available app update on the Settings entry).</summary>
+    [ObservableProperty] private bool _showBadge;
+
+    /// <summary>Count shown after the label in the expanded sidebar (the Inbox's waiting
+    /// songs); 0 shows nothing.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasCount))]
+    private int _count;
+
+    public bool HasCount => Count > 0;
+
+    /// <summary>Icon glyph character or path identifier.</summary>
+    public string IconGlyph { get; set; } = string.Empty;
+
+    /// <summary>If this is a playlist nav item, stores the playlist ID.</summary>
+    public Guid? PlaylistId { get; set; }
+
+    /// <summary>The label. A sidebar row's accessible name falls back to its item's
+    /// ToString(), so screen readers read "Home" or the playlist's name, not the type.</summary>
+    public override string ToString() => Label;
+}

@@ -1,0 +1,192 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:loc="using:Undertone.Localization"
+             xmlns:vm="using:Undertone.ViewModels"
+             xmlns:m="using:Undertone.Models"
+             xmlns:controls="using:Undertone.Controls"
+             xmlns:conv="using:Undertone.Converters"
+             xmlns:helpers="using:Undertone.Helpers"
+             x:Class="Undertone.Views.FavoritesView"
+             x:DataType="vm:FavoritesViewModel"
+             Focusable="True"
+             Background="{DynamicResource AppMainBackground}">
+
+    <UserControl.Resources>
+        <conv:ArtworkPathConverter x:Key="ArtworkConverter" />
+    </UserControl.Resources>
+
+    <Grid RowDefinitions="*">
+        <!-- Right margin trimmed to 2 so the vertical scrollbar sits at the window edge. -->
+        <DockPanel Grid.Row="0" Margin="12,8,2,8">
+
+        <!-- Content area with overlay for empty state -->
+        <Grid>
+            <!-- Favorite grid: outer ListBox virtualizes rows, inner UniformGrid lays out GridColumns per row -->
+            <ListBox x:Name="FavoritesList"
+                     ItemsSource="{Binding FavoriteItemRows}"
+                     Background="Transparent"
+                     BorderThickness="0"
+                     Padding="0,0,0,115"
+                     ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                     ScrollViewer.VerticalScrollBarVisibility="Auto"
+                     SelectionMode="Single"
+                     AutoScrollToSelectedItem="False">
+                <ListBox.Styles>
+                    <Style Selector="ListBoxItem">
+                        <Setter Property="Focusable" Value="False" />
+                    </Style>
+                </ListBox.Styles>
+                <ListBox.ItemTemplate>
+                    <DataTemplate x:DataType="m:FavoriteItemRow">
+                        <ItemsControl ItemsSource="{Binding Items}">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <!-- Column count mirrors the VM's row chunk size (cover-size setting) -->
+                                    <UniformGrid Columns="{Binding $parent[UserControl].((vm:FavoritesViewModel)DataContext).GridColumns}" Rows="1" />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:DataType="m:FavoriteItem">
+                                    <!-- Single button per item — left-click routed in code-behind -->
+                                    <Button Classes="album-tile"
+                                            AutomationProperties.Name="{Binding Title}"
+                                            Focusable="False"
+                                            Margin="2"
+                                            HorizontalAlignment="Stretch"
+                                            VerticalAlignment="Top"
+                                            helpers:DragFileBehavior.EnableFileDrag="True"
+                                            Tag="{Binding}"
+                                            Loaded="OnAlbumTileLoaded"
+                                            Click="OnFavoriteCardClick"
+                                            ContextRequested="OnFavoriteTileContextRequested">
+                                        <!-- Right-click / dots: one shared v2 menu built in code (OnFavoriteTileContextRequested):
+                                             the track menu for a song, the album menu for an album. -->
+
+                                        <StackPanel Classes="tile-text" Spacing="0" HorizontalAlignment="Stretch">
+                                            <!-- Artwork with the hover overlay -->
+                                            <Border Width="{Binding $parent[UserControl].((vm:FavoritesViewModel)DataContext).TileArtworkSize}"
+                                                    Height="{Binding $parent[UserControl].((vm:FavoritesViewModel)DataContext).TileArtworkSize}"
+                                                    CornerRadius="6"
+                                                    ClipToBounds="True"
+                                                    Background="#1AFFFFFF">
+                                                <Panel>
+                                                    <TextBlock Text="{loc:T Favorites.Text}"
+                                                               FontSize="40"
+                                                               HorizontalAlignment="Center"
+                                                               VerticalAlignment="Center"
+                                                               Opacity="0.15"
+                                                               IsVisible="{Binding ArtworkPath, Converter={x:Static StringConverters.IsNullOrEmpty}}" />
+                                                    <controls:CachedImage SourcePath="{Binding ArtworkPath}"
+                                                                          DecodeWidth="768"
+                                                                          Stretch="UniformToFill"
+                                                                          RenderOptions.BitmapInterpolationMode="HighQuality"
+                                                                          IsVisible="{Binding ArtworkPath, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                                                    <!-- Hover overlay (09-13): dim + Play/Pause + dots; styles in Styles.axaml -->
+                                                    <Border Classes="tile-dim" />
+                                                    <Button Classes="tile-play"
+                                                            Command="{Binding $parent[UserControl].((vm:FavoritesViewModel)DataContext).TogglePlayItemCommand}"
+                                                            CommandParameter="{Binding}">
+                                                        <Panel>
+                                                            <Viewbox Width="12" Height="12" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="1,0,0,0">
+                                                                <Viewbox.IsVisible>
+                                                                    <MultiBinding Converter="{x:Static helpers:MultiConverters.NoneTrue}">
+                                                                        <Binding Path="Album.IsNowPlaying" FallbackValue="{x:False}" />
+                                                                        <Binding Path="Track.IsCurrentlyPlaying" FallbackValue="{x:False}" />
+                                                                    </MultiBinding>
+                                                                </Viewbox.IsVisible>
+                                                                <Path Data="{StaticResource PlayIcon}" Fill="White" />
+                                                            </Viewbox>
+                                                            <Viewbox Width="12" Height="12" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                                                <Viewbox.IsVisible>
+                                                                    <MultiBinding Converter="{x:Static BoolConverters.Or}">
+                                                                        <Binding Path="Album.IsNowPlaying" FallbackValue="{x:False}" />
+                                                                        <Binding Path="Track.IsCurrentlyPlaying" FallbackValue="{x:False}" />
+                                                                    </MultiBinding>
+                                                                </Viewbox.IsVisible>
+                                                                <Path Data="{StaticResource PauseIcon}" Fill="White" />
+                                                            </Viewbox>
+                                                        </Panel>
+                                                    </Button>
+                                                    <Button Classes="tile-more" Click="OnTileMoreClick">
+                                                        <Viewbox Width="14" Height="14" HorizontalAlignment="Center" VerticalAlignment="Center"><Path Data="{StaticResource MoreDotsIcon}" Fill="White" /></Viewbox>
+                                                    </Button>
+                                                </Panel>
+                                            </Border>
+                                            <!-- Title + explicit badge; the heart sits at the line's right end (09-13) -->
+                                            <Grid ColumnDefinitions="*,Auto" Margin="0,5,0,0">
+                                                <controls:HighlightTextBlock Grid.Column="0"
+                                                                             helpers:TitleWrap.Watch="True"
+                                                                             DisplayText="{Binding Title}"
+                                                                             HighlightText="{Binding $parent[UserControl].((vm:FavoritesViewModel)DataContext).SearchText}"
+                                                                             IsExplicit="{Binding IsExplicit}"
+                                                                             FontSize="13"
+                                                                             FontWeight="SemiBold"
+                                                                             TextWrapping="Wrap"
+                                                                             TextTrimming="CharacterEllipsis"
+                                                                             MaxLines="2" />
+                                                <Panel Grid.Column="1" Classes="heart-title" VerticalAlignment="Top" Margin="6,2,0,0">
+                                                    <controls:HeartIcon Size="14" ShowWhenOff="False" IsFavorite="True" IsVisible="True" />
+                                                </Panel>
+                                            </Grid>
+                                            <!-- Subtitle; the heart lands here instead when the title wraps -->
+                                            <Grid ColumnDefinitions="*,Auto" Margin="0,1,0,0">
+                                                <controls:HighlightTextBlock Grid.Column="0"
+                                                                             DisplayText="{Binding Subtitle}"
+                                                                             HighlightText="{Binding $parent[UserControl].((vm:FavoritesViewModel)DataContext).SearchText}"
+                                                                             FontSize="12"
+                                                                             FontWeight="Bold"
+                                                                             Opacity="0.55"
+                                                                             TextTrimming="CharacterEllipsis"
+                                                                             MaxLines="1" />
+                                                <Panel Grid.Column="1" Classes="heart-sub" VerticalAlignment="Center" Margin="6,0,0,0">
+                                                    <controls:HeartIcon Size="14" ShowWhenOff="False" IsFavorite="True" IsVisible="True" />
+                                                </Panel>
+                                            </Grid>
+                                        </StackPanel>
+                                    </Button>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+
+            <!-- Empty state overlay: no favorites at all -->
+            <StackPanel IsVisible="{Binding ShowNoFavorites}"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Spacing="8">
+                <TextBlock Text="{loc:T Favorites.NoFavoriteTracksYet}"
+                           FontSize="18"
+                           Opacity="0.5"
+                           HorizontalAlignment="Center"
+                           TextAlignment="Center" />
+                <TextBlock Text="{loc:T Favorites.RightClickTracksSelect}"
+                           FontSize="13"
+                           Opacity="0.3"
+                           HorizontalAlignment="Center"
+                           TextAlignment="Center" />
+            </StackPanel>
+
+            <!-- Empty state overlay: search matched nothing -->
+            <StackPanel IsVisible="{Binding ShowNoResults}"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Spacing="8">
+                <TextBlock Text="{loc:T Favorites.NoResults}"
+                           FontSize="18"
+                           Opacity="0.5"
+                           HorizontalAlignment="Center"
+                           TextAlignment="Center" />
+                <TextBlock Text="{loc:T Favorites.NoFavoritesMatchSearch}"
+                           FontSize="13"
+                           Opacity="0.3"
+                           HorizontalAlignment="Center"
+                           TextAlignment="Center" />
+            </StackPanel>
+        </Grid>
+
+        </DockPanel>
+    </Grid>
+
+</UserControl>

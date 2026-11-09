@@ -1,0 +1,1022 @@
+using System;
+using System.Threading;
+using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
+
+namespace Undertone.Services;
+
+// ── True-gapless splice core ─────────────────────────────────────────────
+//
+// VLC 3 cannot do gapless: every input tears down and recreates its audio
+// output stream, and two MediaPlayers can never be sample-aligned (independent
+// clocks, no latency feedback). The only true-gapless route on this stack is
+// the one mpv and VLC 4 use — ONE persistent output stream that never stops
+// across track changes, fed by decode-ahead, with tracks spliced back-to-back
+// in our own buffer domain so the boundary is crossed inside a single render
+// read: zero inserted samples.
+//
+// This file is the device-independent core of that engine: per-track PCM
+// segments (filled from VLC's amem callbacks on the decoder threads) and the
+// splice provider a WASAPI render stream pulls from. No WASAPI/device code
+// lives here so the splice semantics are unit-testable headless.
+//
+// Threading model per segment: one writer (that player's VLC decoder thread),
+// one reader (the render thread), plus control calls (flush on seek from a VLC
+// thread, abandon from the engine). A plain lock + Monitor pulses is enough —
+// blocks are ~10ms of audio, contention is trivial. Writers block when the
+// ring is full (this back-pressures VLC's decoder, exactly like the existing
+// WasapiGainOutput.Write), and MUST be unblocked by Abandon() before the
+// engine calls player.Stop() — Stop joins the decoder thread, so a writer
+// left blocked here would deadlock the stop (the WasapiGainOutput backpressure
+// lesson).
+
+/// <summary>
+/// One track's staged PCM at its native rate/channels: float interleaved ring
+/// written by that player's amem play callback, read by the splice provider.
+/// </summary>
+public sealed class GaplessTrackSegment
+{
+    private readonly object _gate = new();
+    private readonly float[] _ring;
+    private int _readIdx;
+    private int _writeIdx;
+    private int _count;              // samples (not frames) currently buffered
+    private bool _endOfStream;
+    private bool _abandoned;
+    private bool _started;           // first samples handed to the render side
+    private bool _cutPending;        // a Flush cut live audio; renderer must declick the junction
+    private bool _flushRearmed;      // gate re-armed by a seek flush (warm decoder), not a cold start
+    private bool _hadAudio;          // any block written since creation (the upstream resampler holds history)
+    private int _discardSamples;     // post-flush samples still to drop: the resampler's stale pre-seek tail
+    private long _consumedFrames;    // frames handed to the render side
+    private long _basePositionMs;    // media position of the first frame after creation/flush
+    private float _gain = 1f;        // amplitude the render side reads at (see Gain)
+    private float _renderGain = 1f;  // gain applied to the last sample read; slews to _gain
+    private long _lastWriteTick;     // when a block last landed (Environment.TickCount64)
+    private bool _writerWaiting;     // the writer is blocked on a full ring (healthy back-pressure)
+    private int _writeFadeTotal;     // samples of the write-side fade-in in progress (see TrimDamagedTail)
+    private int _writeFadeDone;
+    private bool _dropLeadingSilence; // see DropLeadingSilence
+
+    // A mid-play Gain change (ReplayGain setting moved) slews over this long per
+    // 1.0 of amplitude, so a pre-amp drag never steps the waveform.
+    private const int GainSlewMs = 20;
+    // Below 8 16-bit steps: what a decoder writes for a frame it could not decode, or while it
+    // primes after a mid-stream open (zeros, plus the resampler's ringing next to real audio).
+    private const float SilentSample = 8f / 32768f;
+
+    public int SampleRate { get; }
+    public int Channels { get; }
+
+    // Identity of the MediaPlayer feeding this segment, so the engine can
+    // discriminate callback senders (the standby's transport events must never
+    // drive the shared sink).
+    public object? Source { get; }
+
+    public GaplessTrackSegment(int sampleRate, int channels, object? source, int capacitySeconds = 15, long basePositionMs = 0)
+    {
+        SampleRate = Math.Clamp(sampleRate, 1000, 384000);
+        Channels = Math.Clamp(channels, 1, 2);
+        Source = source;
+        _basePositionMs = Math.Max(0, basePositionMs);
+        _ring = new float[SampleRate * Channels * Math.Clamp(capacitySeconds, 2, 60)];
+    }
+
+    public bool EndOfStream { get { lock (_gate) return _endOfStream; } }
+    public bool Abandoned { get { lock (_gate) return _abandoned; } }
+    public bool IsFinished { get { lock (_gate) return (_endOfStream || _abandoned) && _count == 0; } }
+    public int BufferedSamples { get { lock (_gate) return _count; } }
+
+    /// <summary>
+    /// How long the writer has gone without landing a block while not waiting on a full
+    /// ring: a decoder that stopped producing mid-track. -1 before any write.
+    /// </summary>
+    public long WriteIdleMs
+    {
+        get
+        {
+            lock (_gate)
+                return _lastWriteTick == 0 || _writerWaiting ? -1 : Environment.TickCount64 - _lastWriteTick;
+        }
+    }
+
+    /// <summary>
+    /// Drop the (near-)zeros a decoder emits before its first real sample, then fade the first
+    /// <paramref name="fadeInFrames"/> in. For an input reopened mid-stream after a decoder
+    /// failure (VLC's avcodec primes ~57 ms of zeros, then the music starts at full level;
+    /// the renderer's short fade-in would be spent on the zeros). The dropped zeros count as
+    /// consumed, so <see cref="PositionMs"/> stays media time. Set before the first write.
+    /// </summary>
+    public void DropLeadingSilence(int fadeInFrames)
+    {
+        lock (_gate)
+        {
+            _dropLeadingSilence = true;
+            _writeFadeTotal = Math.Max(0, fadeInFrames) * Channels;
+            _writeFadeDone = 0;
+        }
+    }
+
+    /// <summary>
+    /// The decoder failed on damaged data right after the last block it wrote (it hit the
+    /// damage, then stopped producing): the newest audio is the frame decoded from the damaged
+    /// bytes. Drops the silence a decoder writes for frames it could not decode (up to
+    /// <paramref name="maxSilentFrames"/>), then the newest <paramref name="dropFrames"/> of
+    /// audio, and fades the <paramref name="fadeFrames"/> before them down to silence, so the
+    /// ring runs dry on a fade instead of junk and a hard edge. Anything written after this
+    /// fades in.
+    /// Returns the media position (ms) of the write end before the trim — where the damage
+    /// starts — or -1 when the input already ended.
+    /// </summary>
+    public long TrimDamagedTail(int dropFrames, int fadeFrames, int maxSilentFrames = 0)
+    {
+        lock (_gate)
+        {
+            if (_endOfStream || _abandoned) return -1;
+            var damageMs = _basePositionMs + (_consumedFrames + _count / Channels) * 1000 / SampleRate;
+            // Harness (a run of undecodable frames before the junk): mpg123 wrote ~130 ms of
+            // zeros after the last audio, so a fade over the newest samples faded silence and
+            // the audio still stopped dead before it.
+            var silent = 0;
+            var maxSilent = Math.Min(_count, Math.Max(0, maxSilentFrames) * Channels);
+            while (silent < maxSilent &&
+                   Math.Abs(_ring[(_writeIdx - silent - 1 + _ring.Length) % _ring.Length]) < SilentSample)
+                silent++;
+            var drop = Math.Min(_count, silent + Math.Max(0, dropFrames) * Channels);
+            drop -= drop % Channels;
+            _count -= drop;
+            _writeIdx = (_writeIdx - drop + _ring.Length) % _ring.Length;
+            var fade = Math.Min(_count / Channels, Math.Max(0, fadeFrames));
+            for (var f = 0; f < fade; f++)
+            {
+                // f = 0 is the newest frame: silent; the oldest faded frame keeps ~all its level.
+                var gain = (float)f / fade;
+                for (var c = 1; c <= Channels; c++)
+                {
+                    var i = (_writeIdx - f * Channels - c + 2 * _ring.Length) % _ring.Length;
+                    _ring[i] *= gain;
+                }
+            }
+            _writeFadeTotal = Math.Max(0, fadeFrames) * Channels;
+            _writeFadeDone = 0;
+            return damageMs;
+        }
+    }
+
+    /// <summary>
+    /// Amplitude gain applied as the render side reads this segment (ReplayGain on
+    /// the splice engine). Per segment, so the audible boundary and a crossfade tail
+    /// each keep their own track's level. Set before the first read it applies from
+    /// the first sample; changed mid-play it slews. 1 = bit-exact pass-through.
+    /// </summary>
+    public float Gain
+    {
+        get { lock (_gate) return _gain; }
+        set
+        {
+            lock (_gate)
+            {
+                _gain = Math.Max(0f, value);
+                if (!_started)
+                    _renderGain = _gain;
+            }
+        }
+    }
+
+    /// <summary>Audible media position of this segment = base + consumed.</summary>
+    public long PositionMs
+    {
+        get
+        {
+            lock (_gate)
+                return _basePositionMs + _consumedFrames * 1000 / SampleRate;
+        }
+    }
+
+    /// <summary>
+    /// Append S16 interleaved PCM (the only format VLC 3 amem delivers).
+    /// Blocks while the ring is full so the decoder thread is back-pressured;
+    /// returns false when the segment was abandoned or the wait timed out
+    /// (dead render side) — callers must simply drop the block then.
+    /// </summary>
+    public bool Write(ReadOnlySpan<short> pcm, int timeoutMs = 2000)
+    {
+        var offset = 0;
+        var deadline = Environment.TickCount64 + timeoutMs;
+        while (offset < pcm.Length)
+        {
+            lock (_gate)
+            {
+                _hadAudio = true;
+                _lastWriteTick = Environment.TickCount64;
+                if (_dropLeadingSilence)
+                {
+                    // Priming zeros: never staged, counted as consumed (see DropLeadingSilence).
+                    var zeros = 0;
+                    while (offset + zeros < pcm.Length && Math.Abs(pcm[offset + zeros] / 32768f) < SilentSample) zeros++;
+                    zeros -= zeros % Channels;
+                    offset += zeros;
+                    _consumedFrames += zeros / Channels;
+                    if (offset < pcm.Length) _dropLeadingSilence = false;
+                    else continue;
+                }
+                if (_discardSamples > 0)
+                {
+                    // Stale head after a flush (see Flush): never staged, but
+                    // counted as consumed so PositionMs stays media time.
+                    var skip = Math.Min(_discardSamples, pcm.Length - offset);
+                    offset += skip;
+                    _discardSamples -= skip;
+                    _consumedFrames += skip / Channels;
+                    continue;
+                }
+                while (_count == _ring.Length)
+                {
+                    if (_abandoned || _endOfStream)
+                        return false;
+                    var remaining = deadline - Environment.TickCount64;
+                    _writerWaiting = true;
+                    var signalled = remaining > 0 && Monitor.Wait(_gate, (int)Math.Min(remaining, 100));
+                    _writerWaiting = false;
+                    _lastWriteTick = Environment.TickCount64;
+                    if (!signalled && Environment.TickCount64 >= deadline)
+                        return false;
+                }
+                if (_abandoned || _endOfStream)
+                    return false;
+
+                var free = _ring.Length - _count;
+                var toCopy = Math.Min(free, pcm.Length - offset);
+                for (var i = 0; i < toCopy; i++)
+                {
+                    var v = pcm[offset + i] / 32768f;
+                    if (_writeFadeDone < _writeFadeTotal)
+                        v *= (float)(_writeFadeDone++ / Channels * Channels) / _writeFadeTotal;
+                    _ring[_writeIdx] = v;
+                    _writeIdx = (_writeIdx + 1) % _ring.Length;
+                }
+                _count += toCopy;
+                offset += toCopy;
+                Monitor.PulseAll(_gate);
+            }
+        }
+        return true;
+    }
+
+    /// <summary>Render-side read; returns samples copied (0 = underrun or finished).</summary>
+    public int Read(float[] dest, int destOffset, int maxSamples)
+    {
+        lock (_gate)
+        {
+            var toCopy = Math.Min(_count, maxSamples);
+            var slewStep = 1000f / (SampleRate * Channels * GainSlewMs);
+            for (var i = 0; i < toCopy; i++)
+            {
+                var sample = _ring[_readIdx];
+                if (_renderGain != _gain)
+                    _renderGain = _renderGain < _gain
+                        ? Math.Min(_gain, _renderGain + slewStep)
+                        : Math.Max(_gain, _renderGain - slewStep);
+                if (_renderGain != 1f)
+                    sample *= _renderGain;
+                dest[destOffset + i] = sample;
+                _readIdx = (_readIdx + 1) % _ring.Length;
+            }
+            _count -= toCopy;
+            _consumedFrames += toCopy / Channels;
+            if (toCopy > 0)
+            {
+                _started = true;
+                _flushRearmed = false;
+                Monitor.PulseAll(_gate);
+            }
+            return toCopy;
+        }
+    }
+
+    /// <summary>
+    /// Frames at the very end of the input that are not part of the track: an MP3's
+    /// encoder padding when LibVLC decoded it without trimming (see Mp3GaplessInfo).
+    /// Cut from the ring when the input ends, so the next segment follows the last real
+    /// sample. Set before the input ends; 0 = keep everything.
+    /// </summary>
+    public int TailTrimFrames { get; set; }
+
+    /// <summary>VLC drain callback: no further samples, play out what is buffered.</summary>
+    public void MarkEndOfStream()
+    {
+        lock (_gate)
+        {
+            if (!_endOfStream && !_abandoned)
+            {
+                // Only what is still in the ring can go; a tail the renderer already
+                // took (an underrun-starved end) stays as heard.
+                var trim = Math.Min(_count, Math.Max(0, TailTrimFrames) * Channels);
+                trim -= trim % Channels;
+                if (trim > 0)
+                {
+                    _count -= trim;
+                    _writeIdx = (_writeIdx - trim + _ring.Length) % _ring.Length;
+                }
+            }
+            _endOfStream = true;
+            Monitor.PulseAll(_gate);
+        }
+    }
+
+    /// <summary>
+    /// VLC flush callback (seek/stop): discard buffered PCM. The engine passes
+    /// the seek target so position reporting stays truthful; a teardown flush
+    /// AFTER drain must be ignored by the caller (it would eat the tail).
+    /// <paramref name="discardFrames"/> drops that many frames of the next
+    /// writes: an upstream resampler that a flush does not reset emits its
+    /// pre-flush history first, ending in a step into the new audio. Armed only
+    /// once audio has been written — before that there is no stale history.
+    /// </summary>
+    public void Flush(long newBasePositionMs, int discardFrames = 0)
+    {
+        lock (_gate)
+        {
+            _readIdx = 0;
+            _writeIdx = 0;
+            _count = 0;
+            _consumedFrames = 0;
+            _basePositionMs = Math.Max(0, newBasePositionMs);
+            _discardSamples = _hadAudio ? Math.Max(0, discardFrames) * Channels : 0;
+            _writeFadeTotal = 0; // a damaged-tail fade-in belongs to the audio this flush dropped
+            // Re-arm the pre-buffer gate: post-seek delivery ramps exactly like
+            // input start, and a once-per-life gate let the first trickle blocks
+            // render against silence — the post-seek chop the gate exists to stop.
+            _started = false;
+            _cutPending = true;
+            _flushRearmed = true;
+            Monitor.PulseAll(_gate);
+        }
+    }
+
+    /// <summary>True while the pre-buffer gate is re-armed by a Flush (seek)
+    /// rather than a fresh segment start: the decoder is already warm, so the
+    /// renderer may use a much shorter refill threshold than a cold start.</summary>
+    public bool GateRearmedByFlush
+    {
+        get { lock (_gate) return _flushRearmed; }
+    }
+
+    /// <summary>
+    /// One-shot: true if a <see cref="Flush"/> cut this segment since the last
+    /// render read. The ring can refill past the pre-buffer gate BEFORE the next
+    /// read arrives (likely at large device buffers), in which case the renderer
+    /// sees no silence at all — the cut is only observable through this flag.
+    /// </summary>
+    public bool ConsumeCut()
+    {
+        lock (_gate)
+        {
+            var cut = _cutPending;
+            _cutPending = false;
+            return cut;
+        }
+    }
+
+    /// <summary>
+    /// True once the segment may be rendered: already started, finished (play
+    /// out whatever exists), or holding at least thresholdSamples. Rendering a
+    /// fresh segment the instant its first block lands chops audio against
+    /// silence while the decoder's delivery ramps — audible as a buzz at every
+    /// input start. A staged next track holds seconds, so the gapless splice
+    /// always passes this instantly.
+    /// </summary>
+    public bool ReadyToRender(int thresholdSamples)
+    {
+        lock (_gate)
+            return _started || _endOfStream || _abandoned || _count >= thresholdSamples;
+    }
+
+    /// <summary>Kill the segment and unblock any writer (call BEFORE player.Stop()).</summary>
+    public void Abandon()
+    {
+        lock (_gate)
+        {
+            _abandoned = true;
+            _count = 0;
+            Monitor.PulseAll(_gate);
+        }
+    }
+}
+
+/// <summary>
+/// Render-thread replay detector (diagnostic, UNDERTONE_ENGINE_TAP-gated): hashes
+/// 96-sample windows (stride 48) of the observed stream and warns when a
+/// bit-exact non-silent window recurs within ~100ms — the field buzz signature
+/// (a ~10ms fragment of already-played audio rendered again at seeks/skips).
+/// Placed at two depths (raw ring output vs provider output) to bisect the
+/// layer that introduces the duplication.
+/// </summary>
+internal sealed class ReplayDetector
+{
+    private const int WindowSamples = 96;
+    private const int Stride = 48;
+    private const int MaxLagSamples = 9600; // 100ms @48k mono-sample count
+    private readonly string _label;
+    private readonly long[] _hashes = new long[512];
+    private readonly long[] _positions = new long[512];
+    private int _next;
+    private long _pos;
+    private long _lastLogTick;
+
+    private ReplayDetector(string label) => _label = label;
+
+    public static ReplayDetector? CreateIfEnabled(string label) =>
+        string.IsNullOrEmpty(Environment.GetEnvironmentVariable("UNDERTONE_ENGINE_TAP"))
+            ? null : new ReplayDetector(label);
+
+    public void Observe(float[] buffer, int offset, int n)
+    {
+        for (var i = 0; i + WindowSamples <= n; i += Stride)
+        {
+            long h = 1469598103934665603;
+            var silent = true;
+            for (var j = 0; j < WindowSamples; j++)
+            {
+                var v = buffer[offset + i + j];
+                if (v != 0f) silent = false;
+                h = (h ^ BitConverter.SingleToInt32Bits(v)) * 1099511628211;
+            }
+            var winPos = _pos + i;
+            if (!silent)
+            {
+                for (var k = 0; k < _hashes.Length; k++)
+                {
+                    if (_hashes[k] == h && winPos - _positions[k] is > 0 and <= MaxLagSamples)
+                    {
+                        var now = Environment.TickCount64;
+                        if (now - _lastLogTick > 250)
+                        {
+                            _lastLogTick = now;
+                            DebugLogger.Warn(DebugLogger.Category.Playback, $"GaplessEngine.Replay{_label}",
+                                $"lagMs={(winPos - _positions[k]) / 96.0:F1}, posSamples={winPos}");
+                        }
+                        break;
+                    }
+                }
+                _hashes[_next] = h;
+                _positions[_next] = winPos;
+                _next = (_next + 1) % _hashes.Length;
+            }
+        }
+        _pos += n;
+    }
+}
+
+/// <summary>
+/// The persistent render source: a FIFO of segments rendered back-to-back.
+/// The active→next boundary is crossed inside a single Read call, so no
+/// silence is ever inserted between tracks. Segments whose rate/channels
+/// differ from the sink format are adapted (WDL resampler + channel map).
+/// Always returns the full requested count (silence on underrun) so the
+/// device stream never stops — the WasapiGainOutput ReadFully pattern.
+/// </summary>
+public sealed class GaplessSpliceProvider : ISampleProvider
+{
+    private readonly object _gate = new();
+    private readonly System.Collections.Generic.Queue<GaplessTrackSegment> _pending = new();
+    private GaplessTrackSegment? _active;
+    private ISampleProvider? _activeAdapted;
+
+    public WaveFormat WaveFormat { get; }
+
+    /// <summary>Raised (on the render thread) when the audible boundary is crossed.</summary>
+    public event Action<GaplessTrackSegment>? SegmentStarted;
+
+    private readonly int _startThresholdMs;
+
+    // Underrun hysteresis: after a mid-track 0-read, hold silence until this much
+    // audio re-buffers instead of consuming each trickle block the instant it
+    // lands — instant consumption alternates audio/silence at the ~10ms read
+    // cadence, audible as a ~100Hz chop buzz. EOS/Abandon bypass the hold.
+    private const int UnderrunRefillMs = 50;
+    // Post-seek gate: the flush re-arms the pre-buffer, but the decoder is warm
+    // — 50ms of refill renders glitch-free where a cold start needs the full
+    // startThresholdMs. Anything longer is an audible pause per timeline click.
+    private const int FlushRearmThresholdMs = 50;
+    // Silence must run at least this long before the next audio fades in, so the
+    // resampler's few-sample seam zeros can never arm a fade at a gapless splice.
+    private const int FadeArmMs = 5;
+
+    private readonly int _startFadeSamples;
+    private readonly int _fadeArmSamples;
+    private int _silentSamples;        // contiguous silence emitted so far (render thread only)
+    private int _fadeRemaining;        // samples left of an in-progress fade-in
+    private int _refillSamplesNeeded;  // >0 while the underrun hold is armed
+    private readonly float[] _lastFrame = new float[2]; // last emitted frame, for the cut declick
+    private int _declickRemaining;     // samples left of an in-progress cut ramp-to-zero
+    private bool _cutFadePending;      // a cut junction is due a fade-in regardless of silence streak (render thread only)
+    private volatile bool _pendingCutSignal; // cut raised off the render thread (Clear / abandon-swap)
+    private volatile bool _parked;     // paused: render silence, consume nothing (set off the render thread)
+    private bool _parkRendered;        // a parked read ran since the last un-parked one (render thread only)
+    private readonly ReplayDetector? _ringDetector = ReplayDetector.CreateIfEnabled("Ring"); // raw adapter output, pre-fade
+    private readonly bool _readTrace = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("UNDERTONE_ENGINE_TAP"));
+    private long _lastTraceTick;
+    private int _underrunCount;         // mid-track 0-reads (render thread increments)
+    private long _lastUnderrunLogTick;  // render thread only
+
+    // Mixed crossfade (transition-mode advance under the engine): the outgoing
+    // segment keeps rendering as a fading tail ADDED to the new active segment
+    // for _fadeTotalSamples, then is abandoned. Without this the engine could
+    // only butt-splice or cut, so an early transition advance cut the last
+    // fade-length seconds of every playlist track dead.
+    private GaplessTrackSegment? _fading;
+    private ISampleProvider? _fadingAdapted;
+    private Undertone.Models.AutoMixFadeCurve _fadeCurve;
+    private int _fadeTotalSamples;
+    private int _fadeElapsedSamples;   // render thread only
+    private volatile bool _crossfadeArmed; // BeginCrossfade swapped the active off the render thread
+    private float[]? _fadeScratch;
+    private readonly float[] _lastMixFrame = new float[2]; // last emitted frame of a read that mixed a tail
+    private bool _tailMixed;           // the last read mixed a tail into its output (render thread only)
+    private int _tailFadeInRemaining;  // un-park fade-in still due on the tail (render thread only)
+
+    // Playback speed (podcast/audiobook island): a WSOLA stretch is the LAST
+    // adapter stage, pulling media frames at the rate, so the segment's
+    // PositionMs stays media time and LibVLC keeps decoding at 1×. 1.0 is a
+    // pass-through — the gapless seam stays bit-exact.
+    private double _playbackRate = 1.0;
+
+    /// <summary>Playback speed, 0.5–2.0; 1.0 = untouched.</summary>
+    public double PlaybackRate
+    {
+        get => Volatile.Read(ref _playbackRate);
+        set => Volatile.Write(ref _playbackRate, TempoStretchProvider.ClampRate(value));
+    }
+
+    // Pitch shift (Harmonoid-style, independent of speed): a variable-ratio
+    // resampler ahead of the WSOLA stage. Resampling by p raises the pitch AND
+    // the tempo by p, so the stretch runs at rate/p to land on the chosen speed.
+    // 1.0 is a pass-through, keeping the gapless seam bit-exact.
+    private double _pitchRatio = 1.0;
+
+    /// <summary>Pitch ratio 0.5–2.0 (2^(semitones/12)); 1.0 = untouched.</summary>
+    public double PitchRatio
+    {
+        get => Volatile.Read(ref _pitchRatio);
+        set => Volatile.Write(ref _pitchRatio, PitchShiftProvider.ClampRatio(value));
+    }
+
+    /// <summary>Rate handed to the WSOLA stage so speed stays at <see cref="PlaybackRate"/> after the pitch resample.</summary>
+    private double EffectiveStretchRate()
+    {
+        var rate = Volatile.Read(ref _playbackRate);
+        var pitch = Volatile.Read(ref _pitchRatio);
+        return Math.Abs(pitch - 1.0) < 1e-9 ? rate : TempoStretchProvider.ClampRate(rate / pitch);
+    }
+
+    public GaplessSpliceProvider(int sinkRate, int sinkChannels, int startThresholdMs = 0, int startFadeMs = 0)
+    {
+        WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(
+            Math.Clamp(sinkRate, 1000, 384000), Math.Clamp(sinkChannels, 1, 2));
+        _startThresholdMs = Math.Clamp(startThresholdMs, 0, 2000);
+        // Whole frames: at 44.1 kHz stereo 5 ms is 441 SAMPLES, and an odd-length
+        // junction ramp leaves the post-cut read at an odd offset — L/R swapped.
+        _startFadeSamples = WaveFormat.SampleRate * Math.Clamp(startFadeMs, 0, 100) / 1000 * WaveFormat.Channels;
+        _fadeArmSamples = WaveFormat.SampleRate * FadeArmMs / 1000 * WaveFormat.Channels;
+        // Born silent: the very first audio the provider ever renders fades in.
+        _silentSamples = _fadeArmSamples;
+    }
+
+    public GaplessTrackSegment? ActiveSegment { get { lock (_gate) return _active; } }
+
+    public void Enqueue(GaplessTrackSegment segment)
+    {
+        lock (_gate)
+            _pending.Enqueue(segment);
+    }
+
+    /// <summary>
+    /// Drop every queued segment and the active one (full stop / new queue).
+    /// The render side falls to silence until the next Enqueue.
+    /// </summary>
+    /// <summary>
+    /// Start a mixed crossfade from the active segment into the next queued one:
+    /// the next segment becomes active NOW (position/bookkeeping follow it) while
+    /// the outgoing keeps rendering as a fading tail mixed underneath for
+    /// <paramref name="durationMs"/>, after which it is abandoned. False when
+    /// nothing is active or nothing is staged — the caller then cuts as before.
+    /// The outgoing decoder must keep feeding its segment for the fade length.
+    /// </summary>
+    public bool BeginCrossfade(int durationMs, Undertone.Models.AutoMixFadeCurve curve)
+    {
+        lock (_gate)
+        {
+            if (_active == null || _active.Abandoned || _pending.Count == 0)
+                return false;
+            // A fade still in flight: its tail is stale now — drop it.
+            _fading?.Abandon();
+            _fading = _active;
+            _fadingAdapted = _activeAdapted;
+            _active = _pending.Dequeue();
+            _activeAdapted = Adapt(_active);
+            _fadeCurve = curve;
+            _fadeTotalSamples = Math.Max(1, WaveFormat.SampleRate * WaveFormat.Channels * Math.Clamp(durationMs, 1, 20000) / 1000);
+            _fadeElapsedSamples = 0;
+            _crossfadeArmed = true;
+            return true;
+        }
+    }
+
+    /// <summary>True while an outgoing tail is still being mixed underneath the active segment.</summary>
+    public bool IsCrossfading { get { lock (_gate) return _fading != null; } }
+
+    /// <summary>
+    /// Pause without stopping the stream. Parked, Read ramps the last emitted frame
+    /// down to silence (the cut declick) and then renders zeros without consuming
+    /// any segment; un-parked, the held audio resumes with the start fade-in.
+    /// Pausing the device instead left both edges unramped: WasapiOut.Pause() only
+    /// stops filling, so the device starved mid-waveform about 100 ms later, and
+    /// Play() stepped straight back in at full level.
+    /// </summary>
+    public bool Parked
+    {
+        get => _parked;
+        set => _parked = value;
+    }
+
+    public void Clear()
+    {
+        lock (_gate)
+        {
+            if (_active != null)
+                _pendingCutSignal = true; // live audio cut off the render thread
+            _active?.Abandon();
+            _active = null;
+            _activeAdapted = null;
+            _fading?.Abandon();
+            _fading = null;
+            _fadingAdapted = null;
+            while (_pending.Count > 0)
+                _pending.Dequeue().Abandon();
+        }
+    }
+
+    /// <summary>
+    /// Drop queued segments but keep the active one playing (queue changed
+    /// while the current track keeps going).
+    /// </summary>
+    public void ClearPending()
+    {
+        lock (_gate)
+        {
+            while (_pending.Count > 0)
+                _pending.Dequeue().Abandon();
+        }
+    }
+
+    public int Read(float[] buffer, int offset, int count)
+    {
+        var written = 0;
+        // Parked: skip the segments (and any crossfade tail) so nothing is consumed;
+        // the pad below declicks the first parked read and renders silence after.
+        var parked = _parked;
+        if (parked)
+            _parkRendered = true;
+        else if (_parkRendered)
+        {
+            // First read after a park that rendered silence: fade the held audio
+            // back in however short the park was (the silence streak alone arms
+            // only after FadeArmMs).
+            _parkRendered = false;
+            if (_startFadeSamples > 0)
+            {
+                _cutFadePending = true;
+                // A crossfade tail kept across the pause resumes from silence too.
+                _tailFadeInRemaining = _startFadeSamples;
+            }
+        }
+        if (_tailMixed)
+        {
+            // The last read emitted incoming × fade-in + tail × fade-out, but no
+            // tail is mixed into this one (Clear dropped it mid-blend, or parked).
+            // _lastFrame is the raw incoming frame — ramp from what was actually
+            // emitted instead, or the cut steps by the whole tail.
+            bool tailLive;
+            lock (_gate) tailLive = _fading != null;
+            if (parked || !tailLive)
+            {
+                _tailMixed = false;
+                for (var c = 0; c < WaveFormat.Channels; c++)
+                    _lastFrame[c] = _lastMixFrame[c];
+                if (_startFadeSamples > 0)
+                    _declickRemaining = _startFadeSamples;
+            }
+        }
+        if (!parked && _crossfadeArmed)
+        {
+            // BeginCrossfade promoted the staged segment off the render thread:
+            // a fresh active is governed by its own start gate, not a leftover
+            // underrun hold, and the audible boundary is announced like a splice.
+            _crossfadeArmed = false;
+            _refillSamplesNeeded = 0;
+            GaplessTrackSegment? promoted;
+            lock (_gate) promoted = _active;
+            if (promoted != null)
+                SegmentStarted?.Invoke(promoted);
+        }
+        while (!parked && written < count)
+        {
+            ISampleProvider? adapted;
+            GaplessTrackSegment? active;
+            lock (_gate)
+            {
+                if (_active == null || _active.IsFinished || _active.Abandoned)
+                {
+                    // A track-change abandon cuts LIVE audio (a natural end-of-
+                    // stream drain does not): the junction into whatever renders
+                    // next must declick+fade exactly like a seek flush.
+                    if (_active is { Abandoned: true })
+                        _pendingCutSignal = true;
+                    _active = null;
+                    _activeAdapted = null;
+                    if (_pending.Count > 0)
+                    {
+                        _active = _pending.Dequeue();
+                        _activeAdapted = Adapt(_active);
+                        _refillSamplesNeeded = 0; // fresh segment: the start gate governs
+                    }
+                    if (_active != null)
+                        SegmentStarted?.Invoke(_active);
+                }
+                adapted = _activeAdapted;
+                active = _active;
+            }
+
+            if (active == null || adapted == null)
+                break; // nothing to play — silence-fill below
+
+            // A cut (seek flush / track abandon / clear) may be followed by a
+            // refill that lands BEFORE this read — then no silence is ever
+            // rendered and the streak-based declick/fade below never engages,
+            // butt-splicing unrelated waveforms (an audible click). The cut
+            // event itself is the only reliable signal; consume it here, before
+            // the gate, so the pad path inherits the armed ramp when it holds.
+            var cutNow = active.ConsumeCut();
+            if (_pendingCutSignal) { _pendingCutSignal = false; cutNow = true; }
+            if (cutNow && _startFadeSamples > 0)
+            {
+                if (_silentSamples == 0)
+                    _declickRemaining = _startFadeSamples; // ramp the live tail
+                _cutFadePending = true;                    // and fade what follows
+            }
+
+            // Pre-buffer gate: hold a fresh segment in silence until enough is
+            // staged for glitch-free rendering (see ReadyToRender). After a seek
+            // flush the decoder is warm and delivery is already ramped — use a
+            // short refill threshold there, or every timeline click pauses for
+            // the full cold-start pre-buffer.
+            var gateMs = active.GateRearmedByFlush ? FlushRearmThresholdMs : _startThresholdMs;
+            if (!active.ReadyToRender(active.SampleRate * active.Channels * gateMs / 1000))
+                break;
+
+            // Underrun hysteresis: after a mid-track 0-read, keep padding until
+            // the segment re-buffers ~UnderrunRefillMs (EOS/Abandon play out).
+            if (_refillSamplesNeeded > 0)
+            {
+                if (active.BufferedSamples < _refillSamplesNeeded &&
+                    !active.EndOfStream && !active.Abandoned)
+                    break;
+                _refillSamplesNeeded = 0;
+            }
+
+            // The junction ramp of a fast-refill cut: play the last live frame
+            // down to zero BEFORE the first post-cut audio. (When the gate holds
+            // instead, the silence pad below runs this same ramp.)
+            if (_cutFadePending && _declickRemaining > 0)
+            {
+                var rampCh = WaveFormat.Channels;
+                var run = Math.Min(_declickRemaining, count - written);
+                for (var i = 0; i < run; i++)
+                {
+                    buffer[offset + written + i] =
+                        _lastFrame[i % rampCh] * ((float)_declickRemaining / _startFadeSamples);
+                    _declickRemaining--;
+                }
+                written += run;
+                if (_declickRemaining == 0)
+                {
+                    // The emitted tail is now zero; a later silence pad must not
+                    // ramp again from the stale pre-cut frame.
+                    _lastFrame[0] = 0f;
+                    _lastFrame[1] = 0f;
+                }
+                continue;
+            }
+
+            var n = adapted.Read(buffer, offset + written, count - written);
+            if (n > 0)
+            {
+                _ringDetector?.Observe(buffer, offset + written, n);
+                // Fade in when audio resumes after audible silence (cold start,
+                // post-seek gate, underrun recovery) or across a cut junction, to
+                // mask decoder warm-up garble and unrelated-waveform steps. A
+                // NATURAL gapless seam is neither (no silence streak, no cut),
+                // so it stays bit-exact.
+                if (_startFadeSamples > 0 && (_silentSamples >= _fadeArmSamples || _cutFadePending))
+                {
+                    _fadeRemaining = _startFadeSamples;
+                    _cutFadePending = false;
+                }
+                _silentSamples = 0;
+                if (_fadeRemaining > 0)
+                    ApplyFadeIn(buffer, offset + written, n);
+                written += n;
+                // Remember the tail frame for the cut declick; audio resuming
+                // cancels any ramp still pending from a previous cut.
+                _declickRemaining = 0;
+                var tailCh = WaveFormat.Channels;
+                if (n >= tailCh)
+                    for (var c = 0; c < tailCh; c++)
+                        _lastFrame[c] = buffer[offset + written - tailCh + c];
+                continue;
+            }
+
+            // 0 from the adapter: either the segment truly finished (advance on
+            // the next loop pass) or a mid-track underrun (VLC hasn't delivered
+            // yet) — pad THIS call with silence rather than busy-spinning the
+            // render thread, but do not advance past an unfinished segment.
+            if (!active.IsFinished)
+            {
+                _refillSamplesNeeded = WaveFormat.SampleRate * WaveFormat.Channels * UnderrunRefillMs / 1000;
+                NoteUnderrun(active);
+                break;
+            }
+        }
+
+        var padded = count - written;
+        if (padded > 0)
+        {
+            var pos = offset + written;
+            // NEVER Array.Clear here: the render buffer arrives as NAudio's
+            // WaveBuffer pun (a byte[] reinterpreted as float[]), and Array.Clear
+            // uses the array's RUNTIME type — it cleared `padded` BYTES (a quarter
+            // of the region), leaving the rest playing stale device-buffer audio:
+            // a ~10ms replay loop at every seek/track cut (the engine buzz).
+            // Element stores go through the static float[] type and are safe.
+            for (var i = 0; i < padded; i++)
+                buffer[pos + i] = 0f;
+            // Declick a hard cut: a seek flush / abandon stops LIVE audio inside
+            // a stream that never stops, so there is no OS stream-stop ramp to
+            // hide the edge — an instant step to zero is an audible click/buzz.
+            // Ramp the pad from the last emitted frame down to silence instead.
+            // Natural seams never pad, so true gapless is untouched.
+            if (_startFadeSamples > 0 && _silentSamples == 0)
+                _declickRemaining = _startFadeSamples;
+            if (_declickRemaining > 0)
+            {
+                var ch = WaveFormat.Channels;
+                var run = Math.Min(_declickRemaining, padded);
+                for (var i = 0; i < run; i++)
+                {
+                    buffer[pos + i] = _lastFrame[i % ch] * ((float)_declickRemaining / _startFadeSamples);
+                    _declickRemaining--;
+                }
+            }
+            _silentSamples = (int)Math.Min((long)_silentSamples + padded, int.MaxValue / 2);
+        }
+        if (!parked)
+            MixFadingTail(buffer, offset, count);
+        if (_readTrace && Environment.TickCount64 - _lastTraceTick > 250)
+        {
+            _lastTraceTick = Environment.TickCount64;
+            DebugLogger.Info(DebugLogger.Category.Playback, "GaplessEngine.ReadTrace",
+                $"offset={offset}, count={count}, written={written}, padded={padded}, bufLen={buffer.Length}, declick={_declickRemaining}, fade={_fadeRemaining}, silent={_silentSamples}, active={(_active != null ? 1 : 0)}");
+        }
+        return count;
+    }
+
+    // A mid-track underrun just armed the refill hold. Counted here on the render
+    // thread; the line is posted off it (a log write must not land inside a render
+    // read) and rate-limited to one per 250 ms, carrying the running count.
+    private void NoteUnderrun(GaplessTrackSegment active)
+    {
+        var count = Interlocked.Increment(ref _underrunCount);
+        if (!DebugLogger.IsEnabled) return;
+        var now = Environment.TickCount64;
+        if (now - _lastUnderrunLogTick < 250) return;
+        _lastUnderrunLogTick = now;
+        DebugLogger.LogOffThread(DebugLogger.Category.Playback, DebugLogger.Level.Warn, "GaplessEngine.Underrun",
+            $"count={count}, slot={active.Source}, bufferedSamples={active.BufferedSamples}, refillHoldSamples={_refillSamplesNeeded}");
+    }
+
+    // Crossfade render: the buffer holds the new active segment's audio (or
+    // silence) for this read; scale it by the fade-in factor and add the
+    // outgoing tail scaled by the fade-out factor, sample-locked so both
+    // sides advance together. The tail is dropped when the fade completes or
+    // it runs dry (EOS drained). Render thread only.
+    private void MixFadingTail(float[] buffer, int offset, int count)
+    {
+        GaplessTrackSegment? fading;
+        ISampleProvider? adapted;
+        lock (_gate)
+        {
+            fading = _fading;
+            adapted = _fadingAdapted;
+        }
+        if (fading == null || adapted == null)
+        {
+            _tailMixed = false;
+            _tailFadeInRemaining = 0;
+            return;
+        }
+
+        var scratch = _fadeScratch;
+        if (scratch == null || scratch.Length < count)
+            _fadeScratch = scratch = new float[Math.Max(count, 4096)];
+        var got = 0;
+        if (!fading.Abandoned)
+        {
+            while (got < count)
+            {
+                var n = adapted.Read(scratch, got, count - got);
+                if (n <= 0) break; // underrun or drained: the rest of the tail is silence
+                got += n;
+            }
+        }
+        for (var i = got; i < count; i++)
+            scratch[i] = 0f;
+        // First read after a pause: ramp the tail in with the active's fade-in, or
+        // it steps straight out of the parked silence at its outgoing level.
+        for (var i = 0; i < count && _tailFadeInRemaining > 0; i++, _tailFadeInRemaining--)
+            scratch[i] *= (float)(_startFadeSamples - _tailFadeInRemaining) / _startFadeSamples;
+
+        var total = _fadeTotalSamples;
+        var elapsed = _fadeElapsedSamples;
+        var ch = WaveFormat.Channels;
+        for (var i = 0; i < count; i += ch)
+        {
+            var progress = Math.Min(1.0, (elapsed + i) / (double)total);
+            var (outGain, inGain) = AutoMixFadeMath.GetFadeFactors(progress, _fadeCurve);
+            var end = Math.Min(count, i + ch);
+            for (var c = i; c < end; c++)
+                buffer[offset + c] = (float)(buffer[offset + c] * inGain + scratch[c] * outGain);
+        }
+        if (count >= ch)
+            for (var c = 0; c < ch; c++)
+                _lastMixFrame[c] = buffer[offset + count - ch + c];
+        _tailMixed = true;
+        _fadeElapsedSamples = (int)Math.Min((long)elapsed + count, int.MaxValue / 2);
+
+        if (_fadeElapsedSamples >= total || fading.IsFinished || fading.Abandoned)
+        {
+            lock (_gate)
+            {
+                if (ReferenceEquals(_fading, fading))
+                {
+                    _fading = null;
+                    _fadingAdapted = null;
+                }
+            }
+            fading.Abandon();
+        }
+    }
+
+    // Linear per-sample ramp 0 → 1 across _startFadeSamples, resuming across
+    // Read calls via _fadeRemaining. Render thread only.
+    private void ApplyFadeIn(float[] buffer, int offset, int n)
+    {
+        var total = _startFadeSamples;
+        for (var i = 0; i < n && _fadeRemaining > 0; i++, _fadeRemaining--)
+        {
+            buffer[offset + i] *= (float)(total - _fadeRemaining) / total;
+        }
+    }
+
+    // Segment (native rate/ch) → sink format. The WDL resampler tail (a few
+    // samples) is flushed naturally: it keeps returning data after the ring
+    // empties until its internal buffer drains, and only then reports 0.
+    private ISampleProvider Adapt(GaplessTrackSegment segment)
+    {
+        ISampleProvider source = new SegmentSampleProvider(segment);
+        if (segment.Channels == 1 && WaveFormat.Channels == 2)
+            source = new MonoToStereoSampleProvider(source);
+        else if (segment.Channels == 2 && WaveFormat.Channels == 1)
+            source = new StereoToMonoSampleProvider(source);
+        if (source.WaveFormat.SampleRate != WaveFormat.SampleRate)
+            source = new WdlResamplingSampleProvider(source, WaveFormat.SampleRate);
+        source = new PitchShiftProvider(source, () => Volatile.Read(ref _pitchRatio));
+        source = new TempoStretchProvider(source, EffectiveStretchRate);
+        return source;
+    }
+
+    private sealed class SegmentSampleProvider : ISampleProvider
+    {
+        private readonly GaplessTrackSegment _segment;
+        public WaveFormat WaveFormat { get; }
+
+        public SegmentSampleProvider(GaplessTrackSegment segment)
+        {
+            _segment = segment;
+            WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(segment.SampleRate, segment.Channels);
+        }
+
+        public int Read(float[] buffer, int offset, int count) =>
+            _segment.Read(buffer, offset, count);
+    }
+}

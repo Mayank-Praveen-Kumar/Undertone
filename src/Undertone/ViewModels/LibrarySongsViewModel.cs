@@ -1,0 +1,846 @@
+using System.Collections.ObjectModel;
+using System.Diagnostics;
+using Avalonia.Threading;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using Undertone.Helpers;
+using Undertone.Models;
+using Undertone.Services;
+
+namespace Undertone.ViewModels;
+
+/// <summary>
+/// ViewModel for the flat "Songs" view — shows all tracks in a sortable table.
+/// </summary>
+public partial class LibrarySongsViewModel : ViewModelBase, ISearchable, IDisposable
+{
+    private readonly ILibraryService _library;
+    private readonly PlayerViewModel _player;
+    private readonly SidebarViewModel _sidebar;
+    private readonly IPersistenceService _persistence;
+    private readonly SettingsViewModel? _settings;
+
+    private List<Track> _allTracks = new();
+    private string _currentFilter = string.Empty;
+    private int _filterGeneration;
+    private DispatcherTimer? _searchDebounce;
+    private EventHandler? _libraryUpdatedHandler;
+    private EventHandler? _viewStateLoadedHandler;
+    private bool _isDirty = true;
+
+    /// <summary>Guards the startup adoption of persisted sort/filter so echoing each
+    /// value straight back into settings doesn't queue a pointless disk write.</summary>
+    private bool _adoptingPersistedState;
+
+    [ObservableProperty] private bool _isSearchVisible = false;
+    [ObservableProperty] private string _searchText = string.Empty;
+    [ObservableProperty] private string _sortColumn = "Date Added";
+    [ObservableProperty] private bool _sortAscending = false;
+    [ObservableProperty] private bool _showOnlyFavorites = false;
+    [ObservableProperty] private bool _isFilterMenuOpen = false;
+
+    /// <summary>Quality filter for the top-bar chips: "All", "Lossless" or "HiRes".</summary>
+    [ObservableProperty] private string _qualityFilter = "All";
+
+    /// <summary>"2,144 songs · 138 hours" line for the top bar; reflects the current filters.</summary>
+    [ObservableProperty] private string _summaryText = string.Empty;
+
+    public bool HasActiveFilter => !string.IsNullOrWhiteSpace(_currentFilter);
+
+    /// <summary>A section click skips its ApplyFilter("") when true: re-applying the empty
+    /// filter Reset the whole list, re-creating every row and cover on each click.</summary>
+    public bool IsSearchCleared => string.IsNullOrEmpty(_currentFilter) && string.IsNullOrEmpty(SearchText);
+
+    /// <summary>
+    /// Identifies the filter the current rows were built for: the applied search (SearchText
+    /// runs ahead of it by the debounce) plus the quality/favorites narrowing. The view resets
+    /// its scroll only when this changes, so a library reload of the same results keeps its place.
+    /// </summary>
+    internal string FilterKey => $"{_currentFilter}\n{QualityFilter}\n{ShowOnlyFavorites}";
+
+    /// <summary>Saved scroll offset for restoring position after navigation.</summary>
+    public double SavedScrollOffset { get; set; }
+
+    /// <summary>Tracks currently Ctrl-selected in the view. Set by code-behind.</summary>
+    public List<Track> CtrlSelectedTracks { get; set; } = new();
+
+    /// <summary>Filtered and sorted tracks displayed in the DataGrid.</summary>
+    public BulkObservableCollection<Track> FilteredTracks { get; } = new();
+
+    /// <summary>Currently selected tracks (for multi-select and drag).</summary>
+    public ObservableCollection<Track> SelectedTracks { get; } = new();
+
+    /// <summary>Fires when the user wants to view an album from a track.</summary>
+    public event EventHandler<Track>? ViewAlbumRequested;
+
+    /// <param name="settings">Owns the persisted sort/filter round-trip. Optional so tests
+    /// that only exercise filtering can build the view model without a settings stack;
+    /// when absent the sort/filter simply stay session-only, as they were before.</param>
+    public LibrarySongsViewModel(ILibraryService library, PlayerViewModel player, SidebarViewModel sidebar,
+        IPersistenceService persistence, SettingsViewModel? settings = null)
+    {
+        _library = library;
+        _player = player;
+        _sidebar = sidebar;
+        _persistence = persistence;
+        _settings = settings;
+
+        // Settings load asynchronously and finish after this view model is built, so the
+        // persisted sort/filter is adopted when it lands rather than read here.
+        if (_settings != null)
+        {
+            _viewStateLoadedHandler = (_, _) => AdoptPersistedViewState();
+            _settings.ViewStateLoaded += _viewStateLoadedHandler;
+        }
+
+        // Mark dirty when library changes — actual reload deferred to next Refresh() call.
+        // Only rebuild immediately while this view is current: a scan fires LibraryUpdated
+        // every ~1.5 s, and rebuilding a 40k-100k row list for a hidden view burns CPU for
+        // nothing. Hidden views catch up once via the dirty flag when they become active.
+        _libraryUpdatedHandler = (_, _) =>
+        {
+            _isDirty = true;
+            Undertone.Services.DebugLog.Write("Songs", $"LibraryUpdated active={_isActive} library={_library.Tracks.Count} shown={FilteredTracks.Count}");
+            if (_isActive)
+                Dispatcher.UIThread.Post(() => UiStallWatchdog.Time("SongsRefresh", Refresh));
+        };
+        _library.LibraryUpdated += _libraryUpdatedHandler;
+
+        // A counted play raises no LibraryUpdated (see HomeViewModel.OnPlayCounted): the row's
+        // Plays cell ticked up live but a Plays sort never re-ranked (Discord, Andre 10-28).
+        _finishedPlays = new FinishedPlays(_player, ReRankFinished);
+    }
+
+    /// <summary>
+    /// Set by MainWindowViewModel when Songs becomes (or stops being) the current view.
+    /// Mirrors CoverFlowViewModel.IsActive: gates LibraryUpdated-driven rebuilds while
+    /// hidden, and catches up on activation (no-op when nothing changed).
+    /// </summary>
+    public bool IsActive
+    {
+        get => _isActive;
+        set
+        {
+            if (_isActive == value) return;
+            _isActive = value;
+            // Catch up on anything missed while hidden — covers back-navigation paths
+            // that swap CurrentView without going through RefreshAndReturnSongs.
+            if (value)
+            {
+                Refresh();
+                FlushReRank();
+            }
+        }
+    }
+
+    private bool _isActive;
+
+    /// <summary>Forces the next Refresh() call to rebuild even if data hasn't changed.</summary>
+    public void MarkDirty() => _isDirty = true;
+
+    /// <summary>Reloads tracks from the library service. Skips if data hasn't changed.</summary>
+    public void Refresh()
+    {
+        if (!_isDirty && FilteredTracks.Count > 0)
+            return;
+
+        _isDirty = false;
+
+        // Off-UI-thread rebuild via the same generation-guarded path as keystroke
+        // filtering. The sync rebuild this replaces froze the UI thread 30-250 ms per
+        // navigation/scan event at 40k-100k tracks; the view keeps showing its previous
+        // rows for the few frames the fresh list takes to compute in the background.
+        ApplyFilterAndSort(refreshFromLibrary: true);
+    }
+
+    public void ApplyFilter(string query)
+    {
+        if (SearchText != query)
+            SearchText = query;
+
+        _currentFilter = query;
+        OnPropertyChanged(nameof(HasActiveFilter));
+        ApplyFilterAndSort();
+    }
+
+    partial void OnSearchTextChanged(string value)
+    {
+        if (_searchDebounce == null)
+        {
+            _searchDebounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+            _searchDebounce.Tick += (_, _) =>
+            {
+                _searchDebounce.Stop();
+                ApplyFilter(SearchText);
+            };
+        }
+
+        _searchDebounce.Stop();
+        _searchDebounce.Start();
+    }
+
+    [RelayCommand]
+    private void ToggleSearch()
+    {
+        IsSearchVisible = !IsSearchVisible;
+        if (!IsSearchVisible)
+        {
+            SearchText = string.Empty;
+        }
+    }
+
+    [RelayCommand]
+    private void ToggleFilterMenu()
+    {
+        IsFilterMenuOpen = !IsFilterMenuOpen;
+    }
+
+    [RelayCommand]
+    private void SetQualityFilter(string quality)
+    {
+        if (QualityFilter == quality) return;
+        QualityFilter = quality;
+        ApplyFilterAndSort();
+    }
+
+    [RelayCommand]
+    private void SetShowAllItems()
+    {
+        ShowOnlyFavorites = false;
+        IsFilterMenuOpen = false;
+        ApplyFilterAndSort();
+    }
+
+    [RelayCommand]
+    private void SetShowOnlyFavorites()
+    {
+        ShowOnlyFavorites = true;
+        IsFilterMenuOpen = false;
+        ApplyFilterAndSort();
+    }
+
+    /// <summary>
+    /// Column-header click: re-clicking the active column flips the direction, any other
+    /// column starts ascending. Menus must not use this — see <see cref="SelectSort"/>.
+    /// </summary>
+    [RelayCommand]
+    private void Sort(string column)
+    {
+        if (SortColumn == column)
+            SortAscending = !SortAscending;
+        else
+        {
+            SortColumn = column;
+            SortAscending = true;
+        }
+
+        IsFilterMenuOpen = false;
+        ApplyFilterAndSort();
+    }
+
+    /// <summary>
+    /// Menu/dialog sort selection: sets the field, or the direction for the literals
+    /// "Ascending"/"Descending". Picking the field that is already active is a no-op.
+    /// <para>
+    /// Distinct from <see cref="Sort"/> because these surfaces show the field and the
+    /// direction as separate checked entries. Sharing the header's toggle meant choosing
+    /// the already-active field silently inverted the direction, moving the ✓ off the
+    /// direction the user had picked without them ever touching it.
+    /// </para>
+    /// </summary>
+    /// <summary><see cref="SelectSort"/> option: back to the default order (Date Added, newest first).</summary>
+    public const string ResetSortOption = "Reset";
+
+    [RelayCommand]
+    private void SelectSort(string option)
+    {
+        switch (option)
+        {
+            case "Ascending":
+                SortAscending = true;
+                break;
+            case "Descending":
+                SortAscending = false;
+                break;
+            case ResetSortOption:
+                // The Songs default: newest additions first (GitHub #156, Sort menu reset).
+                SortColumn = "Date Added";
+                SortAscending = false;
+                break;
+            default:
+                if (SortColumn == option) return;
+                SortColumn = option;
+                break;
+        }
+
+        IsFilterMenuOpen = false;
+        ApplyFilterAndSort();
+    }
+
+    /// <summary>Applies the sort/filter persisted from the previous session.</summary>
+    private void AdoptPersistedViewState()
+    {
+        if (_settings == null) return;
+
+        _adoptingPersistedState = true;
+        try
+        {
+            SortColumn = _settings.SongsSortColumn;
+            SortAscending = _settings.SongsSortAscending;
+            ShowOnlyFavorites = _settings.SongsShowOnlyFavorites;
+        }
+        finally
+        {
+            _adoptingPersistedState = false;
+        }
+
+        ApplyFilterAndSort();
+    }
+
+    partial void OnSortColumnChanged(string value)
+    {
+        if (_settings != null && !_adoptingPersistedState) _settings.SongsSortColumn = value;
+    }
+
+    partial void OnSortAscendingChanged(bool value)
+    {
+        if (_settings != null && !_adoptingPersistedState) _settings.SongsSortAscending = value;
+    }
+
+    partial void OnShowOnlyFavoritesChanged(bool value)
+    {
+        if (_settings != null && !_adoptingPersistedState) _settings.SongsShowOnlyFavorites = value;
+    }
+
+    /// <summary>Row artwork hover button (09-14): Play from this row, or Pause/Resume when
+    /// the row is the loaded track — the album tile's TogglePlayAlbum for a single row.</summary>
+    [RelayCommand]
+    private void TogglePlayTrack(Track track)
+    {
+        if (track == null) return;
+        if (track.IsNowPlaying) { _player.PlayPauseCommand.Execute(null); return; }
+        PlayFromHere(track);
+    }
+
+    [RelayCommand]
+    private void PlayFromHere(Track track)
+    {
+        var tracks = PlayContext(track);
+        var index = tracks.IndexOf(track);
+        if (index < 0) index = 0;
+
+        _player.PlayFromRow(tracks, index);
+    }
+
+    /// <summary>
+    /// The list a played row continues with. A search narrows what is shown, not what plays
+    /// next (Discord, HypnoTized 10-24: search "through the", 1 result, "Nothing up next"):
+    /// with a search applied the row plays in the whole list, in the current sort, with the
+    /// favorites/quality narrowing kept, as Apple Music and Spotify do.
+    /// </summary>
+    private List<Track> PlayContext(Track track)
+    {
+        if (!HasActiveFilter)
+            return FilteredTracks.ToList();
+
+        var all = BuildFilteredAndSortedTracks(
+            _allTracks, string.Empty, SortColumn, SortAscending, ShowOnlyFavorites, QualityFilter);
+        return all.Contains(track) ? all : FilteredTracks.ToList();
+    }
+
+    [RelayCommand]
+    private void ShuffleAll()
+    {
+        var tracks = FilteredTracks.ToList();
+        if (tracks.Count == 0) return;
+
+        _player.PlayShuffled(tracks);
+    }
+
+    [RelayCommand]
+    private void PlayNext(Track track) => _player.AddNext(track);
+
+    [RelayCommand]
+    private void AddToQueue(Track track) => _player.AddToQueue(track);
+
+    [RelayCommand]
+    private void StartRadio(Track track) => _player.StartRadioCommand.Execute(track);
+
+    /// <summary>The row, or the Ctrl-selection it is in (owner 10-10), in one snooze write.</summary>
+    [RelayCommand]
+    private Task SnoozeForMonth(Track track)
+    {
+        var tracks = SelectionOr(track);
+        CtrlSelectedTracks.Clear();
+        return _player.SnoozeTracksForMonthAsync(tracks);
+    }
+
+    [RelayCommand]
+    private async Task AddToNewPlaylist(Track track)
+    {
+        var tracks = SelectionOr(track);
+        await _sidebar.CreatePlaylistWithTracksAsync(tracks);
+        CtrlSelectedTracks.Clear();
+    }
+
+    [RelayCommand]
+    private async Task RemoveFromLibrary(Track track)
+    {
+        var tracks = SelectionOr(track);
+        if (!await Helpers.LibraryRemovalHelper.RemoveWithPromptAsync(_library, tracks))
+            return;
+        CtrlSelectedTracks.Clear();
+    }
+
+    [RelayCommand]
+    private async Task OpenMetadata(Track track)
+    {
+        var selection = SelectionOr(track);
+        if (selection.Count > 1)
+        {
+            CtrlSelectedTracks.Clear();
+            await MetadataHelper.OpenBatchMetadataWindow(selection);
+        }
+        else
+        {
+            await MetadataHelper.OpenMetadataWindow(track);
+        }
+    }
+
+    [RelayCommand]
+    private async Task ConvertTracks(Track track)
+    {
+        var tracks = SelectionOr(track);
+        CtrlSelectedTracks.Clear();
+        await MetadataHelper.OpenAudioConverterDialog(tracks);
+    }
+
+    /// <summary>The ReplayGain column's rows on screen whose tags were never read (GitHub #158).</summary>
+    public void ReadReplayGainSoon(IEnumerable<Track> tracks) => _library.ReadReplayGainSoon(tracks);
+
+    [RelayCommand]
+    private async Task ScanReplayGain(Track track)
+    {
+        var tracks = SelectionOr(track);
+        CtrlSelectedTracks.Clear();
+        await MetadataHelper.OpenReplayGainScannerDialog(tracks);
+    }
+
+    [RelayCommand]
+    private async Task ToggleFavorite(Track track)
+    {
+        var tracks = SelectionOr(track);
+        foreach (var t in tracks)
+            t.IsFavorite = !t.IsFavorite;
+        await _library.SaveTrackUserStateAsync(tracks);
+        _library.NotifyFavoritesChanged(tracks);
+        CtrlSelectedTracks.Clear();
+    }
+
+    [RelayCommand]
+    private void ViewAlbum(Track track)
+    {
+        ViewAlbumRequested?.Invoke(this, track);
+    }
+
+    [RelayCommand]
+    private void ShowInExplorer(Track track)
+    {
+        if (track == null || !File.Exists(track.FilePath)) return;
+        Helpers.PlatformHelper.ShowInFileManager(track.FilePath);
+    }
+
+    /// <summary>The Ctrl-selection when the acted-on row is part of it, else just that row.</summary>
+    private List<Track> SelectionOr(Track track) =>
+        CtrlSelectedTracks.Count > 0 && CtrlSelectedTracks.Contains(track) ? CtrlSelectedTracks.ToList() : new List<Track> { track };
+
+    /// <summary>Star click on a row, or Rate ▸ in the context menu. Rates the whole selection when the row is in it.</summary>
+    public Task RateAsync(Track track, int stars) => _library.SetTracksRatingAsync(SelectionOr(track), stars);
+
+    [RelayCommand]
+    private Task RateTrack(RateRequest request) => RateAsync(request.Track, request.Stars);
+
+    [RelayCommand]
+    private async Task FetchLyrics(Track track)
+    {
+        var tracks = SelectionOr(track);
+        CtrlSelectedTracks.Clear();
+        await MetadataHelper.OpenBulkLyricsDialog(tracks, remove: false);
+    }
+
+    [RelayCommand]
+    private async Task RemoveLyrics(Track track)
+    {
+        var tracks = SelectionOr(track);
+        CtrlSelectedTracks.Clear();
+        await MetadataHelper.OpenBulkLyricsDialog(tracks, remove: true);
+    }
+
+    [RelayCommand]
+    private async Task OpenLyricsStudio(Track track)
+    {
+        var tracks = SelectionOr(track);
+        CtrlSelectedTracks.Clear();
+        await MetadataHelper.OpenLyricsStudio(tracks);
+    }
+
+    [RelayCommand]
+    private async Task SendToFolder(Track track)
+    {
+        var tracks = SelectionOr(track);
+        CtrlSelectedTracks.Clear();
+        await MetadataHelper.OpenSendToFolderDialog(tracks);
+    }
+
+    private Action<Track>? _searchLyricsAction;
+    public void SetSearchLyricsAction(Action<Track> action) => _searchLyricsAction = action;
+
+    [RelayCommand]
+    private void SearchLyrics(Track track) => _searchLyricsAction?.Invoke(track);
+
+    private Action<string>? _viewArtistAction;
+    public void SetViewArtistAction(Action<string> action) => _viewArtistAction = action;
+
+    [RelayCommand]
+    private void ViewArtist(string artistName)
+    {
+        if (!string.IsNullOrWhiteSpace(artistName))
+            _viewArtistAction?.Invoke(artistName);
+    }
+
+    // ── Live Plays re-rank (Discord, Andre 10-28) ──
+    // Apple Music's way: the Plays cell counts up in place at once (Track.PlayCount is
+    // observable), and the row moves to its new rank once its song is over (the next one
+    // starts or is counted), so the playing row never jumps out from under the pointer.
+    // Only the counted rows move; the other rows keep their place, scroll and selection.
+    private readonly FinishedPlays _finishedPlays;
+    private DispatcherTimer? _reRankRetry;
+    private const int ReRankRetryMs = 2000;
+
+    /// <summary>Set by the view: true while the user is busy with the list (rows
+    /// Ctrl-selected, or scrolled a moment ago). A pending re-rank waits until it passes.</summary>
+    public Func<bool>? IsUserBusy { get; set; }
+
+    private void FlushReRank()
+    {
+        _reRankRetry?.Stop();
+        _finishedPlays.Flush();
+    }
+
+    /// <summary>Moves the counted rows whose song is over to their new rank (FinishedPlays).
+    /// False keeps them pending: hidden (activation flushes) or busy (retried shortly).</summary>
+    private bool ReRankFinished(List<Track> finished)
+    {
+        // No other sort reads play counts, and switching to Plays sorts afresh anyway.
+        if (SortColumn != "Plays") return true;
+        if (!_isActive) return false;
+        if (IsUserBusy?.Invoke() == true)
+        {
+            if (_reRankRetry == null)
+            {
+                _reRankRetry = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(ReRankRetryMs) };
+                _reRankRetry.Tick += (_, _) => FlushReRank();
+            }
+            _reRankRetry.Start();
+            return false;
+        }
+
+        ApplyFilterAndSort(reRanked: finished);
+        return true;
+    }
+
+    /// <summary>
+    /// Moves just <paramref name="reRanked"/> to their place in <paramref name="sorted"/>.
+    /// False when the list differs in more than those rows: the caller replaces it whole.
+    /// </summary>
+    private bool TryMoveIntoPlace(List<Track> sorted, List<Track> reRanked)
+    {
+        if (sorted.Count != FilteredTracks.Count) return false;
+        var moves = new List<(Track Track, int To)>();
+        foreach (var t in reRanked)
+        {
+            var to = sorted.IndexOf(t);
+            if (to >= 0) moves.Add((t, to));
+        }
+
+        if (moves.Count == 1)
+        {
+            var from = FilteredTracks.IndexOf(moves[0].Track);
+            if (from < 0) return false;
+            if (from != moves[0].To) FilteredTracks.Move(from, moves[0].To);
+        }
+        else if (moves.Count > 1)
+        {
+            // Out first, then in by target index: what is left already matches the sorted
+            // list, so each insert lands exactly.
+            foreach (var (t, _) in moves)
+                if (!FilteredTracks.Remove(t)) return false;
+            foreach (var (t, to) in moves.OrderBy(m => m.To))
+                FilteredTracks.Insert(to, t);
+        }
+        return FilteredTracks.SequenceEqual(sorted);
+    }
+
+    /// <summary>A library reload was requested and hasn't landed yet (see ApplyFilterAndSort).</summary>
+    private bool _reloadPending;
+
+    /// <param name="reRanked">Rows whose sort key changed in place (a counted play): when the
+    /// result differs only in them they are moved, not the whole list replaced.</param>
+    private async void ApplyFilterAndSort(bool refreshFromLibrary = false, List<Track>? reRanked = null)
+    {
+        try
+        {
+            var generation = Interlocked.Increment(ref _filterGeneration);
+            // A sort/filter request that supersedes a library reload must reload too:
+            // otherwise it sorts the pre-reload _allTracks and the reload is lost until
+            // some later LibraryUpdated.
+            refreshFromLibrary |= _reloadPending;
+            if (refreshFromLibrary) _reloadPending = true;
+
+            // Capture all state needed for filtering/sorting
+            var filter = _currentFilter;
+            var sortCol = SortColumn;
+            var sortAsc = SortAscending;
+            var favOnly = ShowOnlyFavorites;
+            var quality = QualityFilter;
+            var tracks = _allTracks;
+            var library = refreshFromLibrary ? _library : null;
+
+            // Run the heavy filter/sort work on a background thread
+            var result = await Task.Run(() =>
+            {
+                // Move ToList() off the UI thread when refreshing from library
+                if (library != null)
+                    tracks = library.Tracks.ToList();
+
+                return BuildFilteredAndSortedTracks(tracks, filter, sortCol, sortAsc, favOnly, quality);
+            });
+
+            // Discard stale results if a newer filter/sort has been requested. A
+            // superseded library reload must re-mark dirty: the newer request may have
+            // captured the pre-reload _allTracks snapshot.
+            if (generation != _filterGeneration)
+            {
+                if (refreshFromLibrary)
+                {
+                    _isDirty = true;
+                    Undertone.Services.DebugLog.Write("Songs", $"Reload gen={generation} superseded by gen={_filterGeneration} ({tracks.Count} tracks dropped)");
+                }
+                return;
+            }
+            if (refreshFromLibrary)
+                Undertone.Services.DebugLog.Write("Songs", $"Reload gen={generation} applied: {tracks.Count} tracks, {result.Count} shown");
+
+            // Save refreshed tracks list back (already on UI thread)
+            if (refreshFromLibrary)
+            {
+                _allTracks = tracks;
+                _reloadPending = false;
+            }
+
+            if (reRanked != null && !refreshFromLibrary && TryMoveIntoPlace(result, reRanked))
+                return;
+            FilteredTracks.ReplaceAll(result);
+            UpdateSummaryText();
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[SongsVM] Filter/sort failed: {ex.Message}");
+            Undertone.Services.DebugLog.Write("Songs", ex);
+        }
+    }
+
+    private void UpdateSummaryText()
+    {
+        var count = FilteredTracks.Count;
+        var total = TimeSpan.Zero;
+        foreach (var t in FilteredTracks)
+            total += t.Duration;
+
+        var songs = count == 1 ? "song" : "songs";
+        string time;
+        if (total.TotalHours >= 1)
+        {
+            var hours = (int)Math.Round(total.TotalHours);
+            time = hours == 1 ? "1 hour" : $"{hours:N0} hours";
+        }
+        else
+        {
+            var minutes = (int)Math.Round(total.TotalMinutes);
+            time = minutes == 1 ? "1 minute" : $"{minutes} minutes";
+        }
+
+        SummaryText = $"{count:N0} {songs} · {time}";
+    }
+
+    /// <remarks>Internal for tests (InternalsVisibleTo Undertone.Tests).</remarks>
+    internal static List<Track> BuildFilteredAndSortedTracks(
+        List<Track> tracks, string filter, string sortCol, bool sortAsc, bool favOnly, string qualityFilter)
+    {
+        var filtered = tracks.AsEnumerable();
+
+        if (favOnly)
+            filtered = filtered.Where(t => t.IsFavorite);
+
+        filtered = qualityFilter switch
+        {
+            "Lossless" => filtered.Where(t => t.IsLossless),
+            "HiRes" => filtered.Where(t => t.IsHiResLossless),
+            _ => filtered,
+        };
+
+        // Normalize the query once — these were recomputed per track inside the
+        // rank projection below, costing two string allocations per track per
+        // keystroke on large libraries.
+        var hasQuery = !string.IsNullOrWhiteSpace(filter);
+        var q = hasQuery ? filter.Trim() : string.Empty;
+        var qNoSpaces = hasQuery ? RemoveWhitespace(q) : string.Empty;
+
+        if (hasQuery)
+        {
+            // GitHub #107: words may land in different fields ("artist album", "genre year")
+            // and field tags narrow them ("artist:madonna remix").
+            var parsed = Undertone.Helpers.SearchQuery.Parse(q);
+            filtered = filtered.Where(parsed.Matches);
+        }
+
+        var ranked = filtered
+            .Select(t => new
+            {
+                Track = t,
+                Rank = hasQuery ? GetTrackSearchRank(t, q, qNoSpaces) : 0
+            });
+
+        var ordered = ranked.OrderBy(x => x.Rank);
+        ordered = sortCol switch
+        {
+            "Title" => sortAsc ? ordered.ThenBy(x => x.Track.Title) : ordered.ThenByDescending(x => x.Track.Title),
+            "Time" => sortAsc ? ordered.ThenBy(x => x.Track.Duration) : ordered.ThenByDescending(x => x.Track.Duration),
+            "Artist" => sortAsc ? ordered.ThenBy(x => x.Track.Artist).ThenBy(x => x.Track.Title) : ordered.ThenByDescending(x => x.Track.Artist).ThenBy(x => x.Track.Title),
+            // Album Artist/Year ordering (Apple Music/MusicBee): albums grouped under
+            // their album artist, chronological within the artist, tracks in album order.
+            "Album Artist" => sortAsc
+                ? ordered.ThenBy(x => AlbumArtistSortKey(x.Track)).ThenBy(x => x.Track.Year).ThenBy(x => x.Track.Album).ThenBy(x => x.Track.TrackNumber)
+                : ordered.ThenByDescending(x => AlbumArtistSortKey(x.Track)).ThenBy(x => x.Track.Year).ThenBy(x => x.Track.Album).ThenBy(x => x.Track.TrackNumber),
+            "Album" => sortAsc ? ordered.ThenBy(x => x.Track.Album).ThenBy(x => x.Track.TrackNumber) : ordered.ThenByDescending(x => x.Track.Album).ThenBy(x => x.Track.TrackNumber),
+            "Genre" => sortAsc ? ordered.ThenBy(x => x.Track.Genre).ThenBy(x => x.Track.Title) : ordered.ThenByDescending(x => x.Track.Genre).ThenBy(x => x.Track.Title),
+            "Year" => sortAsc ? ordered.ThenBy(x => x.Track.Year).ThenBy(x => x.Track.Album).ThenBy(x => x.Track.TrackNumber) : ordered.ThenByDescending(x => x.Track.Year).ThenBy(x => x.Track.Album).ThenBy(x => x.Track.TrackNumber),
+            "Plays" => sortAsc ? ordered.ThenBy(x => x.Track.PlayCount) : ordered.ThenByDescending(x => x.Track.PlayCount),
+            // First click (ascending) groups favorites at the top — that's what
+            // clicking a "Favorites" header is for; the second click flips it.
+            "IsFavorite" => sortAsc ? ordered.ThenByDescending(x => x.Track.IsFavorite).ThenBy(x => x.Track.Title) : ordered.ThenBy(x => x.Track.IsFavorite).ThenBy(x => x.Track.Title),
+            "Rating" => sortAsc ? ordered.ThenBy(x => x.Track.Rating).ThenBy(x => x.Track.Title) : ordered.ThenByDescending(x => x.Track.Rating).ThenBy(x => x.Track.Title),
+            "Bpm" => sortAsc ? ordered.ThenBy(x => x.Track.Bpm).ThenBy(x => x.Track.Title) : ordered.ThenByDescending(x => x.Track.Bpm).ThenBy(x => x.Track.Title),
+            "Bitrate" => sortAsc ? ordered.ThenBy(x => x.Track.Bitrate).ThenBy(x => x.Track.Title) : ordered.ThenByDescending(x => x.Track.Bitrate).ThenBy(x => x.Track.Title),
+            "SampleRate" => sortAsc ? ordered.ThenBy(x => x.Track.SampleRate).ThenBy(x => x.Track.Title) : ordered.ThenByDescending(x => x.Track.SampleRate).ThenBy(x => x.Track.Title),
+            // Track gain in dB (GitHub #151). Songs without one go last either way.
+            "ReplayGain" => sortAsc
+                ? ordered.ThenBy(x => x.Track.ReplayGainTrackDb is null).ThenBy(x => x.Track.ReplayGainTrackDb).ThenBy(x => x.Track.Title)
+                : ordered.ThenBy(x => x.Track.ReplayGainTrackDb is null).ThenByDescending(x => x.Track.ReplayGainTrackDb).ThenBy(x => x.Track.Title),
+            "Duration" => sortAsc ? ordered.ThenBy(x => x.Track.Duration) : ordered.ThenByDescending(x => x.Track.Duration),
+            "Date Added" => sortAsc ? ordered.ThenBy(x => x.Track.DateAdded) : ordered.ThenByDescending(x => x.Track.DateAdded),
+            // GitHub #89: file last-write time (refreshed on rescan). Descending = newest first.
+            "Date Modified" => sortAsc ? ordered.ThenBy(x => x.Track.LastModified).ThenBy(x => x.Track.Title) : ordered.ThenByDescending(x => x.Track.LastModified).ThenBy(x => x.Track.Title),
+            _ => ordered.ThenBy(x => x.Track.Title)
+        };
+
+        return ordered.Select(x => x.Track).ToList();
+    }
+
+    /// <summary>
+    /// Album-artist sort key. The scanner already resolves an empty album-artist tag
+    /// to the performer (see Track.ResolveAlbumArtist), but tracks from older caches
+    /// or other construction paths may miss that step — fall back to the track artist
+    /// so they still group under someone, matching Apple Music/MusicBee.
+    /// </summary>
+    /// <remarks>Internal for tests (InternalsVisibleTo Undertone.Tests).</remarks>
+    internal static string AlbumArtistSortKey(Track track) =>
+        string.IsNullOrWhiteSpace(track.AlbumArtist) ? track.Artist : track.AlbumArtist;
+
+    public void Dispose()
+    {
+        // Stop and dispose search debounce timer
+        if (_searchDebounce != null)
+        {
+            _searchDebounce.Stop();
+            _searchDebounce = null;
+        }
+
+        _reRankRetry?.Stop();
+        _reRankRetry = null;
+        _finishedPlays.Dispose();
+
+        // Unsubscribe from library events
+        if (_libraryUpdatedHandler != null)
+        {
+            _library.LibraryUpdated -= _libraryUpdatedHandler;
+            _libraryUpdatedHandler = null;
+        }
+
+        if (_viewStateLoadedHandler != null && _settings != null)
+        {
+            _settings.ViewStateLoaded -= _viewStateLoadedHandler;
+            _viewStateLoadedHandler = null;
+        }
+    }
+
+    private static bool MatchesAllWords(string source, string query)
+    {
+        var words = query.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (words.Length <= 1)
+            return false;
+
+        foreach (var word in words)
+        {
+            if (!source.Contains(word, StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+        return true;
+    }
+
+    private static int GetTrackSearchRank(Track track, string query, string queryNoSpaces)
+    {
+        var titleRank = RankMatch(track.Title, track.SearchTitleKey, query, queryNoSpaces);
+        var artistRank = RankMatch(track.Artist, track.SearchArtistKey, query, queryNoSpaces);
+        var albumRank = RankMatch(track.Album, track.SearchAlbumKey, query, queryNoSpaces);
+
+        return Math.Min(titleRank, Math.Min(artistRank + 20, albumRank + 40));
+    }
+
+    private static int RankMatch(string? source, string sourceKey, string query, string queryNoSpaces)
+    {
+        if (string.IsNullOrWhiteSpace(source))
+            return 1000;
+
+        // Normalize strips whitespace, so the cached key equals the old
+        // RemoveWhitespace(source.Trim()) result without the per-call allocations.
+        var normalized = source.Trim();
+
+        var hasKey = queryNoSpaces.Length > 0; // empty for punctuation-only queries
+
+        if (string.Equals(normalized, query, StringComparison.OrdinalIgnoreCase) ||
+            (hasKey && string.Equals(sourceKey, queryNoSpaces, StringComparison.OrdinalIgnoreCase)))
+            return 0;
+
+        if (normalized.StartsWith(query, StringComparison.OrdinalIgnoreCase) ||
+            (hasKey && sourceKey.StartsWith(queryNoSpaces, StringComparison.OrdinalIgnoreCase)))
+            return 1;
+
+        if (normalized.Contains(query, StringComparison.OrdinalIgnoreCase))
+            return 2;
+
+        if (hasKey && sourceKey.Contains(queryNoSpaces, StringComparison.OrdinalIgnoreCase))
+            return 3;
+
+        // Word-level match: all query words found in source
+        if (MatchesAllWords(normalized, query))
+            return 4;
+
+        return 1000;
+    }
+
+    // Normalizes a value into a comparable search key: strips whitespace, punctuation
+    // (e.g. the apostrophe in "Don't") and accents so queries match regardless. Name kept
+    // for its call sites; see Helpers/SearchText for the shared implementation.
+    private static string RemoveWhitespace(string value) => Undertone.Helpers.SearchText.Normalize(value);
+}

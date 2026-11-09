@@ -1,0 +1,62 @@
+using Undertone.Models;
+using Undertone.Services;
+
+namespace Undertone.Tests;
+
+internal class TestPersistenceService : IPersistenceService, IDisposable
+{
+    public string DataDirectory { get; }
+    private readonly string _root;
+
+    public TestPersistenceService()
+    {
+        _root = Path.Combine(Path.GetTempPath(), "UndertoneTests", Guid.NewGuid().ToString("N"));
+        DataDirectory = _root;
+        Directory.CreateDirectory(_root);
+    }
+
+    public bool LibraryLoadFailed => false;
+    public string? LastCorruptFilePath => null;
+    public bool SettingsLoadFailed => false;
+
+    public virtual Task<AppSettings> LoadSettingsAsync() => Task.FromResult(new AppSettings());
+    public virtual Task SaveSettingsAsync(AppSettings settings) => Task.CompletedTask;
+    public Task<List<Track>?> LoadLibraryAsync() => Task.FromResult<List<Track>?>(new List<Track>());
+    public Task SaveLibraryAsync(List<Track> tracks) => Task.CompletedTask;
+    public virtual Task<List<Playlist>> LoadPlaylistsAsync() => Task.FromResult(new List<Playlist>());
+    public virtual Task SavePlaylistsAsync(List<Playlist> playlists) => Task.CompletedTask;
+    public Task<QueueState?> LoadQueueStateAsync() => Task.FromResult<QueueState?>(null);
+    public Task SaveQueueStateAsync(QueueState state) => Task.CompletedTask;
+    public Task SaveQueuePositionAsync(Guid? currentTrackId, double positionSeconds) => Task.CompletedTask;
+    public Task<LibraryIndexCache?> LoadIndexCacheAsync() => Task.FromResult<LibraryIndexCache?>(null);
+    public Task SaveIndexCacheAsync(LibraryIndexCache cache) => Task.CompletedTask;
+
+    public string GetArtworkPath(Guid albumId) => Path.Combine(_root, "artwork", $"{albumId}.jpg");
+    public void SaveArtwork(Guid albumId, byte[] imageData) { }
+
+    public string GetAnimatedCoverPath(Guid albumId, Guid? trackId, string extension)
+    {
+        var ext = string.IsNullOrWhiteSpace(extension) ? ".mp4" : (extension.StartsWith('.') ? extension : "." + extension);
+        var name = trackId.HasValue ? $"{albumId}__{trackId.Value}{ext}" : $"{albumId}{ext}";
+        return Path.Combine(_root, "animated_covers", name);
+    }
+
+    public void EnsureAnimatedCoverDir()
+    {
+        Directory.CreateDirectory(Path.Combine(_root, "animated_covers"));
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            if (Directory.Exists(_root))
+                Directory.Delete(_root, true);
+        }
+        catch
+        {
+            // Ignore cleanup race locks in tests.
+        }
+    }
+}
+

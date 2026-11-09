@@ -1,0 +1,2103 @@
+using System;
+using System.ComponentModel;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Input;
+using Avalonia.Interactivity;
+using Avalonia.Media;
+using Avalonia.VisualTree;
+using Undertone.Helpers;
+using Undertone.ViewModels;
+
+namespace Undertone.Views;
+
+/// <summary>
+/// Resizable always-on-top "liquid glass" mini player. The layout morphs between
+/// five forms based on the window size (see <see cref="MiniPlayerViewModel.ComputeForm"/>):
+/// tiny icon, horizontal bar, vertical card, tall large-icon, and a split lyrics view.
+/// The "…" menu opens bottom-sheet layers (library search / queue / volume) over the
+/// card. Opened/closed by the mini player button in the bottom player bar; closing it
+/// restores the main window (handled by <see cref="MainWindow.ToggleMiniPlayer"/>).
+/// </summary>
+public partial class MiniPlayerWindow : Window
+{
+    private const int CloseAnimationMs = 170;
+    private bool _closeAnimationDone;
+
+    // Set when the window had to fall back to an opaque surface (no Linux compositor),
+    // in which case the card is squared off and must stay that way through resizes.
+    private bool _squareCard;
+
+    // Matches the slowest drawer transition (0.18s) so it stays mapped long enough
+    // for the fade-out + slide to finish before IsVisible flips to false.
+    private static readonly TimeSpan DrawerExitDuration = TimeSpan.FromMilliseconds(200);
+    private Avalonia.Threading.DispatcherTimer? _drawerHideTimer;
+
+    // Debounce for the viewport-derived lyric font size (see LyricsScroll.SizeChanged).
+    private Avalonia.Threading.DispatcherTimer? _lyricsFontTimer;
+    private double _pendingLyricsFontSize = 21;
+
+    // ── Flowing-artwork background (mini copy of the lyrics page's FlowBackdrop) ──
+    // The same FlowingArtworkAnimator as the page and the panel; it only runs while
+    // the Lyrics form, the Artwork background mode and the setting are all active,
+    // so the other forms never pay for it.
+    private FlowingArtworkAnimator? _flow;
+
+    // ── Frost bands (Large icon + Lyrics forms) ──
+    // Per-form brushes whose stops are re-derived from the controls' pixel height on
+    // every resize (MiniFrostBand), replacing the fixed-fraction shared resources.
+    private readonly LinearGradientBrush _largeFrostMask = MiniFrostBand.CreateMask();
+    private readonly LinearGradientBrush _largeFrostScrim = MiniFrostBand.CreateScrim();
+    private readonly LinearGradientBrush _lyricsFrostMask = MiniFrostBand.CreateMask();
+    private readonly LinearGradientBrush _lyricsFrostScrim = MiniFrostBand.CreateScrim();
+
+    // ── Form morphing ──
+    // Poses the form roots animate between. Hidden forms sit at Enter, so showing one is
+    // just "ease to Rest"; the one leaving eases to Exit and is collapsed afterwards.
+    private static readonly Avalonia.Media.Transformation.TransformOperations FormPoseRest =
+        Avalonia.Media.Transformation.TransformOperations.Parse("scale(1)");
+    private static readonly Avalonia.Media.Transformation.TransformOperations FormPoseEnter =
+        Avalonia.Media.Transformation.TransformOperations.Parse("scale(1.03)");
+    private static readonly Avalonia.Media.Transformation.TransformOperations FormPoseExit =
+        Avalonia.Media.Transformation.TransformOperations.Parse("scale(0.97)");
+    // Must match the .form-root transition duration in XAML.
+    private static readonly TimeSpan FormFadeDuration = TimeSpan.FromMilliseconds(180);
+    private MiniPlayerForm? _visibleForm;
+
+    // ── Eased window resize (menu jumps) ──
+    private int _resizeAnimationGeneration;
+    private bool _suppressPlacementCapture;
+
+    // ── Drawer expansion ──
+    // The drawer adds height to the WINDOW rather than covering the player, so these track
+    // how much of the current geometry belongs to it. Placement is persisted with both
+    // backed out, or quitting with the queue open would restore an oversized empty card.
+    private double _drawerHeight;
+    private double _drawerShiftY;
+
+    private MiniPlayerViewModel? Vm => DataContext as MiniPlayerViewModel;
+
+    public MiniPlayerWindow()
+    {
+        InitializeComponent();
+
+        // Per-pixel transparency by default — OS acrylic (AcrylicBlur) tints the WHOLE
+        // window rect, which painted the transparent corners outside the rounded
+        // card as black squares. The simulated glass layers in XAML carry the look.
+        // The opt-in "Frosted background" setting (Windows only) asks for the OS blur
+        // anyway; see ApplyTransparencyHint.
+        //
+        // Linux is the awkward case: per-pixel transparency needs a running compositor,
+        // and Avalonia's X11 backend doesn't track compositor changes
+        // (AvaloniaUI/Avalonia#3300), so without one the surface renders as
+        // garbage/see-through (issue #26). This used to go opaque on ALL of Linux, which
+        // fixed #26 but left every compositing desktop (KDE, GNOME, …) showing the
+        // window's square corners as dark wedges outside the r=28 card. So: ask whether
+        // there is actually a compositor, and only fall back when there isn't.
+        //
+        // UNDERTONE_MINI_OPAQUE=1 forces the fallback, for a desktop where transparency
+        // still misbehaves (same escape-hatch convention as UNDERTONE_SOFTWARE_RENDER).
+        var forceOpaque = Environment.GetEnvironmentVariable("UNDERTONE_MINI_OPAQUE") == "1";
+        if (forceOpaque || (OperatingSystem.IsLinux() && !PlatformHelper.IsLinuxCompositorRunning()))
+        {
+            TransparencyLevelHint = new[] { WindowTransparencyLevel.None };
+            Background = new SolidColorBrush(Color.Parse("#FF141418"));
+            // Square the card to match the window it can't see past. Rounding it here
+            // buys nothing — the corners outside the arc are opaque either way — and
+            // reads as a broken card rather than a deliberate one.
+            RootBorder.CornerRadius = new CornerRadius(0);
+            _squareCard = true;
+        }
+        else
+        {
+            ApplyTransparencyHint();
+        }
+
+        // Seek commits follow the same BeginSeek/EndSeek protocol as the playback bar
+        // so drags update the UI live and send a single debounced seek on release.
+        // Every form has its own seek slider; wire all of them the same way.
+        foreach (var slider in new[] { SeekSlider, BarSeekSlider, LargeSeekSlider, LyricsSeekSlider, PillSeekSlider, SleeveSeekSlider })
+        {
+            slider.AddHandler(PointerPressedEvent, OnSeekPointerPressed, RoutingStrategies.Tunnel);
+            slider.AddHandler(PointerReleasedEvent, OnSeekPointerReleased, RoutingStrategies.Tunnel);
+            slider.PointerCaptureLost += (_, _) => Vm?.Player.EndSeek();
+        }
+
+        // Volume sliders commit once on release so VLC isn't hammered with rapid
+        // changes mid-drag (anti-crackle), mirroring the playback bar.
+        foreach (var slider in new[] { LargeVolumeSlider, DrawerVolumeSlider })
+        {
+            slider.AddHandler(PointerReleasedEvent, (_, _) => Vm?.Player.CommitVolume(), RoutingStrategies.Tunnel);
+            slider.PointerCaptureLost += (_, _) => Vm?.Player.CommitVolume();
+        }
+
+        // The "…" menu has light dismiss disabled (it would unmap without the close
+        // animation); any press inside the window closes it with the animation instead,
+        // and the press is swallowed — the first click only dismisses the menu.
+        AddHandler(PointerPressedEvent, (_, e) =>
+        {
+            if (!MorePopup.IsOpen) return;
+            // A popup's input routes through its parent window too, so this handler
+            // also sees presses *inside* the menu. Swallowing those killed every menu
+            // item (the button never got the press, so no Click ever fired) — leave
+            // them alone and let the item's own Click handler close the menu.
+            if (e.Source is Visual source &&
+                (source == MenuCard || MenuCard.IsVisualAncestorOf(source)))
+                return;
+
+            CloseMorePopup($"tunnel source={e.Source?.GetType().Name}");
+            e.Handled = true;
+        }, RoutingStrategies.Tunnel);
+
+        // Clicking another app entirely never reaches the handler above.
+        Deactivated += (_, _) =>
+        {
+            if (MorePopup.IsOpen) LogMenu("Window.Deactivated", MenuState());
+            CloseMorePopup("deactivated");
+        };
+        Activated += (_, _) =>
+        {
+            if (MorePopup.IsOpen) LogMenu("Window.Activated", MenuState());
+        };
+        // GitHub #79 ("…" often shows nothing, Windows 11, not reproducible here): the
+        // popup's own lifecycle, next to the open/close requests logged below.
+        MorePopup.Opened += (_, _) => LogMenu("Popup.Opened", MenuState());
+        MorePopup.Closed += (_, _) => LogMenu("Popup.Closed", MenuState());
+
+        // Space toggles play/pause app-wide; a focused Button would otherwise eat the
+        // KeyDown and click on KeyUp, so both are tunneled (and the search box excluded).
+        AddHandler(KeyDownEvent, OnPreviewKeyDown, RoutingStrategies.Tunnel);
+        AddHandler(KeyUpEvent, OnPreviewKeyUp, RoutingStrategies.Tunnel);
+
+        // Time readouts show only while the pointer is over the card (style class
+        // "pointer-in", see Window.Styles). The WINDOW's enter/leave, not any child's,
+        // so moving between controls inside the card never blinks them.
+        PointerEntered += (_, _) => Classes.Set("pointer-in", true);
+        PointerExited += (_, _) => Classes.Set("pointer-in", false);
+
+        // RootBorder's ClipToBounds is off (so the close badge can overhang the corner),
+        // which makes these explicit geometries the only thing holding the artwork /
+        // acrylic layers to the rounded outline. Kept in sync with the resizable window.
+        RootPanel.SizeChanged += (_, e) =>
+        {
+            // Radius = RootBorder.CornerRadius - BorderThickness, so the clip follows the
+            // inside of the stroke. On the opaque fallback the card is squared off, so
+            // the clip has to square off with it or the glass layers would pull away
+            // from the corners the border now paints straight through.
+            var radius = _squareCard ? 0 : 26.5;
+            RootPanel.Clip = new RectangleGeometry(
+                new Rect(0, 0, e.NewSize.Width, e.NewSize.Height), radius, radius);
+            // No MaxHeight any more: the drawer no longer competes with the player for the
+            // card's height, it adds its own (AnimateDrawer).
+        };
+        // LargeArtClip / LyricsArtClip need no clip of their own any more: both forms'
+        // artwork is now full bleed, so RootPanel's rounded clip above is what rounds it.
+
+        _flow = new FlowingArtworkAnimator(this, MiniFlowBackdrop, MiniFlowLayer1, MiniFlowLayer2, MiniBeatGlow, GetBeatContext);
+
+        _classicRootFill = RootBorder.Background;
+        _pillSpinner = new CoverSpinner(this, PillCoverSpin);
+        // The design ground follows the card's laid-out rect; the drawer palette follows
+        // the theme's foreground brushes (they are copied, not aliased).
+        LayoutUpdated += (_, _) => SyncDesignGround();
+        // Inside a layout pass (SizeChanged) the slab's new rect is absorbed by the same
+        // pass; LayoutUpdated above is the catch-all a frame later.
+        FormGrid.SizeChanged += (_, _) => SyncDesignGround();
+        PillFormRoot.SizeChanged += (_, _) => SyncDesignGround();
+        PillTransport.SizeChanged += (_, e) => SyncPillToggles(e.NewSize.Width);
+        SleeveFormRoot.SizeChanged += (_, _) => SyncDesignGround();
+        ActualThemeVariantChanged += (_, _) => SyncDrawerPalette();
+        LargeFrostBand.OpacityMask = _largeFrostMask;
+        LargeFrostScrim.Background = _largeFrostScrim;
+        LyricsFrostBand.OpacityMask = _lyricsFrostMask;
+        LyricsFrostScrim.Background = _lyricsFrostScrim;
+        LargeIconFormRoot.SizeChanged += (_, _) => UpdateFrostBands();
+        LargeControls.SizeChanged += (_, _) => UpdateFrostBands();
+        LyricsArtColumn.SizeChanged += (_, _) => UpdateFrostBands();
+        LyricsArtControls.SizeChanged += (_, _) => UpdateFrostBands();
+
+        // WrapPanel word lines must wrap at the visible width — the scroller's padding
+        // is not subtracted from the measure width (see the lyrics panel's MaxWidth).
+        LyricsScroll.SizeChanged += (_, e) =>
+        {
+            LyricsItems.MaxWidth = Math.Max(120, e.NewSize.Width - 16);
+            // Lyric size follows the viewport, the same way the page derives its 46px
+            // from a ~1000px window: 21px suits the canonical 640x412 lyrics form and
+            // larger windows get proportionally larger text. The clamp keeps lines
+            // wrapping instead of overflowing at either extreme, and MaxWidth above
+            // already tracks the viewport, so bigger text just wraps sooner.
+            // Debounced, NOT applied per tick: the open/close ease resizes the window
+            // every ~16ms, and a FontSize write re-measures every lyric line (word
+            // cells, marquees, wrap panels) — doing that mid-ease stuttered the whole
+            // transition. MaxWidth stays per-tick (wrap must track the live width);
+            // the font settles once, right after the size stops moving.
+            var fontScale = Math.Clamp(
+                Math.Min(e.NewSize.Height / 390.0, e.NewSize.Width / 350.0), 0.85, 1.6);
+            _pendingLyricsFontSize = Math.Round(21 * fontScale);
+            if (_lyricsFontTimer == null)
+            {
+                _lyricsFontTimer = new Avalonia.Threading.DispatcherTimer
+                {
+                    Interval = TimeSpan.FromMilliseconds(120)
+                };
+                _lyricsFontTimer.Tick += (_, _) =>
+                {
+                    _lyricsFontTimer!.Stop();
+                    if (Math.Abs(LyricsItems.FontSize - _pendingLyricsFontSize) >= 0.5)
+                        LyricsItems.FontSize = _pendingLyricsFontSize;
+                    // Re-anchor AFTER the settled layout. The entry jump in
+                    // OnEnteredLyricsForm runs while the open ease is still resizing
+                    // the window, and the font write above re-measures every line —
+                    // either one moves the extent out from under the saved offset,
+                    // which left the current lyric parked off-screen after a
+                    // close/reopen. Loaded priority so the re-wrap has happened.
+                    if (Vm?.IsLyricsForm == true)
+                        Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                        {
+                            if (Vm?.IsLyricsForm == true)
+                                CenterActiveLyric(animated: false);
+                        }, Avalonia.Threading.DispatcherPriority.Loaded);
+                };
+            }
+            _lyricsFontTimer.Stop();
+            _lyricsFontTimer.Start();
+            // Run-out padding scaled to the viewport (the window is freely resizable):
+            // enough headroom above the first line for it to reach the anchor, and
+            // enough tail below the last line to scroll up past it. Without the top
+            // half of this, the offset clamp at 0 stalled the first half-viewport of
+            // lines against the top edge, where the presenter's clip cut them off.
+            var v = e.NewSize.Height;
+            LyricsStack.Margin = new Thickness(
+                0, Math.Round(v * LyricsAnchorRatio), 8, Math.Round(v * (1 - LyricsAnchorRatio)) + 24);
+        };
+
+        // The form follows the window size; ClientSize covers both live resize drags
+        // and programmatic jumps (menu → Lyrics).
+        Resized += (_, _) =>
+        {
+            // While a drawer animation drives Window.Height, the sheet takes exactly the
+            // height the window has ACTUALLY gained — platform resizes land a frame after
+            // the property is set, and sizing the sheet ahead of the real resize squeezed
+            // the player area above it on every tick, which read as the card shaking.
+            if (_drawerAnim is { } anim && anim.Generation == _resizeAnimationGeneration)
+            {
+                _drawerHeight = Math.Clamp(ClientSize.Height - anim.FormHeight, 0, anim.MaxDrawer);
+                DrawerSheet.Height = _drawerHeight;
+            }
+
+            // The drawer's share of the height is NOT part of the form decision — a Bar at
+            // 172 plus a 200px queue is 372 and would otherwise silently become a Card.
+            Vm?.UpdateFromSize(ClientSize.Width, ClientSize.Height - _drawerHeight);
+            // An eased jump raises Resized on every frame; persisting each one is pure
+            // churn, so the animation captures once when it lands instead.
+            if (!_suppressPlacementCapture)
+                CapturePlacement();
+        };
+
+        // Drag-move and resize both need persisting, and neither is covered by close:
+        // the main window shutting down closes this window *after* it has already saved.
+        PositionChanged += (_, _) => CapturePlacement();
+
+        DataContextChanged += (_, _) => HookViewModel();
+
+        // What the OS actually granted, for "Copy Logs": on macOS a hint that falls back to
+        // None paints the window opaque (square card on a dark rectangle).
+        Opened += (_, _) => LogTransparency("opened");
+        PropertyChanged += (_, e) =>
+        {
+            if (e.Property == ActualTransparencyLevelProperty) LogTransparency("changed");
+        };
+
+        // The root border starts faded/scaled-down in XAML; flipping the values once
+        // the window is shown lets its transitions play the open animation.
+        Opened += (_, _) =>
+        {
+            RootBorder.Opacity = 1;
+            RootBorder.RenderTransform = Avalonia.Media.Transformation.TransformOperations.Parse("scale(1)");
+
+            // A fixed design opens at its own size — the stored placement belonged to
+            // whatever classic form was last used.
+            if (Vm is { IsStyleLocked: true } styled)
+            {
+                var (w, h) = MiniPlayerViewModel.CanonicalSize(styled.Form);
+                Width = w;
+                Height = h;
+                // The placement check before Show() measured the classic size; keep the
+                // design's own size on screen too (GitHub #75). No animation at open.
+                if (Screens.ScreenFromWindow(this) is { } screen)
+                    Position = MiniPlayerPlacement.Clamp(Position,
+                        MiniPlayerPlacement.ToPixels(w, h, screen.Scaling), screen.WorkingArea);
+            }
+            Vm?.UpdateFromSize(ClientSize.Width, ClientSize.Height);
+            // The roots all start hidden (the .form-root style), and UpdateFromSize only
+            // raises Form when it CHANGES — so the opening form has to be shown explicitly
+            // or the card comes up empty.
+            SyncFormVisual();
+            UpdateLyricsSurfaceRegistration();
+            UpdateFlowAnimationState();
+            if (Vm?.IsLyricsForm == true)
+                OnEnteredLyricsForm();
+
+            // Only trust Position/ClientSize once the platform window exists; before that
+            // they are the pre-realize values and would overwrite a good stored placement.
+            _placementTrackable = true;
+        };
+    }
+
+    // ── Placement persistence ────────────────────────────────
+
+    /// <summary>
+    /// False until <see cref="Window.Opened"/>, so the restore that MainWindow applies
+    /// before Show() isn't immediately overwritten by a pre-realize resize event.
+    /// </summary>
+    private bool _placementTrackable;
+
+    /// <summary>
+    /// Hands the current geometry to the settings view model, which debounces the write.
+    /// Size is in DIPs and position in screen pixels — the same units MainWindow restores
+    /// them in.
+    /// </summary>
+    private void CapturePlacement()
+    {
+        if (!_placementTrackable) return;
+        // Persist the COLLAPSED geometry: back out the drawer's height and any upward shift
+        // it needed to stay on screen, so reopening restores the player, not the expansion.
+        // Under a fixed design only the position is written: the stored size is the
+        // classic card's, and it is what Classic comes back to (this session or the next).
+        if (Vm is { IsStyleLocked: true } styled)
+        {
+            styled.Settings.SetMiniPlayerPosition(Position.X, Position.Y + _drawerShiftY);
+            return;
+        }
+        Vm?.Settings.SetMiniPlayerPlacement(
+            ClientSize.Width, ClientSize.Height - _drawerHeight,
+            Position.X, Position.Y + _drawerShiftY);
+    }
+
+    // ── ViewModel wiring ─────────────────────────────────────
+
+    private MiniPlayerViewModel? _hookedVm;
+
+    private void HookViewModel()
+    {
+        if (_hookedVm != null)
+        {
+            _hookedVm.PropertyChanged -= OnVmPropertyChanged;
+            _hookedVm.Lyrics.PropertyChanged -= OnLyricsPropertyChanged;
+            _hookedVm.Lyrics.LyricsSwapped -= OnLyricsSwapped;
+            _hookedVm.Player.PropertyChanged -= OnPlayerPropertyChanged;
+            _hookedVm.FormResizeRequested -= OnFormResizeRequested;
+            _hookedVm.Settings.PropertyChanged -= OnSettingsPropertyChanged;
+        }
+
+        _hookedVm = Vm;
+        if (_hookedVm == null) return;
+
+        _lastVmForm = _hookedVm.Form;
+        _hookedVm.PropertyChanged += OnVmPropertyChanged;
+        _hookedVm.Lyrics.PropertyChanged += OnLyricsPropertyChanged;
+        _hookedVm.Lyrics.LyricsSwapped += OnLyricsSwapped;
+        _hookedVm.Player.PropertyChanged += OnPlayerPropertyChanged;
+        _hookedVm.FormResizeRequested += OnFormResizeRequested;
+        _hookedVm.Settings.PropertyChanged += OnSettingsPropertyChanged;
+        UpdateDesignSegment();
+        ApplyTransparencyHint();
+        ApplyPin();
+        Classes.Set("plain-track-links", !_hookedVm.Settings.AccentTrackLinks);
+
+        // A DataContext arriving after Opened would otherwise leave every form hidden.
+        SyncFormVisual();
+        UpdateFlowAnimationState();
+    }
+
+    // ── Pin (Windows) ──
+    // Pinned: no minimize box, so Show desktop / Minimize all pass the window over (it keeps
+    // its taskbar button), plus a foreground hook that puts it back on top of a game that
+    // raised itself. Unpinned is exactly the old window. Evidence in MiniPlayerPin.
+
+    private TopmostKeeper? _topmostKeeper;
+
+    private void ApplyPin()
+    {
+        var pinned = Vm is { IsPinned: true } && MiniPlayerPin.IsSupported;
+        CanMinimize = MiniPlayerPin.CanMinimize(pinned);
+        if (pinned)
+        {
+            _topmostKeeper ??= new TopmostKeeper(
+                () => TryGetPlatformHandle() is { HandleDescriptor: "HWND" } h ? h.Handle : IntPtr.Zero,
+                () => IsVisible && !_closeAnimationDone);
+        }
+        else
+        {
+            _topmostKeeper?.Dispose();
+            _topmostKeeper = null;
+        }
+    }
+
+    private void OnVmPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        switch (e.PropertyName)
+        {
+            case nameof(MiniPlayerViewModel.Drawer):
+                OnDrawerChanged();
+                break;
+            case nameof(MiniPlayerViewModel.IsPinned):
+                ApplyPin();
+                break;
+            case nameof(MiniPlayerViewModel.Form):
+                // Leaving the split view ends the lyrics session the pre-lyrics capture
+                // belonged to. The menu close consumes the capture BEFORE the form flips
+                // (OnFormResizeRequested), so anything still here when Lyrics goes away
+                // is a leftover from a resize-out — and "restoring" it on a later menu
+                // close re-inflated the window to an obsolete size (the card came back
+                // huge after hiding lyrics).
+                if (_lastVmForm == MiniPlayerForm.Lyrics && Vm?.Form != MiniPlayerForm.Lyrics)
+                    _preLyricsSize = null;
+                _lastVmForm = Vm?.Form;
+
+                SyncFormVisual();
+                ApplyTransparencyHint();
+                UpdateLyricsSurfaceRegistration();
+                UpdateFlowAnimationState();
+                if (Vm?.IsLyricsForm == true)
+                    OnEnteredLyricsForm();
+                break;
+        }
+    }
+
+    private void OnLyricsPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        switch (e.PropertyName)
+        {
+            case nameof(LyricsViewModel.ScrollLineIndex) when Vm?.IsLyricsForm == true:
+                CenterActiveLyric(animated: true);
+                break;
+            case nameof(LyricsViewModel.IsColorModeArtwork):
+                UpdateFlowAnimationState();
+                break;
+        }
+    }
+
+    /// <summary>New lines (a track change, lyrics fetched online): the ScrollLineIndex change
+    /// reached this window before they were laid out, so their containers had no place yet and
+    /// the list stayed where it was (GitHub #155). Jump once the layout pass has run.</summary>
+    private void OnLyricsSwapped(object? sender, EventArgs e)
+    {
+        if (Vm?.IsLyricsForm != true) return;
+        Avalonia.Threading.Dispatcher.UIThread.Post(
+            () => CenterActiveLyric(animated: false),
+            Avalonia.Threading.DispatcherPriority.Loaded);
+    }
+
+    private void OnPlayerPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(PlayerViewModel.State))
+            UpdatePillSpin();
+        // The layers' visibility is bound in XAML; this only parks/resumes the loop.
+        if (e.PropertyName is nameof(PlayerViewModel.LyricsFlowingLightEnabled)
+                or nameof(PlayerViewModel.LyricsFlowingStyle)
+                or nameof(PlayerViewModel.LyricsDriftMovement))
+            UpdateFlowAnimationState();
+    }
+
+    // ── Flowing-artwork background ──
+    // Mini copy of the lyrics page's flow: the blurred cover drifts and breathes on
+    // the beat behind the lyrics COLUMN only. See FlowingArtworkAnimator.
+
+    private void UpdateFlowAnimationState()
+    {
+        if (_flow == null) return;
+        _flow.BeatReactive = Undertone.Models.FlowingStyles.IsBeatReactive(
+            Undertone.Models.FlowingStyles.Normalize(Vm?.Player.LyricsFlowingStyle));
+        _flow.Speed = (Vm?.Player.LyricsDriftMovement ?? Undertone.Models.AppSettings.LyricsDriftKnobDefault) / 100.0;
+        _flow.Enabled = Vm is { IsLyricsForm: true } vm && vm.Lyrics.IsColorModeArtwork &&
+                        vm.Player.LyricsFlowingLightEnabled;
+    }
+
+    /// <summary>Re-anchors both frost bands to their controls' current pixel height.</summary>
+    private void UpdateFrostBands()
+    {
+        MiniFrostBand.Apply(_largeFrostMask, _largeFrostScrim,
+            MiniFrostBand.Compute(LargeIconFormRoot.Bounds.Height,
+                LargeControls.Bounds.Height + LargeControls.Margin.Bottom));
+        MiniFrostBand.Apply(_lyricsFrostMask, _lyricsFrostScrim,
+            MiniFrostBand.Compute(LyricsArtColumn.Bounds.Height,
+                LyricsArtControls.Bounds.Height + LyricsArtControls.Margin.Bottom));
+    }
+
+    private BeatContext GetBeatContext()
+    {
+        if (Vm is not { Player: { } player }) return default;
+        return new BeatContext(player.CurrentTrack?.Bpm ?? 0, player.Position.TotalMilliseconds, player.IsPlaying);
+    }
+
+    /// <summary>Exact window size (and the form it belonged to) captured when the menu
+    /// jumped into the Lyrics form, so closing lyrics restores the size the user actually
+    /// had — the canonical size read as "the mini player forgot my size". Lives only as
+    /// long as that lyrics session: resizing out of the split view clears it (see the
+    /// Form case in OnVmPropertyChanged).</summary>
+    private (MiniPlayerForm Form, double Width, double Height)? _preLyricsSize;
+
+    /// <summary>Previous VM form, kept to detect the Lyrics→other edge above.</summary>
+    private MiniPlayerForm? _lastVmForm;
+
+    /// <summary>Exact size (and form) of the classic card when a fixed design was picked,
+    /// handed back when the user returns to Classic — the counterpart of _preLyricsSize.</summary>
+    private (MiniPlayerForm Form, double Width, double Height)? _preDesignSize;
+
+    private void OnFormResizeRequested(MiniPlayerForm form)
+    {
+        // The collapsed height: a drawer that is open adds its own rows to Height.
+        var collapsedHeight = Height - _drawerHeight;
+
+        // A drawer mid-slide shares Window.Height with the form glide (both eased the
+        // same property with competing generations): the loser's timer died leaving
+        // _drawerHeight stale, and the sheet kept a 64px slice of the new form — the
+        // "pill shrinks" bug. Snap the drawer shut before any form jump.
+        SnapDrawerClosed();
+
+        if (form is MiniPlayerForm.Pill or MiniPlayerForm.Sleeve)
+        {
+            // Leaving a classic form for a design: remember where the card was. The VM
+            // raises this BEFORE flipping Form, so Form still names the classic form.
+            if (Vm is { IsDesignForm: false, IsLyricsForm: false } classicVm &&
+                double.IsFinite(Width) && double.IsFinite(collapsedHeight))
+                _preDesignSize = (classicVm.Form, Width, collapsedHeight);
+        }
+        else if (form != MiniPlayerForm.Lyrics && Vm is { IsDesignForm: true } or { IsStyleLocked: true })
+        {
+            // Back to Classic: the size the user left the card at — this session's
+            // capture, else the persisted classic size (a design never overwrites it,
+            // see CapturePlacement), else the form's canonical size.
+            if (_preDesignSize is { } savedClassic)
+            {
+                _preDesignSize = null;
+                AnimateSizeTo(savedClassic.Width, savedClassic.Height);
+                return;
+            }
+            if (Vm?.Settings.StoredMiniPlayerSize is { } stored)
+            {
+                AnimateSizeTo(Math.Clamp(stored.Width, MinWidth, MaxWidth), Math.Clamp(stored.Height, MinHeight, MaxHeight));
+                return;
+            }
+        }
+
+        if (form == MiniPlayerForm.Lyrics)
+        {
+            if (Vm is { Form: not MiniPlayerForm.Lyrics } vm &&
+                double.IsFinite(Width) && double.IsFinite(collapsedHeight))
+                _preLyricsSize = (vm.Form, Width, collapsedHeight);
+        }
+        else if (_preLyricsSize is { } saved && saved.Form == form)
+        {
+            // Only when the VM is returning to the form the size was captured in —
+            // the Icon→Card fallback still gets Card's canonical size below.
+            _preLyricsSize = null;
+            AnimateSizeTo(saved.Width, saved.Height);
+            return;
+        }
+
+        var (w, h) = MiniPlayerViewModel.CanonicalSize(form);
+        AnimateSizeTo(w, h);
+    }
+
+    /// <summary>
+    /// Eases the window to a size instead of snapping to it, so a menu jump reads as the
+    /// card growing into the new form. The form cross-fade rides along for free: every
+    /// step raises Resized, so the threshold gets crossed partway through the glide.
+    /// </summary>
+    private void AnimateSizeTo(double targetWidth, double targetHeight)
+    {
+        var generation = ++_resizeAnimationGeneration;
+
+        var fromWidth = Width;
+        var fromHeight = Height;
+        // Where the top-left has to go so the new size stays on screen (GitHub #75);
+        // null when the screen is unknown, which keeps the old fixed top-left.
+        var fromPosition = Position;
+        var toPosition = AnchoredPosition(
+            double.IsFinite(fromWidth) ? fromWidth : targetWidth,
+            double.IsFinite(fromHeight) ? fromHeight : targetHeight,
+            targetWidth, targetHeight);
+        if (toPosition == fromPosition) toPosition = null;
+        if (!double.IsFinite(fromWidth) || !double.IsFinite(fromHeight))
+        {
+            Width = targetWidth;
+            Height = targetHeight;
+            if (toPosition is { } snapTo) Position = snapTo;
+            return;
+        }
+
+        const double durationMs = 280;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        _suppressPlacementCapture = true;
+        _sizeAnimating = true;
+
+        // Stepped by the compositor frame clock (TopLevel.RequestAnimationFrame), not a
+        // DispatcherTimer: on Windows a 16 ms DispatcherTimer fires on the 15.6 ms USER-timer
+        // grid — measured 41–48 ticks/s with alternating 16/31 ms steps — so the glide ran at
+        // ~40 fps with uneven jumps while the frame clock delivered one tick per refresh.
+        // Whole-DIP steps stay: fractional sizes shimmer the border/clip on every frame.
+        _sizeAnimationOwner = generation;
+        void Frame(TimeSpan _)
+        {
+            // A newer jump owns the flag now, and a closing window must not be resized.
+            if (generation != _resizeAnimationGeneration || _closeAnimationDone)
+            {
+                // Superseded (a drawer or a newer jump took the height): whatever was
+                // waiting on this glide shows now rather than never.
+                if (generation == _sizeAnimationOwner) { _sizeAnimating = false; RevealDeferredForm(); }
+                return;
+            }
+
+            var t = Math.Clamp(clock.Elapsed.TotalMilliseconds / durationMs, 0, 1);
+            var eased = 1 - Math.Pow(1 - t, 3);   // CubicEaseOut, matching the card's own curve
+            Width = Math.Round(fromWidth + (targetWidth - fromWidth) * eased);
+            Height = Math.Round(fromHeight + (targetHeight - fromHeight) * eased);
+            // Same eased value as the size, in the same frame, so an anchored edge holds still.
+            // Only when the pixel changed: Position's setter moves the native window unconditionally.
+            if (toPosition is { } to)
+            {
+                var p = new PixelPoint(
+                    (int)Math.Round(fromPosition.X + (to.X - fromPosition.X) * eased),
+                    (int)Math.Round(fromPosition.Y + (to.Y - fromPosition.Y) * eased));
+                if (p != Position) Position = p;
+            }
+
+            if (t < 1) { RequestGeometryFrame(Frame); return; }
+
+            Width = targetWidth;
+            Height = targetHeight;
+            if (toPosition is { } landed) Position = landed;
+            _suppressPlacementCapture = false;
+            _sizeAnimating = false;
+            CapturePlacement();
+            RevealDeferredForm();
+        }
+        RequestGeometryFrame(Frame);
+    }
+
+    /// <summary>
+    /// Schedules one step of a window-geometry glide (size / drawer) on the frame clock.
+    /// macOS: a RequestAnimationFrame callback runs INSIDE AppKit's display pass
+    /// (-[AvnView updateLayer]). Resizing the NSWindow there marks it as needing another
+    /// display pass in the same cycle, that pass runs the next frame callback, which resizes
+    /// again, and so on until AppKit throws NSGenericException ("more Display Window passes
+    /// than there are views in the window") and the app aborts. Posting the step to the
+    /// dispatcher keeps the frame-clock pacing but moves the resize out of the display pass.
+    /// Windows / Linux keep the direct callback (the 1.6.0 smoothness fix).
+    /// </summary>
+    private void RequestGeometryFrame(Action<TimeSpan> step)
+    {
+        if (!OperatingSystem.IsMacOS())
+        {
+            RequestAnimationFrame(step);
+            return;
+        }
+        RequestAnimationFrame(ts => Avalonia.Threading.Dispatcher.UIThread.Post(
+            () => step(ts), Avalonia.Threading.DispatcherPriority.Normal));
+    }
+
+    /// <summary>Generation of the AnimateSizeTo that owns <see cref="_sizeAnimating"/>.</summary>
+    private int _sizeAnimationOwner;
+
+    /// <summary>Top-left that keeps a window of <paramref name="fromWidth"/> ×
+    /// <paramref name="fromHeight"/> DIPs, resized to the target, anchored to its nearest
+    /// screen edge and inside the work area (<see cref="MiniPlayerPlacement.Anchored"/>).
+    /// Null when the window's screen is unknown.</summary>
+    private PixelPoint? AnchoredPosition(double fromWidth, double fromHeight, double targetWidth, double targetHeight)
+    {
+        if (Screens.ScreenFromWindow(this) is not { } screen) return null;
+        var scaling = screen.Scaling <= 0 ? 1 : screen.Scaling;
+        var current = new PixelRect(Position, MiniPlayerPlacement.ToPixels(fromWidth, fromHeight, scaling));
+        return MiniPlayerPlacement.Anchored(current, targetWidth, targetHeight, scaling, screen.WorkingArea);
+    }
+
+    /// <summary>
+    /// Cross-fades the form layouts. Both are alive for the length of the fade, which is
+    /// why the roots' IsVisible is driven here rather than bound to IsXForm — a binding
+    /// would collapse the outgoing tree in the same frame and leave nothing to fade.
+    /// </summary>
+    private void SyncFormVisual()
+    {
+        if (Vm is not { } vm) return;
+
+        var next = vm.Form;
+        if (_visibleForm == next) return;
+
+        var previous = _visibleForm;
+        _visibleForm = next;
+
+        if (previous is { } prev)
+        {
+            var outgoing = FormRoot(prev);
+            outgoing.Opacity = 0;
+            outgoing.RenderTransform = FormPoseExit;
+            Avalonia.Threading.DispatcherTimer.RunOnce(() =>
+            {
+                // Guarded by identity, not a generation counter: if the drag wandered back
+                // over the threshold this form is on screen again, and a generation guard
+                // would have left the *other* one stranded visible at opacity 0.
+                if (_visibleForm == prev) return;
+                outgoing.IsVisible = false;
+                outgoing.RenderTransform = FormPoseEnter;
+            }, FormFadeDuration);
+        }
+
+        // A jump into or out of a fixed design glides the window between two very
+        // different sizes. Cross-fading through the glide painted the incoming design at
+        // full opacity inside a still-tiny window (the Sleeve's disc over its own
+        // transport, the slab snapping to each frame's size). So: the outgoing form fades
+        // during the glide, and the incoming one is revealed only when the glide lands,
+        // at its final size — one clean swap. Classic-to-classic (drag resizes, Lyrics)
+        // keeps its cross-fade.
+        if (_sizeAnimating && (IsDesign(next) || (previous is { } p && IsDesign(p))))
+        {
+            _deferredForm = next;
+            return;
+        }
+        _deferredForm = null;
+        ShowIncomingForm(next);
+    }
+
+    private static bool IsDesign(MiniPlayerForm form) => form is MiniPlayerForm.Pill or MiniPlayerForm.Sleeve;
+
+    /// <summary>Form waiting for the size glide to land before it fades in.</summary>
+    private MiniPlayerForm? _deferredForm;
+
+    /// <summary>True while AnimateSizeTo is easing the window.</summary>
+    private bool _sizeAnimating;
+
+    private void RevealDeferredForm()
+    {
+        if (_deferredForm is not { } form) return;
+        _deferredForm = null;
+        if (_visibleForm != form) return;
+        ShowIncomingForm(form);
+    }
+
+    private void ShowIncomingForm(MiniPlayerForm next)
+    {
+        var incoming = FormRoot(next);
+        incoming.IsVisible = true;
+        SyncChrome(next);
+        UpdatePillSpin();
+        // One frame parked at the enter pose, so the transition has a start value to
+        // animate from rather than jumping straight to rest.
+        Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+        {
+            if (_visibleForm != next) return;
+            incoming.Opacity = 1;
+            incoming.RenderTransform = FormPoseRest;
+        }, Avalonia.Threading.DispatcherPriority.Render);
+    }
+
+    private Control FormRoot(MiniPlayerForm form) => form switch
+    {
+        MiniPlayerForm.Icon => IconFormRoot,
+        MiniPlayerForm.Bar => BarFormRoot,
+        MiniPlayerForm.Card => CardFormRoot,
+        MiniPlayerForm.LargeIcon => LargeIconFormRoot,
+        MiniPlayerForm.Pill => PillFormRoot,
+        MiniPlayerForm.Sleeve => SleeveFormRoot,
+        _ => LyricsFormRoot,
+    };
+
+    /// <summary>
+    /// The fixed designs paint their own light cards (the pill is not even rectangular),
+    /// so the window's dark glass — base fill, outline, sheen, specular — steps aside for
+    /// them and comes back for every classic form.
+    /// </summary>
+    private void SyncChrome(MiniPlayerForm form)
+    {
+        var design = form is MiniPlayerForm.Pill or MiniPlayerForm.Sleeve;
+        RootBorder.BorderThickness = design ? new Thickness(0) : new Thickness(1.5);
+        RootBorder.Background = design ? Brushes.Transparent : _classicRootFill;
+        GlassSheen.IsVisible = !design;
+        GlassSpecular.IsVisible = !design;
+
+        // Under a design the card and the drawer share ONE painted shape, DesignGround
+        // (theme colour at the opacity setting). The sheet itself is always transparent:
+        // on the classic forms it sits on the root glass, under a design on the ground.
+        // Its specular top hairline is a classic-only detail — on the ground it read as
+        // a seam between "two pieces".
+        DrawerSheet.BorderThickness = design ? new Thickness(0) : new Thickness(0, 1, 0, 0);
+        UpdateDesignGroundShadow();
+        SyncDrawerPalette();
+        if (design)
+            SyncDesignGround(force: true);
+        else
+        {
+            DrawerSheet.Margin = new Thickness(0);
+            DrawerSheet.Padding = ClassicSheetPadding;
+        }
+    }
+
+    private static readonly Thickness ClassicSheetPadding = new(12, 10, 12, 12);
+
+    /// <summary>
+    /// Keeps <c>DesignGround</c> on the design card's outline. Measured from the card's
+    /// laid-out rect inside the form grid while the drawer is CLOSED (the grid is then
+    /// exactly the card row, so the insets are the card's own); while a drawer is open or
+    /// sliding the insets are left alone and the ground simply spans the taller grid —
+    /// the card row never changes size during the slide (AnimateDrawer), so the card is
+    /// still where it was measured. The sheet takes the ground's side insets and keeps its
+    /// rows above the ground's bottom inset, so the drawer content stays inside the slab's
+    /// rounded bottom.
+    /// </summary>
+    private void SyncDesignGround(bool force = false)
+    {
+        if (Vm is not { IsDesignForm: true } vm) return;
+        var grid = FormGrid;
+        if (grid.Bounds.Width <= 0) return;
+        var sleeve = vm.Form == MiniPlayerForm.Sleeve;
+        var card = sleeve ? SleeveCard : PillCard;
+        var formRoot = sleeve ? SleeveFormRoot : PillFormRoot;
+        if (card.Bounds.Width <= 0 || LayoutRectIn(card, grid) is not { } rect ||
+            LayoutRectIn(formRoot, grid) is not { } rootRect) return;
+        if (!force && (_drawerHeight > 0 || _drawerAnim != null || vm.IsDrawerOpen))
+        {
+            // Insets are frozen while a drawer is open; only the slab's height follows.
+            ApplyDesignGroundRect();
+            return;
+        }
+
+        // Only the closed grid is the card row; with a sheet in row 1 the bottom inset
+        // would be measured through the sheet.
+        var gridHeight = grid.Bounds.Height - _drawerHeight;
+        var margin = new Thickness(
+            Math.Round(rect.Left), Math.Round(rect.Top),
+            Math.Round(grid.Bounds.Width - rect.Right), Math.Round(gridHeight - rect.Bottom));
+        if (margin.Left < 0 || margin.Top < 0 || margin.Right < 0 || margin.Bottom < 0) return;
+        var rootOffset = rootRect.Position;
+        if (!force && NearlyEqual(margin, _designGroundInsets) && rootOffset == _designGroundRootOffset)
+        {
+            ApplyDesignGroundRect();
+            return;
+        }
+
+        _designGroundInsets = margin;
+        _designGroundRootOffset = rootOffset;
+        ApplyDesignGroundRect();
+        DrawerSheet.Margin = new Thickness(margin.Left, 0, margin.Right, 0);
+        DrawerSheet.Padding = new Thickness(
+            ClassicSheetPadding.Left, ClassicSheetPadding.Top,
+            ClassicSheetPadding.Right, ClassicSheetPadding.Bottom + margin.Bottom);
+    }
+
+    /// <summary>The child's LAYOUT rect in the ancestor's coordinates — Bounds offsets
+    /// only, no render transforms. The form roots ease in from scale(1.03), and a
+    /// TransformToVisual taken mid-ease inflated the ground by that pose (and no layout
+    /// pass follows a render-transform transition to correct it).</summary>
+    private static Rect? LayoutRectIn(Visual child, Visual ancestor)
+    {
+        var offset = new Point();
+        for (Visual? v = child; v != ancestor; v = v.GetVisualParent())
+        {
+            if (v == null) return null;
+            offset += v.Bounds.Position;
+        }
+        return new Rect(offset, child.Bounds.Size);
+    }
+
+    /// <summary>The ground's insets from the form grid's edges (left, top, right, and the
+    /// bottom inset that stays constant while a drawer stretches the grid).</summary>
+    private Thickness _designGroundInsets = new(66, 6, 10, 6);
+
+    /// <summary>Where the active design's form root sits in the form grid (its margin),
+    /// so grid-relative insets can be laid out inside the root-hosted Canvas.</summary>
+    private Point _designGroundRootOffset = new(6, 6);
+
+    /// <summary>The active design's ground slab and its Canvas host.</summary>
+    private (Canvas Host, Border Ground)? ActiveGround() => Vm?.Form switch
+    {
+        MiniPlayerForm.Pill => (PillGroundHost, PillGround),
+        MiniPlayerForm.Sleeve => (SleeveGroundHost, SleeveGround),
+        _ => null,
+    };
+
+    /// <summary>Lays the slab out from the stored insets: the grid's full rect (drawer
+    /// row included) minus the insets, expressed in the form root's coordinates — so it
+    /// runs past the root's bottom edge while a drawer is open.</summary>
+    private void ApplyDesignGroundRect()
+    {
+        if (ActiveGround() is not { } g) return;
+        var grid = FormGrid.Bounds.Size;
+        if (grid.Width <= 0 || grid.Height <= 0) return;
+        var i = _designGroundInsets;
+        var trim = Vm?.Form == MiniPlayerForm.Pill ? PillGroundTrim : 0;
+        Canvas.SetLeft(g.Ground, i.Left - _designGroundRootOffset.X);
+        Canvas.SetTop(g.Ground, i.Top - _designGroundRootOffset.Y + trim);
+        g.Ground.Width = Math.Max(0, grid.Width - i.Left - i.Right);
+        g.Ground.Height = Math.Max(0, grid.Height - i.Top - i.Bottom - 2 * trim);
+    }
+
+    /// <summary>The Pill's slab is the cover's height on paper, but the slab (a Canvas child)
+    /// and the cover snap to device pixels separately: at 125% the slab's top landed a pixel
+    /// above the cover's and its square left corner showed as a step. A DIP in from the top
+    /// and bottom keeps the slab's edge inside the cover's outline at any scale.</summary>
+    internal const double PillGroundTrim = 1;
+
+    private static bool NearlyEqual(Thickness a, Thickness b) =>
+        Math.Abs(a.Left - b.Left) < 0.5 && Math.Abs(a.Top - b.Top) < 0.5 &&
+        Math.Abs(a.Right - b.Right) < 0.5 && Math.Abs(a.Bottom - b.Bottom) < 0.5;
+
+    /// <summary>The ground's drop shadow per design (Pill 0 6 22, Sleeve 0 8 26, #33).
+    /// None while frosted: the window region ends FrostRegionBleed past the slab, so the
+    /// shadow's darkest band would be cut there into a hard, stair-stepped line.</summary>
+    private void UpdateDesignGroundShadow()
+    {
+        if (ActiveGround() is not { } g) return;
+        if (_frosted)
+        {
+            g.Ground.BoxShadow = default;
+            return;
+        }
+        var sleeve = Vm?.Form == MiniPlayerForm.Sleeve;
+        g.Ground.BoxShadow = new BoxShadows(new BoxShadow
+        {
+            OffsetY = sleeve ? 8 : 6,
+            Blur = sleeve ? 26 : 22,
+            Color = Color.FromArgb(0x33, 0, 0, 0),
+        });
+    }
+
+    /// <summary>The Pill cover's XAML shadow, put back when the frost goes off.</summary>
+    private BoxShadows? _pillCoverShadow;
+
+    /// <summary>Drops the shadows that fall outside the frost region (design ground, Pill
+    /// cover) while frosted, and restores them after.</summary>
+    private void UpdateFrostShadows()
+    {
+        _pillCoverShadow ??= PillCover.BoxShadow;
+        PillCover.BoxShadow = _frosted ? default : _pillCoverShadow.Value;
+        UpdateDesignGroundShadow();
+    }
+
+    // Drawer ink under a design: the sheet sits on the theme-coloured ground, so the
+    // classic white palette (Window.Resources MiniDrawer*) is overridden on the sheet
+    // with the theme's foreground brushes. Copied per call (re-run on theme change).
+    private static readonly (string Key, string Theme)[] DesignDrawerPalette =
+    {
+        ("MiniDrawerText", "SystemControlForegroundBaseHighBrush"),
+        ("MiniDrawerTextHeader", "SystemControlForegroundBaseMediumHighBrush"),
+        ("MiniDrawerTextSoft", "SystemControlForegroundBaseMediumBrush"),
+        ("MiniDrawerTextFaint", "SystemControlForegroundBaseMediumLowBrush"),
+        ("MiniDrawerFieldFill", "SystemControlForegroundBaseLowBrush"),
+        ("MiniDrawerFieldStroke", "SystemControlForegroundBaseMediumLowBrush"),
+        ("MiniDrawerRowHover", "SystemControlForegroundBaseLowBrush"),
+        ("MiniDrawerDisc", "SystemControlForegroundBaseLowBrush"),
+        ("MiniDrawerDiscHover", "SystemControlForegroundBaseMediumLowBrush"),
+        ("MiniDrawerDiscPressed", "SystemControlForegroundBaseMediumBrush"),
+        ("MiniDrawerBadgeFill", "SystemControlForegroundBaseLowBrush"),
+        ("MiniDrawerBadgeText", "SystemControlForegroundBaseHighBrush"),
+        ("MiniDrawerTrack", "SystemControlForegroundBaseMediumLowBrush"),
+    };
+
+    private void SyncDrawerPalette()
+    {
+        var design = Vm is { IsDesignForm: true };
+        foreach (var (key, theme) in DesignDrawerPalette)
+        {
+            if (design && this.TryFindResource(theme, ActualThemeVariant, out var brush) && brush is IBrush b)
+                DrawerSheet.Resources[key] = b;
+            else
+                DrawerSheet.Resources.Remove(key);
+        }
+    }
+
+    // ── "…" menu ▸ Design segment ──
+    // A highlight pill slides under the selected design (translate transition on the
+    // thumb); the three labels are transparent buttons over it.
+
+    private void OnSettingsPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(SettingsViewModel.MiniPlayerStyle))
+            UpdateDesignSegment();
+        else if (e.PropertyName == nameof(SettingsViewModel.MiniPlayerFrostedBackground))
+            ApplyTransparencyHint();
+        else if (e.PropertyName == nameof(SettingsViewModel.AccentTrackLinks))
+            Classes.Set("plain-track-links", !(Vm?.Settings.AccentTrackLinks ?? true));
+    }
+
+    // ── Frosted background (GitHub #76) ──
+    // Opt-in OS blur-behind. The OS backdrop fills the whole window RECT, so on its own it
+    // showed as frosted square corners outside Classic's r=28 card and a frosted box around
+    // the Pill's round cover / the Sleeve's slab. While frosted the window is therefore
+    // clipped to the design's own outline with a Win32 window region (SetWindowRgn clips
+    // everything the window presents, the composition backdrop included). Region edges are
+    // not anti-aliased, so the region runs a little past the outline (FrostRegionBleed): the
+    // card's own anti-aliased edge is painted whole over the blur, and the stair-step lands
+    // between blurred and unblurred desktop, where it barely reads. Shadows outside the
+    // outline are dropped while frosted. Mica is left out on purpose: it tints from the
+    // wallpaper instead of blurring what is behind.
+    //
+    // Why not something anti-aliased: Avalonia's only rounded backdrop is the process-wide
+    // Win32PlatformOptions.WinUICompositionBackdropCornerRadius (one radius for every window,
+    // the main window's Liquid Glass included, and a rounded rect can't follow the Pill's
+    // cover), and DWM's Win11 corner preference is a fixed 4/8 px radius.
+
+    /// <summary>The transparency levels asked for, and what the frost toggle maps to.
+    /// One shared array per choice: the hint is set again whenever the view model is
+    /// (re)attached, and Avalonia compares arrays by reference. On macOS a second, equal
+    /// hint that arrives as a new array is re-applied, the native backend skips the level
+    /// it already has and falls back to Opaque, and the window paints its fallback brush
+    /// behind the card as a dark square (Avalonia.Native TopLevelImpl, 12.1.3).</summary>
+    internal static WindowTransparencyLevel[] TransparencyLevels(bool frosted) => frosted ? FrostedLevels : ClearLevels;
+
+    private static readonly WindowTransparencyLevel[] FrostedLevels =
+        { WindowTransparencyLevel.AcrylicBlur, WindowTransparencyLevel.Blur, WindowTransparencyLevel.Transparent };
+    private static readonly WindowTransparencyLevel[] ClearLevels = { WindowTransparencyLevel.Transparent };
+
+    private bool _frosted;
+
+    private void ApplyTransparencyHint()
+    {
+        // The opaque fallback (no compositor / UNDERTONE_MINI_OPAQUE) owns the hint.
+        if (_squareCard) return;
+        // Every design (GitHub #76, #150). The Pill and Sleeve were dropped from the frost on
+        // 10-05 (e2340d26) because the region below sat ON their outline and cut the
+        // anti-aliased edge into stair-steps (1v1ctus). The region now runs FrostRegionBleed
+        // past the outline (RegionPixels), so the painted edge stays whole and only the
+        // blurred desktop meets the region's edge; the shadows that would be cut there are
+        // dropped while frosted (UpdateFrostShadows).
+        var frosted = OperatingSystem.IsWindows() && Vm?.Settings.MiniPlayerFrostedBackground == true;
+        TransparencyLevelHint = TransparencyLevels(frosted);
+        if (frosted == _frosted) return;
+        _frosted = frosted;
+        UpdateFrostShadows();
+        if (frosted) LayoutUpdated += OnFrostLayoutUpdated;
+        else LayoutUpdated -= OnFrostLayoutUpdated;
+        _appliedRegion = null;
+        ApplyFrostRegion();
+    }
+
+    /// <summary>One piece of the window's outline, in window DIPs.</summary>
+    internal readonly record struct RegionShape(Rect Rect, double Radius, bool Ellipse);
+
+    /// <summary>The active design's outline: Classic's glass card, the Pill's slab plus its
+    /// round cover, the Sleeve's slab. Layout rects (no render transforms), so the form
+    /// cross-fade's scale pose never leaks in. Empty when nothing is laid out yet.</summary>
+    internal RegionShape[] FrostRegionShapes()
+    {
+        var shapes = new System.Collections.Generic.List<RegionShape>(2);
+        if (Vm is { IsDesignForm: true } vm)
+        {
+            var pill = vm.Form == MiniPlayerForm.Pill;
+            var ground = pill ? PillGround : SleeveGround;
+            if (LayoutRectIn(ground, this) is { Width: > 0, Height: > 0 } slab)
+                shapes.Add(new RegionShape(slab, ground.CornerRadius.TopRight, false));
+            if (pill && LayoutRectIn(PillCover, this) is { Width: > 0, Height: > 0 } cover)
+                shapes.Add(new RegionShape(cover, cover.Width / 2, true));
+        }
+        else if (LayoutRectIn(RootBorder, this) is { Width: > 0, Height: > 0 } card)
+        {
+            shapes.Add(new RegionShape(card, RootBorder.CornerRadius.TopLeft, false));
+        }
+        return shapes.ToArray();
+    }
+
+    /// <summary>How far (DIPs) the frost region runs past each shape's outline. The region's
+    /// edge is never anti-aliased; on the outline it sliced the card's soft edge pixels into
+    /// stair-steps (the Pill/Sleeve report, 10-05). Past it the whole edge is painted, over
+    /// the blur. Two DIPs clear the ~1 px edge ramp plus CreateRoundRectRgn's arc rounding.</summary>
+    internal const double FrostRegionBleed = 2;
+
+    /// <summary>The shapes grown by <see cref="FrostRegionBleed"/> (same corner centres:
+    /// the radius grows with them), in whole device pixels (left, top, right, bottom,
+    /// corner diameter) — what CreateRoundRectRgn / CreateEllipticRgn take.</summary>
+    internal static (int L, int T, int R, int B, int D, bool Ellipse)[] RegionPixels(
+        RegionShape[] shapes, double scaling)
+    {
+        var px = new (int, int, int, int, int, bool)[shapes.Length];
+        for (var i = 0; i < shapes.Length; i++)
+        {
+            var (r, radius, ellipse) = shapes[i];
+            r = r.Inflate(FrostRegionBleed);
+            radius += FrostRegionBleed;
+            // Region rects exclude their right / bottom edge, hence the +1.
+            px[i] = ((int)Math.Floor(r.X * scaling), (int)Math.Floor(r.Y * scaling),
+                     (int)Math.Ceiling(r.Right * scaling) + 1, (int)Math.Ceiling(r.Bottom * scaling) + 1,
+                     (int)Math.Round(radius * 2 * scaling), ellipse);
+        }
+        return px;
+    }
+
+    private (int L, int T, int R, int B, int D, bool Ellipse)[]? _appliedRegion;
+
+    private void OnFrostLayoutUpdated(object? sender, EventArgs e) => ApplyFrostRegion();
+
+    private void ApplyFrostRegion()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        if (TryGetPlatformHandle() is not { HandleDescriptor: "HWND" } handle) return;
+        if (!_frosted)
+        {
+            Win32Region.Set(handle.Handle, null);
+            return;
+        }
+        var shapes = FrostRegionShapes();
+        if (shapes.Length == 0) return;
+        var px = RegionPixels(shapes, RenderScaling);
+        if (_appliedRegion != null && _appliedRegion.AsSpan().SequenceEqual(px)) return;
+        _appliedRegion = px;
+        Win32Region.Set(handle.Handle, px);
+    }
+
+    internal static class Win32Region
+    {
+        [System.Runtime.InteropServices.DllImport("gdi32.dll")]
+        private static extern IntPtr CreateRoundRectRgn(int left, int top, int right, int bottom, int widthEllipse, int heightEllipse);
+        [System.Runtime.InteropServices.DllImport("gdi32.dll")]
+        private static extern IntPtr CreateEllipticRgn(int left, int top, int right, int bottom);
+        [System.Runtime.InteropServices.DllImport("gdi32.dll")]
+        private static extern int CombineRgn(IntPtr dest, IntPtr src1, IntPtr src2, int mode);
+        [System.Runtime.InteropServices.DllImport("gdi32.dll")]
+        private static extern bool DeleteObject(IntPtr obj);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern int SetWindowRgn(IntPtr hWnd, IntPtr hRgn, bool redraw);
+        private const int RGN_OR = 2;
+
+        /// <summary>Clips the window to the union of the shapes; null removes the clip.
+        /// The system owns the region once SetWindowRgn succeeds.</summary>
+        public static void Set(IntPtr hwnd, (int L, int T, int R, int B, int D, bool Ellipse)[]? shapes)
+        {
+            if (shapes == null)
+            {
+                SetWindowRgn(hwnd, IntPtr.Zero, true);
+                return;
+            }
+            var region = IntPtr.Zero;
+            foreach (var (l, t, r, b, d, ellipse) in shapes)
+            {
+                var piece = ellipse ? CreateEllipticRgn(l, t, r, b) : CreateRoundRectRgn(l, t, r, b, d, d);
+                if (piece == IntPtr.Zero) continue;
+                if (region == IntPtr.Zero) { region = piece; continue; }
+                CombineRgn(region, region, piece, RGN_OR);
+                DeleteObject(piece);
+            }
+            if (region == IntPtr.Zero) return;
+            if (SetWindowRgn(hwnd, region, true) == 0) DeleteObject(region);
+        }
+    }
+
+    private void UpdateDesignSegment()
+    {
+        if (Vm == null) return;
+        var width = DesignSegmentPanel.Bounds.Width;
+        if (width <= 0) return;
+        var segment = width / 3;
+        var index = Vm.Settings.MiniPlayerStyleMode switch
+        {
+            Undertone.Models.MiniPlayerStyle.Pill => 1,
+            Undertone.Models.MiniPlayerStyle.Sleeve => 2,
+            _ => 0,
+        };
+        DesignSegmentThumb.Width = segment;
+        // Invariant: on a comma-decimal locale "54,67px" parses as two values and throws
+        // (GitHub #79 log) — mid OnMoreMenuClick, leaving the popup open at opacity 0.
+        DesignSegmentThumb.RenderTransform = Avalonia.Media.Transformation.TransformOperations.Parse(
+            FormattableString.Invariant($"translateX({segment * index:0.##}px)"));
+    }
+
+    // Wheel over a design card: volume, 5 per notch (the classic forms have their own bar
+    // or the Volume drawer; the designs' only volume affordance is the drawer item).
+    // Touchpads and hi-res wheels report fractions at a high rate: "any delta = one notch" made
+    // a small swipe jump 0→100 (10-08). The playback bar's accumulator turns them into notches.
+    private readonly PlaybackBarView.VolumeWheelAccumulator _volumeWheel = new();
+
+    private void OnDesignVolumeWheel(object? sender, PointerWheelEventArgs e)
+    {
+        if (Vm == null || e.Delta.Y == 0) return;
+        e.Handled = true;
+        var notches = _volumeWheel.Add(e.Delta.Y, e.Timestamp);
+        if (notches != 0) Vm.NudgeVolume(notches);
+    }
+
+    private IBrush? _classicRootFill;
+
+    // Pill design: the round cover turns like a disc while music plays.
+    private CoverSpinner? _pillSpinner;
+
+    private void UpdatePillSpin()
+    {
+        if (_pillSpinner == null) return;
+        _pillSpinner.IsSpinning = Vm is { IsPillForm: true, Player.IsPlaying: true };
+    }
+
+    // ── Close / lifecycle ────────────────────────────────────
+
+    // Any close path (close button, toggling from the player bar) first plays the
+    // reverse fade/scale, then really closes once the animation has run.
+    protected override void OnClosing(WindowClosingEventArgs e)
+    {
+        if (!_closeAnimationDone)
+        {
+            e.Cancel = true;
+            _closeAnimationDone = true;
+            // Last good geometry, before teardown can report anything odd.
+            CapturePlacement();
+            _placementTrackable = false;
+            RootBorder.Opacity = 0;
+            RootBorder.RenderTransform = Avalonia.Media.Transformation.TransformOperations.Parse("scale(0.92)");
+            Avalonia.Threading.DispatcherTimer.RunOnce(Close, TimeSpan.FromMilliseconds(CloseAnimationMs));
+        }
+        base.OnClosing(e);
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        _drawerHideTimer?.Stop();
+        _lyricsChaseRunning = false;
+        _lyricsFontTimer?.Stop();
+        _pillSpinner?.Stop();
+        _flow?.Dispose();
+        _topmostKeeper?.Dispose();
+        _topmostKeeper = null;
+        if (_lyricsSurfaceRegistered && _hookedVm != null)
+        {
+            _lyricsSurfaceRegistered = false;
+            _hookedVm.Lyrics.SetLyricsSurfaceVisible(false);
+            _hookedVm.Lyrics.SetWordClockHost(null);
+        }
+        if (_hookedVm != null)
+        {
+            _hookedVm.PropertyChanged -= OnVmPropertyChanged;
+            _hookedVm.Lyrics.PropertyChanged -= OnLyricsPropertyChanged;
+            _hookedVm.Lyrics.LyricsSwapped -= OnLyricsSwapped;
+            _hookedVm.Player.PropertyChanged -= OnPlayerPropertyChanged;
+            _hookedVm.FormResizeRequested -= OnFormResizeRequested;
+            // The settings VM outlives this window; a later toggle must not reach it.
+            _hookedVm.Settings.PropertyChanged -= OnSettingsPropertyChanged;
+            _hookedVm = null;
+        }
+        base.OnClosed(e);
+    }
+
+    private void OnCloseClick(object? sender, RoutedEventArgs e) => Close();
+
+    // ── Input ────────────────────────────────────────────────
+
+    private void OnSeekPointerPressed(object? sender, PointerPressedEventArgs e) =>
+        Vm?.Player.BeginSeek();
+
+    private void OnSeekPointerReleased(object? sender, PointerReleasedEventArgs e) =>
+        Vm?.Player.EndSeek();
+
+    private void OnPreviewKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Escape)
+        {
+            if (MorePopup.IsOpen)
+                CloseMorePopup("escape");
+            else if (Vm?.IsDrawerOpen == true)
+                Vm.CloseDrawerCommand.Execute(null);
+            else
+                Close();
+            e.Handled = true;
+            return;
+        }
+
+        // Typing a space in the search box stays typing a space.
+        if (e.Key == Key.Space && e.KeyModifiers == KeyModifiers.None && e.Source is not TextBox)
+        {
+            Vm?.Player.PlayPauseCommand.Execute(null);
+            _spaceShortcutConsumed = true;
+            e.Handled = true;
+        }
+    }
+
+    /// <summary>
+    /// True between the Space press we consumed as play/pause and its release. Button
+    /// raises Click on key *up*, so swallowing only the press still let the focused
+    /// button fire on the way back up.
+    /// </summary>
+    private bool _spaceShortcutConsumed;
+
+    private void OnPreviewKeyUp(object? sender, KeyEventArgs e)
+    {
+        if (e.Key != Key.Space || !_spaceShortcutConsumed) return;
+        _spaceShortcutConsumed = false;
+        e.Handled = true;
+    }
+
+    // The window has no title bar, so any press on the glass (not on a control) drags it.
+    // Window drag is armed on press and only STARTED once the pointer has travelled a
+    // few pixels. BeginMoveDrag hands the window to the OS move loop (on Windows a modal
+    // WM_SYSCOMMAND loop) the instant it is called, and while the mouse is merely held
+    // still that loop starves the UI thread's frame callbacks — the Sleeve's disc and
+    // the Pill's cover (RequestAnimationFrame spinners) froze for a beat and then
+    // lurched to catch up. A held-still press now never enters that loop.
+    private const double DragStartThreshold = 4;
+    private PointerPressedEventArgs? _armedDrag;
+    private Point _armedDragOrigin;
+
+    /// <summary>True between an eligible press and either the drag starting or the release.</summary>
+    internal bool IsDragArmed => _armedDrag != null;
+
+    private void OnRootPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        _armedDrag = null;
+        if (!e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
+            return;
+        if (!ShouldBeginWindowDrag(e.Source))
+            return;
+
+        // Double-click on the glass returns to the full window (GitHub #80). Close()
+        // plays the exit animation; MainWindow's Closed handler shows the main window.
+        if (e.ClickCount == 2)
+        {
+            e.Handled = true;
+            Close();
+            return;
+        }
+
+        _armedDrag = e;
+        _armedDragOrigin = e.GetPosition(this);
+    }
+
+    private void OnRootPointerMoved(object? sender, PointerEventArgs e)
+    {
+        if (_armedDrag is not { } armed) return;
+        if (!e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
+        {
+            _armedDrag = null;
+            return;
+        }
+        var delta = e.GetPosition(this) - _armedDragOrigin;
+        if (Math.Abs(delta.X) < DragStartThreshold && Math.Abs(delta.Y) < DragStartThreshold)
+            return;
+
+        _armedDrag = null;
+        BeginMoveDrag(armed);
+    }
+
+    private void OnRootPointerReleased(object? sender, PointerReleasedEventArgs e) => _armedDrag = null;
+
+    private void OnRootPointerCaptureLost(object? sender, PointerCaptureLostEventArgs e) => _armedDrag = null;
+
+    /// <summary>Least room between a Pill toggle and the transport beside it.</summary>
+    private const double PillToggleGap = 4;
+
+    /// <summary>
+    /// The Pill's Shuffle / Repeat need ~190 px beside prev / play / next — the canonical card
+    /// has it, but the window resizes down to 160 wide. Narrower than that the toggles step
+    /// aside and the row is the three buttons it was before them, rather than five that
+    /// overlap. Their slots are Auto columns of a stretched grid, so hiding them does not
+    /// change the width this reads.
+    /// </summary>
+    private void SyncPillToggles(double width)
+    {
+        var need = PillShuffleButton.Width + PillRepeatButton.Width
+                   + PillTransportCenter.DesiredSize.Width + 2 * PillToggleGap;
+        var show = width >= need;
+        PillShuffleButton.IsVisible = show;
+        PillRepeatButton.IsVisible = show;
+    }
+
+    // ── Queue drawer: drag to reorder, Delete to remove ──────────
+    //
+    // The main Queue panel's pointer-tracked drag (MainWindow "Queue drag-to-reorder") on the
+    // drawer's list: a press arms it, crossing the threshold captures the pointer and lifts the
+    // row onto MiniQueueDragPreview (LiquidReorder opens the gap), release glides it in and
+    // MoveQueueRow commits. Up Next rows only: played rows (Keep Played Songs) stay put and a
+    // drag can't land among them. Queue rows are excluded from the window drag
+    // (ShouldBeginWindowDrag), so a row drag never moves the window as well. The drawer shows
+    // three or four rows, so a card held at its top or bottom edge scrolls the list (the main
+    // panel's band-selection edge scroll, QueueBandAutoScroll, on the frame clock).
+
+    private const double QueueDragThreshold = 6.0;
+    private const double QueueDragEdge = 28.0;
+    private Point _queueDragStart;
+    private bool _queueDragActive;
+    private MiniQueueRow? _queueDragRow;
+    private Control? _queueDragRowControl;
+    private double _queueDragRowOffsetY;
+    private double _queueDragRowHeight;
+    /// <summary>The row the last press landed on; a click (no drag) focuses it for Delete.</summary>
+    private Control? _queuePressedRow;
+    /// <summary>Last pointer Y in QueueScroller coordinates.</summary>
+    private double _queueDragPointerY;
+    private bool _queueDragFrameQueued;
+    private long _queueDragLastFrameTicks;
+    private LiquidReorder? _queueLiquid;
+
+    private LiquidReorder QueueLiquid => _queueLiquid ??=
+        new LiquidReorder(this, QueueList, MiniQueueDragPreview, () => MiniQueueDragPreview.DataContext = null);
+
+    /// <summary>The dragged row's index in the list now: its container's, while that still
+    /// shows the same song (a refresh can recycle it); else the song's Up Next row.</summary>
+    private int QueueDragSourceIndex(MiniPlayerViewModel vm)
+    {
+        if (_queueDragRow is not { } dragged) return -1;
+        var rows = vm.QueuePreview;
+        // The row Border is its template's root, so its visual parent is the item container.
+        if (_queueDragRowControl?.GetVisualParent() is Control container
+            && QueueList.IndexFromContainer(container) is var i and >= 0
+            && i < rows.Count && rows[i] is MiniQueueRow { IsPlayed: false } row
+            && ReferenceEquals(row.Track, dragged.Track))
+            return i;
+        // Recycled (the edge scroll): the row at its own Up Next index, so the second copy of
+        // a song queued twice is not taken for the first; the song's first row only when a
+        // live edit has moved it since.
+        var own = vm.QueueUpNextStart + dragged.Index;
+        if (own < rows.Count && rows[own] is MiniQueueRow { IsPlayed: false } same
+            && ReferenceEquals(same.Track, dragged.Track))
+            return own;
+        for (var k = vm.QueueUpNextStart; k < rows.Count; k++)
+            if (rows[k] is MiniQueueRow { IsPlayed: false } r && ReferenceEquals(r.Track, dragged.Track))
+                return k;
+        return -1;
+    }
+
+    private void OnMiniQueueRowPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if (sender is not Control rowControl || rowControl.DataContext is not MiniQueueRow row) return;
+        if (!e.GetCurrentPoint(rowControl).Properties.IsLeftButtonPressed) return;
+
+        // A new press lands before the last drop's glide finished: commit it now.
+        QueueLiquid.FinishNow();
+        _queuePressedRow = rowControl;
+        if (row.IsPlayed) return;
+
+        _queueDragRow = row;
+        _queueDragRowControl = rowControl;
+        _queueDragRowOffsetY = e.GetPosition(rowControl).Y;
+        _queueDragStart = e.GetPosition(this);
+        _queueDragActive = false;
+    }
+
+    /// <summary>Moves bubble here from the pressed row until the drag starts, then arrive
+    /// captured (see QueueScroller in the XAML).</summary>
+    private void OnMiniQueueDragPointerMoved(object? sender, PointerEventArgs e)
+    {
+        if (_queueDragRow == null || QueueLiquid is not { IsSettling: false } liquid) return;
+        if (_queueDragRowControl is not { } rowControl || Vm is not { } vm) return;
+        if (!e.GetCurrentPoint(this).Properties.IsLeftButtonPressed) return;
+
+        var pos = e.GetPosition(this);
+        if (!_queueDragActive)
+        {
+            if (Math.Abs(pos.X - _queueDragStart.X) < QueueDragThreshold &&
+                Math.Abs(pos.Y - _queueDragStart.Y) < QueueDragThreshold)
+                return;
+            if (!StartQueueDrag(rowControl, e, liquid, vm)) return;
+        }
+
+        _queueDragPointerY = e.GetPosition(QueueScroller).Y;
+        liquid.MoveCardTo(_queueDragPointerY - _queueDragRowOffsetY);
+        UpdateQueueDragTarget(liquid, vm);
+        QueueDragFrameRequest();
+    }
+
+    /// <summary>Source and target from the card's position over the rows as laid out now.</summary>
+    private void UpdateQueueDragTarget(LiquidReorder liquid, MiniPlayerViewModel vm)
+    {
+        liquid.SourceIndex = QueueDragSourceIndex(vm);
+        var cardTop = _queueDragPointerY - _queueDragRowOffsetY;
+        var target = LiquidReorder.NearestSlot(QueueList, QueueScroller, cardTop + _queueDragRowHeight / 2);
+        if (target >= 0) liquid.TargetIndex = Math.Clamp(target, vm.QueueUpNextStart, Math.Max(vm.QueueUpNextStart, vm.QueuePreview.Count - 1));
+    }
+
+    private void QueueDragFrameRequest()
+    {
+        if (!_queueDragActive || _queueDragFrameQueued) return;
+        _queueDragFrameQueued = true;
+        _queueDragLastFrameTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+        RequestAnimationFrame(QueueDragFrame);
+    }
+
+    /// <summary>Edge scroll while the card is held near the list's top or bottom.</summary>
+    private void QueueDragFrame(TimeSpan _)
+    {
+        _queueDragFrameQueued = false;
+        if (!_queueDragActive || Vm is not { } vm || _queueLiquid is not { IsDragging: true } liquid) return;
+
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        // Real elapsed time, clamped so a stalled UI thread can't produce one giant jump.
+        var dt = Math.Min((now - _queueDragLastFrameTicks) / (double)System.Diagnostics.Stopwatch.Frequency, 0.1);
+        _queueDragLastFrameTicks = now;
+        var delta = QueueBandAutoScroll.Step(_queueDragPointerY, QueueScroller.Bounds.Height, QueueDragEdge, dt);
+        if (delta != 0)
+        {
+            var max = Math.Max(0, QueueScroller.Extent.Height - QueueScroller.Viewport.Height);
+            var next = Math.Clamp(QueueScroller.Offset.Y + delta, 0, max);
+            if (Math.Abs(next - QueueScroller.Offset.Y) > 0.01)
+            {
+                QueueScroller.Offset = QueueScroller.Offset.WithY(next);
+                // Realize/arrange the rows at the new offset before measuring off them.
+                QueueList.UpdateLayout();
+                UpdateQueueDragTarget(liquid, vm);
+            }
+        }
+        _queueDragFrameQueued = true;
+        RequestAnimationFrame(QueueDragFrame);
+    }
+
+    private bool StartQueueDrag(Control rowControl, PointerEventArgs e, LiquidReorder liquid, MiniPlayerViewModel vm)
+    {
+        var source = QueueDragSourceIndex(vm);
+        if (source < 0 || _queueDragRow == null) return false;
+        _queueDragActive = true;
+        _queueDragRowHeight = rowControl.Bounds.Height;
+        // Keep the move/release events even when the pointer leaves the row, or the row its
+        // container (the edge scroll recycles it).
+        e.Pointer.Capture(QueueScroller);
+
+        MiniQueueDragPreview.DataContext = _queueDragRow.Track;
+        var container = QueueList.ContainerFromIndex(source);
+        liquid.Pitch = container == null ? rowControl.Bounds.Height : container.Bounds.Height + container.Margin.Top + container.Margin.Bottom;
+        liquid.SourceIndex = liquid.TargetIndex = source;
+        // Start exactly over the grabbed row so the lift reads as the row rising.
+        var rowTop = rowControl.TranslatePoint(new Point(0, 0), QueueScroller)?.Y
+                     ?? e.GetPosition(QueueScroller).Y - _queueDragRowOffsetY;
+        liquid.Begin(rowTop);
+        return true;
+    }
+
+    private void OnMiniQueueDragPointerReleased(object? sender, PointerReleasedEventArgs e)
+    {
+        if (_queueDragActive) BeginQueueSettle();
+        else
+        {
+            ResetQueueDragState();
+            // A click: the row takes focus, so Delete removes it (and it keeps the hover wash).
+            // Not on the press, where focus would scroll a half-visible row under the pointer
+            // just as a drag starts.
+            if (_queuePressedRow is { } pressed && e.Source is Visual source
+                && (ReferenceEquals(pressed, source) || pressed.IsVisualAncestorOf(source)))
+                pressed.Focus(NavigationMethod.Pointer);
+        }
+        _queuePressedRow = null;
+        if (ReferenceEquals(e.Pointer.Captured, QueueScroller)) e.Pointer.Capture(null);
+    }
+
+    private void OnMiniQueueDragPointerCaptureLost(object? sender, PointerCaptureLostEventArgs e)
+    {
+        // Releasing the capture on drop raises this too; the glide owns cleanup then.
+        if (QueueLiquid.IsSettling) return;
+        ResetQueueDragState();
+    }
+
+    /// <summary>Release: glide the card into the gap; the move commits when it lands.</summary>
+    private void BeginQueueSettle()
+    {
+        if (Vm is not { } vm || _queueDragRow is not { } row)
+        {
+            ResetQueueDragState();
+            return;
+        }
+        var liquid = QueueLiquid;
+        var from = QueueDragSourceIndex(vm);
+        if (from < 0)
+        {
+            ResetQueueDragState();
+            return;
+        }
+        var start = vm.QueueUpNextStart;
+        var to = Math.Clamp(liquid.TargetIndex, start, Math.Max(start, vm.QueuePreview.Count - 1));
+        liquid.SourceIndex = from;
+        liquid.TargetIndex = to;
+        var landing = LiquidReorder.SlotTop(QueueList, to, QueueScroller) ?? liquid.CardY;
+        _queueDragActive = false;
+        _queueDragRow = null;
+        _queueDragRowControl = null;
+        // Rows, not list slots: the row's own Up Next index moves to the target's.
+        var fromRow = vm.QueuePreview[from] as MiniQueueRow;
+        liquid.Settle(landing, () =>
+        {
+            if (from != to && fromRow != null && ReferenceEquals(fromRow.Track, row.Track))
+                vm.MoveQueueRow(fromRow, to - start);
+        });
+    }
+
+    private void ResetQueueDragState()
+    {
+        _queueLiquid?.Cancel();
+        _queueDragActive = false;
+        _queueDragRow = null;
+        _queueDragRowControl = null;
+    }
+
+    /// <summary>Row menu ▸ Remove from Queue. A Click handler, as the main Queue panel's menu
+    /// uses: the menu item's DataContext is the row it opened on.</summary>
+    private void OnMiniQueueRemoveClick(object? sender, RoutedEventArgs e)
+    {
+        if (sender is MenuItem { DataContext: MiniQueueRow row })
+            Vm?.RemoveFromQueueCommand.Execute(row);
+    }
+
+    /// <summary>Delete on a clicked (focused) queue row removes it, as in the main Queue panel.</summary>
+    private void OnMiniQueueRowKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (!PlatformHelper.IsDeleteKey(e.Key) || e.KeyModifiers != KeyModifiers.None) return;
+        if (sender is not Control { DataContext: MiniQueueRow row } || Vm is not { } vm) return;
+        vm.RemoveFromQueueCommand.Execute(row);
+        e.Handled = true;
+    }
+
+    /// <summary>
+    /// True when a press landed on the window's own glass rather than on a control.
+    /// The "…" menu lives in a popup whose input still routes through this window, so
+    /// presses inside it are rejected outright — otherwise a press on the menu's padding
+    /// would drag the window out from under the open menu. (The popup is a separate
+    /// window on desktop and an overlay layer elsewhere; the menu-card check covers both.)
+    /// </summary>
+    internal bool ShouldBeginWindowDrag(object? source)
+    {
+        if (source is not Visual visual)
+            return true;
+        if (visual == MenuCard || MenuCard.IsVisualAncestorOf(visual))
+            return false;
+        if (TopLevel.GetTopLevel(visual) is { } root && !ReferenceEquals(root, this))
+            return false;
+
+        foreach (var ancestor in visual.GetSelfAndVisualAncestors())
+        {
+            if (ancestor is Button or Slider or TextBox)
+                return false;
+            if (ancestor is Border b && b.Classes.Contains("resize-grip"))
+                return false;
+            // Queue drawer rows are dragged to reorder (OnMiniQueueRowPointerPressed).
+            if (ancestor is Border row && row.Classes.Contains("mini-queue-row"))
+                return false;
+        }
+
+        return true;
+    }
+
+    private void OnResizeGripPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if (!e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
+            return;
+        if (sender is not Border grip || grip.Tag is not string tag)
+            return;
+
+        var edge = tag switch
+        {
+            "North" => WindowEdge.North,
+            "South" => WindowEdge.South,
+            "East" => WindowEdge.East,
+            "West" => WindowEdge.West,
+            "NorthEast" => WindowEdge.NorthEast,
+            "NorthWest" => WindowEdge.NorthWest,
+            "SouthEast" => WindowEdge.SouthEast,
+            _ => WindowEdge.SouthWest,
+        };
+
+        e.Handled = true;
+        BeginResizeDrag(edge, e);
+    }
+
+    // ── "…" menu popup ───────────────────────────────────────
+
+    // Mirrors the Settings modal: fade + scale(0.96 → 1) over 0.18s on open, the
+    // reverse on close, and the popup unmaps once the exit animation has run.
+    private int _menuCloseGeneration;
+
+    private void OnMoreMenuClick(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not Control anchor) return;
+        LogMenu("OnMoreMenuClick",
+            $"form={Vm?.Form} style={Vm?.Style} anchor={anchor.Bounds} anchorVisible={anchor.IsEffectivelyVisible} {MenuState()}");
+
+        // Pressing the "…" button while its menu is open already closed it in the
+        // window's tunnel handler (which swallows the press, so no Click arrives).
+        _menuCloseGeneration++;
+
+        // The large-icon form's button sits low on the card, so its menu opens upward.
+        var openUp = Vm?.IsLargeIconForm == true;
+        MorePopup.Placement = openUp ? PlacementMode.TopEdgeAlignedRight : PlacementMode.BottomEdgeAlignedRight;
+        MorePopup.VerticalOffset = openUp ? -6 : 6;
+        MorePopup.PlacementTarget = anchor;
+
+        MenuCard.Opacity = 0;
+        MenuCard.RenderTransform = Avalonia.Media.Transformation.TransformOperations.Parse("scale(0.96)");
+        MorePopup.IsOpen = true;
+        // The popup's content lays out now; the segment sizes itself from that pass.
+        DesignSegmentPanel.SizeChanged -= OnDesignSegmentSizeChanged;
+        DesignSegmentPanel.SizeChanged += OnDesignSegmentSizeChanged;
+        UpdateDesignSegment();
+
+        // Apply the shown target on the next render tick so the transitions animate
+        // from the hidden state instead of snapping.
+        Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+        {
+            if (!MorePopup.IsOpen) { LogMenu("ShowSkipped", MenuState()); return; }
+            MenuCard.Opacity = 1;
+            MenuCard.RenderTransform = Avalonia.Media.Transformation.TransformOperations.Parse("scale(1)");
+        }, Avalonia.Threading.DispatcherPriority.Render);
+    }
+
+    private void OnMenuItemClick(object? sender, RoutedEventArgs e) => CloseMorePopup("item");
+
+    private void OnDesignSegmentSizeChanged(object? sender, SizeChangedEventArgs e) => UpdateDesignSegment();
+
+    private void CloseMorePopup(string reason)
+    {
+        if (!MorePopup.IsOpen) return;
+        LogMenu("CloseMorePopup", $"reason={reason} {MenuState()}");
+
+        var generation = ++_menuCloseGeneration;
+        MenuCard.Opacity = 0;
+        MenuCard.RenderTransform = Avalonia.Media.Transformation.TransformOperations.Parse("scale(0.96)");
+        Avalonia.Threading.DispatcherTimer.RunOnce(() =>
+        {
+            if (generation == _menuCloseGeneration)
+                MorePopup.IsOpen = false;
+        }, TimeSpan.FromMilliseconds(200));
+    }
+
+    private string MenuState() =>
+        $"isOpen={MorePopup.IsOpen} opacity={MenuCard.Opacity:0.##} active={IsActive} gen={_menuCloseGeneration}";
+
+    private void LogTransparency(string when) =>
+        Undertone.Services.DebugLog.Write("MiniPlayer",
+            $"transparency {when}: hint=[{string.Join(",", TransparencyLevelHint)}] actual={ActualTransparencyLevel}");
+
+    // GitHub #79 diagnostics. Written straight to the session log behind Settings →
+    // Developer Mode → "Copy Logs" (DebugLogger's UI entries are never shown anywhere),
+    // and only while Developer Mode has the logger on.
+    private static void LogMenu(string action, string metadata)
+    {
+        if (!Undertone.Services.DebugLogger.IsEnabled) return;
+        Undertone.Services.DebugLog.Write("MiniMenu", $"{action} | {metadata}");
+    }
+
+    // ── Drawer (bottom-sheet layers) ─────────────────────────
+
+    // Open: fade + slide-up like the playback bar's flyouts. Close: reverse, and unmap
+    // only once the exit transition has finished so it doesn't snap.
+    /// <summary>How much window height each drawer asks for. Fixed rather than
+    /// content-sized so the card always grows by the same amount; long queues and result
+    /// lists scroll inside their own section.</summary>
+    private static double DrawerTargetHeight(MiniDrawer drawer) => drawer switch
+    {
+        MiniDrawer.Queue => 200,
+        MiniDrawer.Search => 240,
+        MiniDrawer.Volume => 64,
+        _ => 0,
+    };
+
+    // True while SnapDrawerClosed is collapsing the VM's drawer state without animation.
+    private bool _suppressDrawerAnimation;
+
+    /// <summary>
+    /// Closes the drawer instantly (no slide, no window-height animation) and clears every
+    /// piece of in-flight drawer state. Used before a form jump so the jump owns
+    /// Window.Height alone.
+    /// </summary>
+    private void SnapDrawerClosed()
+    {
+        _drawerHideTimer?.Stop();
+        _drawerHideTimer = null;
+        _drawerAnim = null;
+        var hadHeight = _drawerHeight;
+        _drawerHeight = 0;
+        DrawerSheet.Height = 0;
+        DrawerSheet.Opacity = 0;
+        DrawerSheet.IsVisible = false;
+        SetDrawerOffset(14);
+        if (hadHeight > 0 && double.IsFinite(Height))
+            Height = Math.Max(MinHeight, Height - hadHeight);
+        // Give back the upward shift the drawer needed, as its animated close does.
+        // Left set, CapturePlacement kept adding it to a window that no longer had it,
+        // persisting a Y below where the card really was.
+        if (_drawerShiftY != 0)
+        {
+            var shift = _drawerShiftY;
+            _drawerShiftY = 0; // first: the move below raises PositionChanged → CapturePlacement
+            Position = new PixelPoint(Position.X, (int)Math.Round(Position.Y + shift));
+        }
+        if (Vm is { IsDrawerOpen: true } vm)
+        {
+            _suppressDrawerAnimation = true;
+            try { vm.Drawer = MiniDrawer.None; }
+            finally { _suppressDrawerAnimation = false; }
+        }
+        if (Vm != null) Vm.IsDrawerAnimating = false;
+    }
+
+    // No per-open chrome change under a design: DesignGround already spans the card AND
+    // the sheet's row, so the slab simply stretches with the window (the classic glide),
+    // instead of corners squaring off and margins snapping the moment the sheet appears.
+    private void OnDrawerChanged()
+    {
+        if (_suppressDrawerAnimation) return;
+        var open = Vm?.IsDrawerOpen == true;
+        var target = open ? DrawerTargetHeight(Vm!.Drawer) : 0;
+
+        // Row streaming (StreamingFill) waits for the slide to land — see IsDrawerAnimating.
+        if (Vm != null) Vm.IsDrawerAnimating = true;
+
+        _drawerHideTimer?.Stop();
+        _drawerHideTimer = null;
+
+        if (open)
+        {
+            DrawerSheet.IsVisible = true;
+            DrawerSheet.Opacity = 0;
+            SetDrawerOffset(14);
+            Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+            {
+                if (Vm?.IsDrawerOpen != true) return;
+                DrawerSheet.Opacity = 1;
+                SetDrawerOffset(0);
+                if (Vm.IsSearchDrawer)
+                    SearchBox.Focus();
+            }, Avalonia.Threading.DispatcherPriority.Render);
+            // Keep Played Songs (GitHub #124): open on where playback is, not the top of up to
+            // 50 played songs. After the layout pass, so the rows the VM just filled exist.
+            if (Vm!.IsQueueDrawer && Vm.QueuePreviewHasPlayed)
+                Avalonia.Threading.Dispatcher.UIThread.Post(ScrollQueueToBoundary,
+                    Avalonia.Threading.DispatcherPriority.Loaded);
+        }
+        else
+        {
+            DrawerSheet.Opacity = 0;
+            SetDrawerOffset(14);
+        }
+
+        AnimateDrawer(target, onLanded: () =>
+        {
+            if (Vm != null) Vm.IsDrawerAnimating = false;
+            if (Vm?.IsDrawerOpen != true)
+                DrawerSheet.IsVisible = false;
+        });
+    }
+
+    /// <summary>
+    /// Grows or shrinks the window by the drawer's height, moving the window and the
+    /// drawer on the SAME eased curve. That lockstep is the point: window height and
+    /// drawer height change by the same delta at the same time, so the player area above
+    /// stays exactly the same size throughout and never reflows or changes form. Setting
+    /// the drawer to its full height first would starve the form row to nothing until the
+    /// window caught up.
+    /// </summary>
+    private void AnimateDrawer(double targetDrawerHeight, Action onLanded)
+    {
+        var fromDrawer = _drawerHeight;
+        var delta = targetDrawerHeight - fromDrawer;
+
+        var fromHeight = Height;
+        var fromShift = _drawerShiftY;
+        if (!double.IsFinite(fromHeight))
+        {
+            _drawerHeight = targetDrawerHeight;
+            DrawerSheet.Height = targetDrawerHeight;
+            onLanded();
+            return;
+        }
+
+        // Growing downward can run off the screen; shift the window up by the overflow so
+        // the whole expanded card stays visible, and give the shift back when it collapses.
+        var targetShift = 0.0;
+        if (delta > 0 && Screens.ScreenFromWindow(this) is { } screen)
+        {
+            var scaling = screen.Scaling <= 0 ? 1 : screen.Scaling;
+            var bottom = Position.Y + (fromHeight + delta) * scaling;
+            var overflow = bottom - screen.WorkingArea.Bottom;
+            if (overflow > 0)
+                targetShift = Math.Min(overflow / scaling, Math.Max(0, (Position.Y - screen.WorkingArea.Y) / scaling));
+        }
+
+        var generation = ++_resizeAnimationGeneration;
+        const double durationMs = 240;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        var startY = Position.Y;
+        _suppressPlacementCapture = true;
+
+        // The tick only eases Window.Height (whole DIPs — fractional sizes make the
+        // border/clip shimmer); the Resized handler sizes the sheet from the height the
+        // window has ACTUALLY reached, keeping the form row constant (see there).
+        _drawerAnim = (generation, fromHeight - fromDrawer, Math.Max(fromDrawer, targetDrawerHeight));
+
+        // Frame clock, not a DispatcherTimer — see AnimateSizeTo for the measurement.
+        void Frame(TimeSpan _)
+        {
+            if (generation != _resizeAnimationGeneration || _closeAnimationDone)
+                return; // A newer animation owns _drawerAnim (its generation differs) — leave it.
+
+            var t = Math.Clamp(clock.Elapsed.TotalMilliseconds / durationMs, 0, 1);
+            var eased = 1 - Math.Pow(1 - t, 3);
+
+            Height = Math.Round(fromHeight + delta * eased);
+
+            var shift = fromShift + (targetShift - fromShift) * eased;
+            if (Math.Abs(shift - _drawerShiftY) > 0.01)
+            {
+                Position = new PixelPoint(Position.X, (int)Math.Round(startY - (shift - fromShift)));
+                _drawerShiftY = shift;
+            }
+
+            if (t < 1) { RequestGeometryFrame(Frame); return; }
+
+            _drawerAnim = null;
+            Height = fromHeight + delta;
+            _drawerHeight = targetDrawerHeight;
+            DrawerSheet.Height = targetDrawerHeight;
+            _drawerShiftY = targetShift;
+            _suppressPlacementCapture = false;
+            onLanded();
+            CapturePlacement();
+        }
+        RequestGeometryFrame(Frame);
+    }
+
+    /// <summary>In-flight drawer animation: generation tag (only honored while it matches
+    /// the live animation), the constant player-area height above the sheet, and the
+    /// ceiling for the sheet height. Consumed by the Resized handler.</summary>
+    private (int Generation, double FormHeight, double MaxDrawer)? _drawerAnim;
+
+    /// <summary>
+    /// Scrolls the Queue drawer so the last played row sits at the top of the list, with the
+    /// Up Next header and the next songs under it — the boundary stays in view as the sheet
+    /// grows (the offset holds while the viewport extends downward). The list is virtualized,
+    /// so the row is realized first (ScrollIntoView) and placed by its real position rather
+    /// than an estimate from the mixed header/song row heights.
+    /// </summary>
+    private void ScrollQueueToBoundary()
+    {
+        if (Vm is not { IsQueueDrawer: true } vm || vm.QueueBoundaryIndex < 0
+            || vm.QueueBoundaryIndex >= QueueList.ItemCount)
+            return;
+        var index = vm.QueueBoundaryIndex;
+        QueueList.ScrollIntoView(index);
+        QueueList.UpdateLayout();
+        if (QueueList.ContainerFromIndex(index) is not { } row
+            || row.TranslatePoint(default, QueueScroller) is not { } at)
+            return;
+        QueueScroller.Offset = new Vector(QueueScroller.Offset.X, Math.Max(0, QueueScroller.Offset.Y + at.Y));
+    }
+
+    private void SetDrawerOffset(double y)
+    {
+        if (DrawerSheet.RenderTransform is TranslateTransform t)
+            t.Y = y;
+    }
+
+    // ── Lyrics form ──────────────────────────────────────────
+
+    /// <summary>
+    /// The lyrics VM only runs its sync/word clocks while a lyrics surface is
+    /// attached, and the word clock rides the main window's render loop — which
+    /// pumps no frames while the main window is hidden behind the mini player.
+    /// The lyrics form therefore registers as a surface AND as the frame source.
+    /// </summary>
+    private bool _lyricsSurfaceRegistered;
+
+    private void UpdateLyricsSurfaceRegistration()
+    {
+        var vm = Vm;
+        var active = vm?.IsLyricsForm == true;
+        if (active == _lyricsSurfaceRegistered) return;
+        if (vm == null) { _lyricsSurfaceRegistered = false; return; }
+
+        _lyricsSurfaceRegistered = active;
+        if (active)
+        {
+            vm.Lyrics.SetWordClockHost(this);
+            vm.Lyrics.SetLyricsSurfaceVisible(true);
+        }
+        else
+        {
+            vm.Lyrics.SetLyricsSurfaceVisible(false);
+            vm.Lyrics.SetWordClockHost(null);
+        }
+    }
+
+    private void OnEnteredLyricsForm()
+    {
+        var vm = Vm;
+        if (vm == null) return;
+
+        // Handles the case where the track started before the lyrics form existed.
+        vm.Lyrics.EnsureLyricsForCurrentTrack();
+
+        // Jump (no animation) once the list has laid out.
+        Avalonia.Threading.Dispatcher.UIThread.Post(
+            () => CenterActiveLyric(animated: false),
+            Avalonia.Threading.DispatcherPriority.Loaded);
+    }
+
+    /// <summary>Anchor for the active lyric line, as a fraction of the viewport height —
+    /// slightly above centre, like the Apple Music mini player. The run-out padding in
+    /// LyricsScroll.SizeChanged is derived from the same ratio so every line can reach it.</summary>
+    private const double LyricsAnchorRatio = 0.42;
+
+    /// <summary>Scrolls the active lyric line to the anchor point of the panel.</summary>
+    private void CenterActiveLyric(bool animated)
+    {
+        var vm = Vm;
+        if (vm == null) return;
+
+        var index = vm.Lyrics.ScrollLineIndex;
+        if (index < 0) return;
+
+        var container = LyricsItems.ContainerFromIndex(index);
+        if (container == null) return;
+
+        var top = container.TranslatePoint(new Point(0, 0), LyricsItems);
+        if (top == null) return;
+
+        // Offset lives in extent space, which includes the wrapper StackPanel's top
+        // margin (the run-out padding) — TranslatePoint against LyricsItems does not,
+        // so add it back or every target lands short by the pad height (the lyrics
+        // page corrects the same way with LyricsItemsControl.Margin.Top).
+        var target = top.Value.Y + LyricsStack.Margin.Top + container.Bounds.Height / 2
+                     - LyricsScroll.Viewport.Height * LyricsAnchorRatio;
+        var max = Math.Max(0, LyricsScroll.Extent.Height - LyricsScroll.Viewport.Height);
+        target = Math.Clamp(target, 0, max);
+
+        if (!animated)
+        {
+            _lyricsChaseRunning = false;
+            LyricsScroll.Offset = new Vector(0, target);
+            return;
+        }
+
+        // Exponential chase (same idea as the lyrics page / SmoothScrollBehavior): a
+        // new active line only moves the goalpost, so back-to-back updates during a
+        // timeline scrub retarget the glide mid-flight instead of restarting it from
+        // zero velocity — the flow never stutters. Stepped on the compositor frame clock
+        // with real dt, so the decay per second is the same at 60 and 250 Hz.
+        _lyricsChaseTarget = target;
+        if (_lyricsChaseRunning) return;
+        _lyricsChaseRunning = true;
+        _lyricsChaseLastTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+        RequestAnimationFrame(LyricsChaseFrame);
+    }
+
+    private double _lyricsChaseTarget;
+    private bool _lyricsChaseRunning;
+    private long _lyricsChaseLastTicks;
+    // 10 % of the remaining distance per ~15 ms tick, as before: τ = 0.015 / −ln(0.9).
+    private const double LyricsChaseTauSeconds = 0.142;
+
+    private void LyricsChaseFrame(TimeSpan _)
+    {
+        if (!_lyricsChaseRunning) return;
+
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        // Clamped so a stalled UI thread cannot produce one huge jump.
+        var dt = Math.Min((now - _lyricsChaseLastTicks) / (double)System.Diagnostics.Stopwatch.Frequency, 0.1);
+        _lyricsChaseLastTicks = now;
+
+        var current = LyricsScroll.Offset.Y;
+        var remaining = _lyricsChaseTarget - current;
+        if (Math.Abs(remaining) < 0.5)
+        {
+            LyricsScroll.Offset = new Vector(0, _lyricsChaseTarget);
+            _lyricsChaseRunning = false;
+            return;
+        }
+        LyricsScroll.Offset = new Vector(0, current + remaining * (1 - Math.Exp(-dt / LyricsChaseTauSeconds)));
+        // Coerced write = target unreachable (extent shrank); a chase that cannot land must not keep the compositor rendering.
+        if (Math.Abs(LyricsScroll.Offset.Y - current) < 1e-6)
+        {
+            _lyricsChaseRunning = false;
+            return;
+        }
+        RequestAnimationFrame(LyricsChaseFrame);
+    }
+}

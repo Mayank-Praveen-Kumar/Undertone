@@ -1,0 +1,1324 @@
+using System.Text.Json.Serialization;
+
+namespace Undertone.Models;
+
+/// <summary>
+/// Application settings, persisted to settings.json in %APPDATA%\Undertone\.
+/// </summary>
+public class AppSettings : IJsonOnDeserializing
+{
+    /// <summary>Directories to scan for music files.</summary>
+    public List<string> MusicFolders { get; set; } = new();
+
+    /// <summary>Phone: albums the user pinned from the long-press sheet (Library → Pinned rail).
+    /// Playlists pin through Playlist.IsPinned instead.</summary>
+    public List<Guid> PinnedAlbumIds { get; set; } = new();
+
+    /// <summary>Phone: artists pinned to Library → Pinned, by name (artists have no stable id
+    /// across rescans).</summary>
+    public List<string> PinnedArtistNames { get; set; } = new();
+
+    /// <summary>Phone: songs pinned to Library → Pinned.</summary>
+    public List<Guid> PinnedTrackIds { get; set; } = new();
+
+    /// <summary>Phone: the Library tab's list rows (Playlists, Artists, Albums, Songs, Favorites,
+    /// Downloaded) in the order the user arranged them under Edit. Each entry is a row key; a
+    /// leading "-" marks a row switched off ("-Favorites"). Empty = the default set. Keys this
+    /// build does not know are skipped, and rows missing from the list (added by a later build)
+    /// follow the listed ones in their default order and state.</summary>
+    public List<string> PhoneLibraryRows { get; set; } = new();
+
+    /// <summary>GitHub #71: whether files/folders dropped onto Undertone are moved into the
+    /// managed "Undertone Imports" folder and added to the library (true, the original
+    /// behaviour) or played/queued from where they are without touching the library.</summary>
+    public bool ImportDroppedMedia { get; set; } = true;
+
+    /// <summary>GitHub #74: playlist page furniture, each opt-out. Album run headers
+    /// above each same-album run, the NEW badge on tracks added in the last 7 days,
+    /// and the Added / Favorite columns.</summary>
+    public bool PlaylistShowAlbumHeaders { get; set; } = true;
+    public bool PlaylistShowNewBadge { get; set; } = true;
+    public bool PlaylistShowAddedColumn { get; set; } = true;
+    public bool PlaylistShowFavoriteColumn { get; set; } = true;
+
+    /// <summary>The Featured Artists / Suggested rail on the right of a playlist page
+    /// (Discord, DendyAly 11-02). Off hides it and skips its artist pictures and the
+    /// suggestion scan; the track list takes the width.</summary>
+    public bool PlaylistShowSideRail { get; set; } = true;
+
+    /// <summary>File paths explicitly removed from the library. Skipped during rescans.</summary>
+    public List<string> ExcludedFilePaths { get; set; } = new();
+
+    /// <summary>Persistent include/exclude rules for scanning.</summary>
+    public List<FolderRule> FolderRules { get; set; } = new();
+
+    /// <summary>Folders (any level) the user hid from the library in the Folders view. Their
+    /// tracks stay scanned and in library.json, with their play counts, favorites and ratings,
+    /// but drop out of every other view until the folder is shown again. No rescan either way.</summary>
+    public List<string> HiddenLibraryFolders { get; set; } = new();
+
+    /// <summary>Directory names to ignore while scanning (case-insensitive).</summary>
+    public List<string> IgnoredFolderNames { get; set; } = new() { ".git", "node_modules", "$recycle.bin", "system volume information" };
+
+    /// <summary>Current theme: "Gray", "Dark", "MidnightBlack", "Light", or "System".</summary>
+    public string Theme { get; set; } = "Gray";
+
+    /// <summary>UI language: a culture name shipped in Localization/ ("es") or "" to follow the OS.</summary>
+    public string Language { get; set; } = "";
+
+    /// <summary>Plugin ids (plugin.json "id"; the folder name for a legacy plugin without one)
+    /// the user switched off in Settings → Plugins. Older builds stored folder names; the
+    /// plugin host rewrites those to ids on load.</summary>
+    public List<string> DisabledPlugins { get; set; } = new();
+
+    /// <summary>Plugin ids whose screens the user took off the sidebar (Settings → Plugins → the
+    /// plugin's "Show in sidebar", or the row's Hide from sidebar). Every other running plugin
+    /// that adds a screen gets a sidebar entry.</summary>
+    public List<string> SidebarHiddenPlugins { get; set; } = new();
+
+    /// <summary>
+    /// "Community plugins" switch (Settings → Plugins). False = restricted mode: no
+    /// third-party plugin code is loaded. Null = never decided (a settings.json from before
+    /// this switch existed): the plugin host sets it on first load, ON when plugins were
+    /// already installed (they ran before this switch existed), OFF for everyone else.
+    /// Defaults the app creates itself (no usable settings file, Reset) set it to false.
+    /// </summary>
+    public bool? CommunityPluginsEnabled { get; set; }
+
+    /// <summary>Plugin id → the permissions the user approved when enabling it. A plugin
+    /// whose plugin.json asks for more (after an update) waits for approval again.</summary>
+    public Dictionary<string, List<string>> PluginPermissionGrants { get; set; } = new();
+
+    /// <summary>Plugin id → setting key → value (invariant text) for settings declared in plugin.json.</summary>
+    public Dictionary<string, Dictionary<string, string>> PluginSettingValues { get; set; } = new();
+
+    /// <summary>Plugin id → "version|sha256" of an installed copy whose zip matched its official
+    /// listing (plugins/index.json, author Undertone) at install time. Only these show the verified
+    /// mark in Settings → Plugins; written by the plugin host on install, dropped on remove.</summary>
+    public Dictionary<string, string> VerifiedOfficialPlugins { get; set; } = new();
+
+    /// <summary>
+    /// Marker for the v2 theme migration. In v1, "Dark" denoted today's Gray colours.
+    /// On first load post-upgrade, a stored "Dark" with this flag false is rewritten to "Gray"
+    /// so existing users keep their visual; future explicit "Dark" picks set this true and
+    /// are honoured as the new dark theme.
+    /// </summary>
+    public bool ThemeV2Migrated { get; set; } = false;
+
+    /// <summary>Display name shown in the Settings profile section.</summary>
+    public string ProfileName { get; set; } = string.Empty;
+
+    /// <summary>Absolute path to the user's avatar image, or empty for the default placeholder.</summary>
+    public string ProfileAvatarPath { get; set; } = string.Empty;
+
+    /// <summary>Accent preset name ("Crimson", "Sunset", ..., or "Custom").</summary>
+    public string AccentPresetName { get; set; } = "Crimson";
+
+    /// <summary>Active accent colour as #RRGGBB hex (mirrors the preset; honoured when preset is "Custom").</summary>
+    public string AccentColorHex { get; set; } = "#E74856";
+
+    /// <summary>Accent recolours from the playing track's cover; the chosen accent returns when nothing plays.</summary>
+    public bool AccentFollowsArtwork { get; set; }
+
+    /// <summary>GitHub #125: artist, album and genre names in song lists take the accent colour.
+    /// Off shows them in the plain text colour.</summary>
+    public bool AccentTrackLinks { get; set; } = true;
+
+    /// <summary>Settings › Appearance › App Icon: id of the window/taskbar/tray icon
+    /// ("classic", "blush", "sky", ...). Unknown ids fall back to classic.</summary>
+    public string AppIcon { get; set; } = "classic";
+
+    /// <summary>Phone: "System" (follow Android's dark/light), "Dark" (the dark theme in
+    /// <see cref="Theme"/>) or "Light".</summary>
+    public string MobileAppearance { get; set; } = "System";
+
+    /// <summary>Phone: the lyrics page's text size on top of the system font scale (0.8-1.6).</summary>
+    public double MobileLyricsTextScale { get; set; } = 1.0;
+
+    /// <summary>Phone, Settings › Listening History › Keep History: days of plays kept (older ones are
+    /// dropped when the app starts and when this changes). 0 keeps them forever.</summary>
+    public int MobileKeepHistoryDays { get; set; }
+
+    /// <summary>Phone, Settings › Listening History › Share with Computer: the plays of the computer's
+    /// songs are sent to it (as scrobbles, on the next sync). Off keeps them on the phone.</summary>
+    public bool MobileShareHistory { get; set; } = true;
+
+    /// <summary>Phone, Settings › Pick Up on Computer: the phone's queue and place are sent to the
+    /// computer, which offers to continue from them. Off by default.</summary>
+    public bool MobilePickUpOnComputer { get; set; }
+
+    /// <summary>Phone, Settings › Appearance › Player Bar: the mini player's elapsed part filled in
+    /// the cover's colour. Off (the default) leaves the capsule plain glass, as Apple's.</summary>
+    public bool MobilePlayerBarProgressFill { get; set; }
+
+    /// <summary>Phone, Settings › Appearance › Player Bar: the bright progress line along the mini
+    /// player's bottom edge. Off by default.</summary>
+    public bool MobilePlayerBarProgressLine { get; set; }
+
+    /// <summary>Phone, Settings › Appearance › Album Colours: album and artist pages painted in a
+    /// deep shade of the cover's colour. Off, they keep the theme's plain pages. On by default.</summary>
+    public bool MobileArtworkPageColors { get; set; } = true;
+
+    /// <summary>Phone, Settings › Downloads › Download on Wi-Fi Only: the phone fetches songs from the
+    /// computer only on an unmetered network (Wi-Fi), never over mobile data. On by default.</summary>
+    public bool MobileDownloadWifiOnly { get; set; } = true;
+
+    /// <summary>Phone, Settings › Background: the page background. "Off" (the default, and what a
+    /// settings file without the field reads as) is the plain theme colour; "Artwork" a mesh of
+    /// the playing cover's colours; otherwise the id of a Neutral or Colour mesh ("ash", "ember").</summary>
+    public string MobileBackground { get; set; } = "Off";
+
+    /// <summary>Phone, Settings › Background › Slow Motion: the mesh's colours drift gently.
+    /// Off by default; it also stays still while Android's Battery Saver is on.</summary>
+    public bool MobileBackgroundMotion { get; set; }
+
+    /// <summary>Phone, Settings › Background › Strength: how strong the colour wash is, 0.2-1.</summary>
+    public double MobileBackgroundStrength { get; set; } = 0.6;
+
+    /// <summary>Phone scrobbling route: false = through the computer (plays queue for it on sync),
+    /// true = the phone sends plays to Last.fm / ListenBrainz itself. A play goes one way only,
+    /// decided when it is counted.</summary>
+    public bool MobileScrobbleFromPhone { get; set; } = false;
+
+    /// <summary>Phone, From This Phone: send plays to the connected services.</summary>
+    public bool MobileScrobbleSendPlays { get; set; } = true;
+
+    /// <summary>Phone, From This Phone: tell the connected services what is playing now.</summary>
+    public bool MobileScrobbleNowPlaying { get; set; } = true;
+
+    /// <summary>User-defined custom themes selectable from the Themes row.</summary>
+    public List<CustomThemeDefinition> CustomThemes { get; set; } = new();
+
+    /// <summary>Last volume level (0–100).</summary>
+    public int Volume { get; set; } = 75;
+
+    /// <summary>Whether to scan for new/changed music files on startup.</summary>
+    public bool ScanOnStartup { get; set; } = true;
+
+    /// <summary>
+    /// Whether to continuously watch the media folders and update the library in
+    /// near-real-time as files are added/removed/changed (FileSystemWatcher).
+    /// </summary>
+    public bool WatchFoldersEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Inbox for new music (Discord request, MusicBee's Inbox): songs a scan or the folder
+    /// watcher finds for the first time in a music folder that already holds songs wait in
+    /// the Inbox, out of the library views, until added to the library or deleted. A new
+    /// folder's songs (and a fresh library's first scan) are an import and skip it. Off by
+    /// default; turning it off moves everything waiting into the library.
+    /// </summary>
+    public bool InboxEnabled { get; set; }
+
+    /// <summary>
+    /// Whether album covers may be read from the artwork embedded in each file's
+    /// tags (ID3 APIC / FLAC picture / MP4 covr). Off = folder images only.
+    /// </summary>
+    public bool UseEmbeddedArtwork { get; set; } = true;
+
+    /// <summary>
+    /// Folder/filename template for the auto-organize tool. Tokens:
+    /// {AlbumArtist} {Artist} {Album} {Title} {TrackNo} {DiscNo} {Year} {Genre}.
+    /// </summary>
+    public string OrganizePattern { get; set; } = "{AlbumArtist}/{Album}/{TrackNo} {Title}";
+
+    /// <summary>Destination root for organized files. Empty = first media folder.</summary>
+    public string OrganizeTargetRoot { get; set; } = string.Empty;
+
+    /// <summary>When true, the in-app updater also offers GitHub pre-releases. Off = stable channel only.</summary>
+    public bool IncludePrereleaseUpdates { get; set; } = false;
+
+    /// <summary>Opt-in: download new releases in the background and install them at the next launch
+    /// (Windows Inno install, Linux AppImage/tarball; macOS downloads only). Off = manual Update button.</summary>
+    public bool AutoInstallUpdates { get; set; } = false;
+
+    /// <summary>Shows the Developer section (version manager + debug logs) in Settings → About.</summary>
+    public bool DeveloperMode { get; set; } = false;
+
+    /// <summary>Default page index (0=Home, 1=Songs, 2=Albums, 3=Artists, 4=Genres, 5=Playlists, 6=Favorites).</summary>
+    public int DefaultPageIndex { get; set; } = 0;
+
+    /// <summary>Configured remote/local source connections.</summary>
+    public List<SourceConnection> SourceConnections { get; set; } = new();
+
+    /// <summary>Window dimensions and position for restore on next launch.</summary>
+    public double WindowWidth { get; set; } = 1280;
+    public double WindowHeight { get; set; } = 800;
+    public double WindowX { get; set; } = 100;
+    public double WindowY { get; set; } = 100;
+    public string MainWindowState { get; set; } = "Normal";
+
+    /// <summary>
+    /// Mini player size (DIPs) and screen position (pixels), reapplied every time it is
+    /// reopened so it comes back where it was left instead of the top-right corner.
+    /// Null until the mini player has been opened once — that's what selects the
+    /// first-run placement, so these stay nullable rather than carrying magic defaults.
+    /// </summary>
+    public double? MiniPlayerWidth { get; set; }
+    public double? MiniPlayerHeight { get; set; }
+    public double? MiniPlayerX { get; set; }
+    public double? MiniPlayerY { get; set; }
+
+    // ── Playback settings ──
+
+    /// <summary>Whether crossfade between tracks is enabled.</summary>
+    public bool CrossfadeEnabled { get; set; }
+
+    /// <summary>Crossfade duration in seconds (1–12, fractional allowed).</summary>
+    public double CrossfadeDuration { get; set; } = 6;
+
+    /// <summary>GitHub #73: fade the level out before a pause lands and back in after a
+    /// resume (off = the hard cut), over <see cref="PlayPauseFadeMs"/> milliseconds. On for new
+    /// installs (2026-10-18); a settings.json saved before the toggle existed keeps it off
+    /// (<see cref="OnDeserializing"/>).</summary>
+    public bool PlayPauseFadeEnabled { get; set; } = true;
+
+    public int PlayPauseFadeMs { get; set; } = 300;
+
+    /// <summary>GitHub #101: how much of a song (percent) has to be heard before the play
+    /// counts (play count, Last Played, the play log). 0 = as soon as it starts, the old
+    /// behaviour; otherwise one of <see cref="PlayCountThresholdChoices"/>.</summary>
+    public int PlayCountThresholdPercent { get; set; }
+
+    /// <summary>The Settings picker's choices for <see cref="PlayCountThresholdPercent"/>.</summary>
+    public static IReadOnlyList<int> PlayCountThresholdChoices { get; } = new[] { 0, 25, 50, 75, 90 };
+
+    /// <summary>The nearest of <see cref="PlayCountThresholdChoices"/>: a hand-edited value snaps.</summary>
+    public static int SnapPlayCountThreshold(int percent) =>
+        PlayCountThresholdChoices.MinBy(c => Math.Abs((long)c - percent));
+
+    /// <summary>Master toggle for Apple-style song transitions (drives AutoMixTransitionMode).</summary>
+    public bool SongTransitionsEnabled { get; set; }
+    /// <summary>Transition style when enabled: "AutoMix" (key/tempo aware) or "Crossfade" (fixed duration).</summary>
+    public string TransitionStyle { get; set; } = "Crossfade";
+    /// <summary>AutoMix strength: "Subtle", "Balanced", or "Extended".</summary>
+    public string SongTransitionStrength { get; set; } = "Balanced";
+    /// <summary>Whether AutoMix beat-matches when BPM/key metadata is available.</summary>
+    public bool SongTransitionBeatMatch { get; set; } = true;
+
+    /// <summary>Whether loudness normalization (Sound Check) is enabled.</summary>
+    public bool SoundCheckEnabled { get; set; }
+
+    /// <summary>Windows only: WASAPI exclusive-mode output for bit-perfect playback.</summary>
+    public bool ExclusiveAudioEnabled { get; set; }
+
+    /// <summary>Windows only: MMDevice endpoint id Undertone plays to (Settings → Output →
+    /// Output Device). Empty = follow the Windows default. Exclusive Mode opens this
+    /// endpoint directly, so bit-perfect output follows the in-app selection instead of
+    /// breaking when the system default changes.</summary>
+    public string AudioOutputDeviceId { get; set; } = "";
+
+    /// <summary>Gapless playback: natural track changes hand off to a pre-decoded
+    /// standby player instead of an audible stop/start. On by default.</summary>
+    public bool GaplessPlaybackEnabled { get; set; } = true;
+
+    /// <summary>Autoplay: when the queue is exhausted by a natural track end, playback
+    /// continues with similar tracks from the library (same genre as the just-ended
+    /// track, then same primary artist). Off by default — continuing playback the
+    /// user didn't queue is opt-in.</summary>
+    public bool AutoplayEnabled { get; set; }
+
+    /// <summary>Keep played songs in the queue (GitHub #124): the queue lists what played above
+    /// Now Playing and the last song stays loaded when the queue ends. Off by default.</summary>
+    public bool KeepPlayedInQueue { get; set; }
+
+    /// <summary>Missing Songs (GitHub #154): a queued song whose file is gone is taken off the
+    /// queue when playback passes over it; off (the default) keeps it there, marked missing.</summary>
+    public bool RemoveMissingFromQueue { get; set; }
+
+    /// <summary>Queue panel width in DIPs (GitHub #147): its left edge drags, Settings ▸ Player ▸
+    /// Queue has a slider. See <see cref="QueuePanelMetrics"/> for the range.</summary>
+    public double QueuePanelWidth { get; set; } = QueuePanelMetrics.Default;
+
+    /// <summary>What Queue panel rows show (GitHub #147), as <see cref="QueueRowField"/> names:
+    /// line 1 and line 2 each a field plus an optional extra one ("None"), and the right slot as a
+    /// <see cref="QueueRowSide"/> name. Read through <see cref="QueueRowLayout.FromSettings"/>;
+    /// the defaults are the rows from before the setting existed.</summary>
+    public string QueueRowLine1 { get; set; } = nameof(QueueRowField.Title);
+    public string QueueRowLine1Extra { get; set; } = nameof(QueueRowField.None);
+    public string QueueRowLine2 { get; set; } = nameof(QueueRowField.Artist);
+    public string QueueRowLine2Extra { get; set; } = nameof(QueueRowField.None);
+    public string QueueRowRight { get; set; } = nameof(QueueRowSide.Position);
+
+    /// <summary>Whether long playback-bar track titles should scroll while playing.</summary>
+    public bool TrackTitleMarqueeEnabled { get; set; } = true;
+
+    /// <summary>Whether long playback-bar artist names should scroll while playing.</summary>
+    public bool ArtistMarqueeEnabled { get; set; } = true;
+
+    /// <summary>Whether long track titles in the CoverFlow view should scroll.</summary>
+    public bool CoverFlowMarqueeEnabled { get; set; } = true;
+
+    /// <summary>Whether long artist names in the CoverFlow view should scroll.</summary>
+    public bool CoverFlowArtistMarqueeEnabled { get; set; } = true;
+
+    /// <summary>Whether long album titles in the CoverFlow view should scroll.</summary>
+    public bool CoverFlowAlbumMarqueeEnabled { get; set; } = true;
+
+    /// <summary>Whether animated cover art (looping MP4/WebM) plays for the currently playing track.</summary>
+    public bool EnableAnimatedCovers { get; set; } = true;
+
+    /// <summary>Album pages take their background colour from the cover's edge colour,
+    /// Apple-Music style, with the page text flipping dark on light covers. Ships on
+    /// (2026-10-18; a settings.json saved before the toggle existed keeps it off, see
+    /// <see cref="OnDeserializing"/>); the Appearance toggle turns it off for users who want
+    /// the flat theme page.</summary>
+    public bool AlbumPageTintEnabled { get; set; } = true;
+
+    /// <summary>Fresh-install value of <see cref="AlbumPageTintStrength"/>: the full cover
+    /// colour, the look the album page had before the slider existed. Double-tapping the
+    /// slider in Settings snaps back to it.</summary>
+    public const int AlbumPageTintStrengthDefault = 100;
+
+    /// <summary>How strongly a tinted album page takes on its cover colour, in percent
+    /// (0–100). Below 100 the cover colour is blended into the theme's own page colour, so
+    /// the page reads calmer and its buttons stand further apart from it (Discord ask).</summary>
+    public int AlbumPageTintStrength { get; set; } = AlbumPageTintStrengthDefault;
+
+    /// <summary>Fresh-install value of <see cref="AlbumPageTintWholePage"/>.</summary>
+    public const bool AlbumPageTintWholePageDefault = true;
+
+    /// <summary>A tinted album page carries the cover colour under Other Versions / More By
+    /// too, with no viewport-tall padding between the tracks and those rows (Discord
+    /// "Album Page Redesign" mockup). Off keeps the tint on the album block alone.</summary>
+    public bool AlbumPageTintWholePage { get; set; } = AlbumPageTintWholePageDefault;
+
+    /// <summary>While a tinted album page is open, the window around the sidebar and
+    /// player islands takes the same colour (Discord 1v1ctus). Off by default.</summary>
+    public bool AlbumPageTintWholeWindow { get; set; }
+
+    /// <summary>Minimizing the main window hides it to the system tray.</summary>
+    public bool MinimizeToTray { get; set; }
+
+    /// <summary>Closing the main window hides it to the system tray instead of exiting.</summary>
+    public bool CloseToTray { get; set; }
+
+    /// <summary>When launched at login, start hidden in the system tray instead of
+    /// showing the window. Only honored when launch-at-startup is on and the tray
+    /// initializes successfully (so the app can never start completely invisible).</summary>
+    public bool StartMinimizedToTray { get; set; }
+
+    /// <summary>Restore the last-played track (paused, where you left off) into the
+    /// playbar when Undertone reopens.</summary>
+    public bool RestoreLastTrackOnStartup { get; set; } = true;
+
+    /// <summary>Whether the local-network web remote is enabled (off by default).</summary>
+    public bool WebRemoteEnabled { get; set; }
+
+    /// <summary>TCP port for the web remote.</summary>
+    public int WebRemotePort { get; set; } = 9420;
+
+    /// <summary>Local automation API on 127.0.0.1 (/api/v1, docs/LOCAL-API.md). Off by default.
+    /// The token lives in local-api.json, never here.</summary>
+    public bool LocalApiEnabled { get; set; }
+
+    /// <summary>Preferred TCP port for the Local API (a free one is used when it's taken;
+    /// local-api.json records the real one).</summary>
+    public int LocalApiPort { get; set; } = 9421;
+
+    /// <summary>Built-in Undertone server (OpenSubsonic API over HTTPS for phones and other clients). Off by default.</summary>
+    public bool UndertoneServerEnabled { get; set; }
+
+    /// <summary>Port the Undertone server listens on.</summary>
+    public int UndertoneServerPort { get; set; } = 4747;
+
+    // ── Account & Sync ──
+
+    /// <summary>Sync favorites / ratings / play counts / playlists with devices that log into the Undertone server.</summary>
+    public bool SyncEnabled { get; set; }
+
+    /// <summary>The user switched sync off: letting phones connect again later leaves it off.</summary>
+    public bool SyncTurnedOffByUser { get; set; }
+
+    /// <summary>How this computer shows up in other devices' sync status. Empty = machine name.</summary>
+    public string SyncDeviceName { get; set; } = string.Empty;
+
+    /// <summary>Stable id of this installation in the sync ledger (created on first use).</summary>
+    public string SyncDeviceId { get; set; } = string.Empty;
+
+    // ── Multi-channel upmix (Settings → Audio, Windows gapless engine) ──
+
+    /// <summary>"Off" | "Duplicate" | "Surround" — see <see cref="Services.UpmixMode"/>.</summary>
+    public string UpmixMode { get; set; } = "Off";
+
+    /// <summary>Settings → Audio: 5.1/7.1 files play binaurally (VLC's headphone mode) instead of
+    /// a plain stereo downmix. Stereo and mono pass untouched. Read at launch (VLC takes it as an
+    /// instance option), so a change applies the next time Undertone starts.</summary>
+    public bool HeadphoneSurround { get; set; }
+
+    /// <summary>Settings → Audio: Mono Audio, left and right averaged onto both channels (hearing
+    /// in one ear, a single earbud). Bypassed in Exclusive Mode.</summary>
+    public bool MonoAudio { get; set; }
+
+    /// <summary>Settings → Audio: left/right balance, -100 (left only) … 0 (centre) … +100 (right
+    /// only). Linear balance law, see ChannelMixProvider. Bypassed in Exclusive Mode.</summary>
+    public int AudioBalance { get; set; }
+
+    /// <summary>Settings → Player: the sleep timer fades playback out over its last N seconds
+    /// (and "stop after current track" over the end of the track). 0 = off; 10, 30 or 60.
+    /// 30 on a new install; a settings file from before the setting reads as off
+    /// (<see cref="OnDeserializing"/>).</summary>
+    public int SleepTimerFadeSeconds { get; set; } = 30;
+
+    /// <summary>The Fade Out choices; anything else snaps to the nearest.</summary>
+    public static int SnapSleepTimerFadeSeconds(int seconds)
+    {
+        int[] options = [0, 10, 30, 60];
+        var best = options[0];
+        foreach (var o in options)
+            if (Math.Abs(o - seconds) < Math.Abs(best - seconds)) best = o;
+        return best;
+    }
+
+    // ── YouTube downloads ──
+
+    /// <summary>Legacy (unused since 10-29): where "Add from YouTube" saved downloads before it became
+    /// the official plugin, which keeps its own folder choice. Kept so older settings.json files
+    /// load and round-trip unchanged.</summary>
+    public string YouTubeDownloadFolder { get; set; } = string.Empty;
+
+    /// <summary>Override path to yt-dlp for the lyrics background videos. Empty = the copy Undertone
+    /// installs, then PATH. No longer shown in Settings (10-08); the "Add from YouTube" plugin has
+    /// its own setting.</summary>
+    public string YtDlpPath { get; set; } = string.Empty;
+
+    // ── Lyrics Studio ──
+
+    /// <summary>Whisper model. Only Medium is offered (09-29); older values (Tiny, Base, Small) are read as Medium.</summary>
+    public string LyricsStudioModel { get; set; } = "Medium";
+
+    /// <summary>ISO 639-1 language for the speech model, or "auto".</summary>
+    public string LyricsStudioLanguage { get; set; } = "auto";
+
+    /// <summary>Write word-level (ELRC) timings; false = line-level LRC.</summary>
+    public bool LyricsStudioWordTimings { get; set; } = true;
+
+    /// <summary>Skip songs that already carry the format being written (ELRC vs LRC are distinct).</summary>
+    public bool LyricsStudioSkipAlreadyTimed { get; set; } = true;
+
+    /// <summary>Also embed the plain lyrics in the audio file's tags when saving.</summary>
+    public bool LyricsStudioEmbedTags { get; set; }
+
+    /// <summary>Songs with no lyrics at all: look the plain text up online (LRCLIB) before falling back to transcription.</summary>
+    public bool LyricsStudioOnlineLyrics { get; set; } = true;
+
+    /// <summary>Also save the timings as a .ttml sidecar, for players that read TTML but not ELRC (Discord: Light Cone).</summary>
+    public bool LyricsStudioSaveTtml { get; set; }
+
+    /// <summary>The Studio's live preview pane beside the review is open (10-14).</summary>
+    public bool LyricsStudioLivePreview { get; set; } = true;
+
+    /// <summary>Experimental: run the speech model on the graphics card (Vulkan) where this build carries it. Off by default.</summary>
+    public bool LyricsStudioUseGpu { get; set; }
+
+    // ── Songs page optional columns ──
+    // All six were the original set, chosen from the column-header dropdown.
+    public bool ShowArtworkColumn { get; set; } = true;
+    public bool ShowGenreColumn { get; set; } = true;
+    public bool ShowRatingColumn { get; set; } = true;
+    public bool ShowBpmColumn { get; set; }
+    public bool ShowBitrateColumn { get; set; }
+    public bool ShowSampleRateColumn { get; set; }
+
+    // Columns that used to be unconditionally visible. They became hideable when the
+    // chooser moved into View Options — a list of five permanently-checked entries
+    // reads as broken. Default true so existing libraries look unchanged on upgrade.
+    public bool ShowTimeColumn { get; set; } = true;
+    public bool ShowArtistColumn { get; set; } = true;
+    public bool ShowAlbumColumn { get; set; } = true;
+    public bool ShowFavoritesColumn { get; set; } = true;
+    public bool ShowPlaysColumn { get; set; } = true;
+
+    // GitHub #151: more fields to pick from the header menu / View Options. Off by default.
+    public bool ShowYearColumn { get; set; }
+    public bool ShowAlbumArtistColumn { get; set; }
+    public bool ShowComposerColumn { get; set; }
+    public bool ShowFormatColumn { get; set; }
+    public bool ShowDateAddedColumn { get; set; }
+    // The file's REPLAYGAIN_TRACK_GAIN (Track.ReplayGainTrackDb). Off by default.
+    public bool ShowReplayGainColumn { get; set; }
+
+    /// <summary>Songs list column order (GitHub #151): column keys, comma-separated; empty =
+    /// the default order. Read through <c>ColumnLayout.Load</c>, which drops unknown keys.</summary>
+    public string SongsColumnOrder { get; set; } = string.Empty;
+
+    /// <summary>Songs list widths the user dragged (GitHub #151): "Key=width" pairs,
+    /// comma-separated. Columns not listed keep their automatic width.</summary>
+    public string SongsColumnWidths { get; set; } = string.Empty;
+
+    // ── Songs page sort / filter ──
+    // Previously view-model-only, so every launch reset the list to Date Added ▼
+    // while the column choices beside them persisted. Defaults reproduce that
+    // former startup state exactly.
+
+    /// <summary>Active Songs sort field, matching the column keys understood by
+    /// <c>LibrarySongsViewModel.BuildFilteredAndSortedTracks</c>.</summary>
+    public string SongsSortColumn { get; set; } = "Date Added";
+
+    /// <summary>Songs sort direction. False (descending) puts newest additions first.</summary>
+    public bool SongsSortAscending { get; set; }
+
+    /// <summary>Whether the Songs list is filtered to favorites only.</summary>
+    public bool SongsShowOnlyFavorites { get; set; }
+
+    // ── Albums grid sort ──
+
+    /// <summary>Albums grid sort: "default", "title", "dateadded", "mostplayed",
+    /// "albumartist" or "year".</summary>
+    public string AlbumSortMode { get; set; } = "default";
+
+    /// <summary>Albums page layout (GitHub #149): "grid" (tiles, the default) or "carousel"
+    /// (one album at a time, Cover Flow style).</summary>
+    public string AlbumViewMode { get; set; } = "grid";
+
+    /// <summary>Artist page Albums tab layout (GitHub #149): "grid" or "carousel". One
+    /// setting for every artist, like the release sort.</summary>
+    public string ArtistAlbumsViewMode { get; set; } = "grid";
+
+    /// <summary>How albums are dressed in the album carousel: "Cover" (default), "JewelCase",
+    /// "Vinyl" or "Cassette" (<see cref="AlbumCarouselStyles.Parse"/>). Shared by both carousels.</summary>
+    public string AlbumCarouselStyle { get; set; } = AlbumCarouselStyles.DefaultSetting;
+
+    /// <summary>Built-in feature switch (Settings › Plugins › Built-in Features): the album
+    /// carousel and its cases. Off shows the grid on the Albums page and the artist page and
+    /// hides the way to the carousel; <see cref="AlbumViewMode"/> is kept for when it returns.</summary>
+    public bool AlbumCarouselEnabled { get; set; } = true;
+
+    /// <summary>Artists grid sort: "name", "songs" (track count), "albums" (album count),
+    /// "time" (total length) or "genre".</summary>
+    public string ArtistSortMode { get; set; } = "name";
+
+    /// <summary>Artists grid sort direction.</summary>
+    public bool ArtistSortAscending { get; set; } = true;
+
+    /// <summary>Artists page layout: "grid" (portrait tiles, the default) or "list" (rows
+    /// with Albums / Songs / Time / Genre columns, like the Songs page).</summary>
+    public string ArtistViewMode { get; set; } = "grid";
+
+    /// <summary>Artists list view columns (GitHub #151): order, dragged widths and hidden
+    /// columns, in the same comma-separated forms as <see cref="SongsColumnOrder"/>.</summary>
+    public string ArtistListColumnOrder { get; set; } = string.Empty;
+    public string ArtistListColumnWidths { get; set; } = string.Empty;
+    public string ArtistListHiddenColumns { get; set; } = string.Empty;
+
+    /// <summary>Artist page Albums / Singles &amp; EPs tab order (GitHub #100): "newest"
+    /// (release date), "oldest" (undated releases last) or "name" (A–Z). One setting for
+    /// both tabs and every artist.</summary>
+    public string ArtistReleaseSortMode { get; set; } = "newest";
+
+    /// <summary>Whether the artist page Overview's "Similar Artists" section shows its
+    /// tiles (Luwi, Discord 10-04). One setting for every artist; defaults to expanded,
+    /// the pre-feature layout.</summary>
+    public bool ArtistSimilarExpanded { get; set; } = true;
+
+    /// <summary>Album page "Other Versions" / "More By {Artist}" fold state, one setting each
+    /// for every album (10-05); default expanded, the pre-feature layout.</summary>
+    public bool AlbumOtherVersionsExpanded { get; set; } = true;
+    public bool AlbumMoreByExpanded { get; set; } = true;
+
+    /// <summary>Folders track-pane sort (GitHub #89): "default" (folder order),
+    /// "modified-newest" or "modified-oldest" (file last-modified time).</summary>
+    public string FoldersSortMode { get; set; } = "default";
+
+    /// <summary>Albums sort direction. Only meaningful outside "default"; each mode
+    /// starts in its natural direction (see LibraryAlbumsViewModel.IsDescendingByDefault).</summary>
+    public bool AlbumSortAscending { get; set; } = true;
+
+    /// <summary>GitHub #106: under the "albumartist" sort, list each artist's releases
+    /// newest first instead of chronologically.</summary>
+    public bool AlbumSortNewestFirst { get; set; }
+
+    /// <summary>Albums grid release Type filter: "album", "single", "ep", "live",
+    /// "compilation" (GitHub #122), "other", or ""
+    /// for All. Unknown values load as All.</summary>
+    public string AlbumReleaseTypeFilter { get; set; } = "";
+
+    // ── Home section collapse state ──
+    // Every Home section can be folded away to its header, so the page can be cut down
+    // to only the rows the user currently cares about. All default to expanded — the
+    // pre-feature layout — so an existing install sees no change until it collapses one.
+
+    /// <summary>Whether Home's "Most Listened To" section shows its rows.</summary>
+    public bool HomeTopSongsExpanded { get; set; } = true;
+
+    /// <summary>Whether Home's "Top Artists" section shows its rows.</summary>
+    public bool HomeTopArtistsExpanded { get; set; } = true;
+
+    /// <summary>Whether Home's "Recently Played" section shows its rows.</summary>
+    public bool HomeRecentlyPlayedExpanded { get; set; } = true;
+
+    /// <summary>Whether Home's time-of-day rotation section shows its rows.</summary>
+    public bool HomeTimeRotationExpanded { get; set; } = true;
+
+    /// <summary>Whether Home's "Heavy rotation" section shows its rows.</summary>
+    public bool HomeHeavyRotationExpanded { get; set; } = true;
+
+    /// <summary>Whether Home's "Recently rediscovered" section shows its rows.</summary>
+    public bool HomeRediscoveredExpanded { get; set; } = true;
+
+    /// <summary>Whether Home's "Last Played" section shows its rows.</summary>
+    public bool HomeLastPlayedExpanded { get; set; } = true;
+
+    /// <summary>Settings toggle (Appearance): show the "Heavy rotation" row on Home at all.</summary>
+    public bool HomeShowHeavyRotation { get; set; } = true;
+
+    // GitHub #159: how many albums Home's Albums (recently played) and New in Library rows
+    // show, and which of the two comes first. Defaults keep the Albums row as it was (six).
+
+    /// <summary>Albums shown in Home's recently played Albums row; one of <see cref="HomeAlbumCountChoices"/>.</summary>
+    public int HomeRecentAlbumsCount { get; set; } = 6;
+
+    /// <summary>Albums shown in Home's New in Library row (newest added first); one of <see cref="HomeAlbumCountChoices"/>.</summary>
+    public int HomeNewAlbumsCount { get; set; } = 10;
+
+    /// <summary>Whether Home's "New in Library" section shows its rows.</summary>
+    public bool HomeNewAlbumsExpanded { get; set; } = true;
+
+    /// <summary>Show New in Library above the recently played Albums row (default: below it).</summary>
+    public bool HomeNewAlbumsFirst { get; set; }
+
+    /// <summary>The counts the Home album rows offer (Settings picker and the row's own pill).</summary>
+    public static IReadOnlyList<int> HomeAlbumCountChoices { get; } = new[] { 6, 10, 20, 50, 100 };
+
+    /// <summary>The nearest of <see cref="HomeAlbumCountChoices"/>: a hand-edited value snaps.</summary>
+    public static int SnapHomeAlbumCount(int count) =>
+        HomeAlbumCountChoices.MinBy(c => Math.Abs((long)c - count));
+
+    /// <summary>Opacity of the playback bar's glass fill (0 = fully transparent, 1 = solid).
+    /// Controls only the background, not the bar's text/controls. Default 0.4 matches the
+    /// original #66 alpha glass look. Shown as "Glass Opacity" (GitHub #104): with Liquid Glass
+    /// on it also tints the queue drawer and the island's menus. Key kept so looks carry over.</summary>
+    public double PlaybackBarBackgroundOpacity { get; set; } = 0.4;
+
+    /// <summary>Background Blur (owner 10-08): how strongly the app behind a pop-up (the
+    /// metadata editor) and the Settings sheet is blurred, 0 = off (dim only) to 1 = the
+    /// strongest, shown as a percent like the opacity sliders. Default 10% (owner 10-08), a
+    /// light blur. (The first build stored a 0–10 step as "BackgroundBlur"; a new
+    /// key so that value is never read as a fraction.)</summary>
+    public double BackgroundBlurAmount { get; set; } = BackgroundBlurAmountDefault;
+    public const double BackgroundBlurAmountDefault = 0.1;
+    /// <summary>Below this the slider reads Off and no blur is drawn (the thumb at the far left).</summary>
+    public const double BackgroundBlurOffBelow = 0.005;
+
+    /// <summary>Interface Size (GitHub #145): the whole UI drawn at this percent of normal, on
+    /// every platform (the OS text-size settings never reach the app). One of
+    /// <see cref="UiScaleChoices"/>; 100 = unchanged.</summary>
+    public int UiScalePercent { get; set; } = 100;
+
+    /// <summary>The Settings picker's choices for <see cref="UiScalePercent"/>.</summary>
+    public static IReadOnlyList<int> UiScaleChoices { get; } = new[] { 90, 100, 110, 125, 150, 175, 200 };
+
+    /// <summary>The nearest of <see cref="UiScaleChoices"/>: a hand-edited value snaps.</summary>
+    public static int SnapUiScale(int percent) =>
+        UiScaleChoices.MinBy(c => Math.Abs((long)c - percent));
+
+    /// <summary>Opacity of the white track box (song info card) inside the playback bar
+    /// (0 = no box, 1 = solid white). Default 0.07 is the reference LCD's soft lift.</summary>
+    public double PlaybackBarTrackBoxOpacity { get; set; } = 0.07;
+
+    /// <summary>Opacity of the mini player card's glass fill (0 = fully transparent,
+    /// 1 = solid). Background only — the artwork wash, sheen and contents are unaffected.
+    /// Default 0.35 keeps the card distinctly see-through (iOS Live-Activity glass);
+    /// the artwork wash and scrim layers carry text legibility over bright wallpapers.</summary>
+    public double MiniPlayerBackgroundOpacity { get; set; } = 0.35;
+
+    /// <summary>Settings toggle (Mini Player, Windows only, GitHub #76): the mini player asks
+    /// the OS for a blur-behind backdrop, so the desktop behind the card reads frosted.
+    /// Off by default.</summary>
+    public bool MiniPlayerFrostedBackground { get; set; } = false;
+
+    /// <summary>The mini player's pin (Windows only): it survives Show desktop / Minimize all
+    /// and re-asserts always-on-top when another window (e.g. a borderless game) takes the
+    /// foreground. Written by the mini player itself, like its placement. Off by default.</summary>
+    public bool MiniPlayerPinned { get; set; } = false;
+
+    /// <summary>User-chosen width of the floating playback bar island, set by dragging its
+    /// edges (double-click a grip resets). 536 is the full layout (626 with the old long
+    /// track info, 590 before the favorite heart); 340 is the smallest proven layout (the
+    /// lyrics-page compact pill). The window clamps the upper end live, so only a sanity
+    /// ceiling is stored.</summary>
+    public double PlaybackBarWidth { get; set; } = 536;
+
+    /// <summary>Album cover sizing mode for the Albums/Favorites grids. True (default) keeps
+    /// the classic layout — five covers per row, covers scale with the window — so existing
+    /// installs look unchanged. False derives the column count from
+    /// <see cref="AlbumTileTargetSize"/> instead, so covers stay near the chosen size on any
+    /// window width (the ultrawide fix).</summary>
+    public bool AlbumTileSizeAuto { get; set; } = true;
+
+    /// <summary>Target artwork edge (px) for album covers when <see cref="AlbumTileSizeAuto"/>
+    /// is off. The grid picks however many columns land nearest this size and stretches tiles
+    /// to fill the row. 220 mirrors the classic five-per-row look at a typical window width.</summary>
+    public double AlbumTileTargetSize { get; set; } = 220;
+
+    /// <summary>How the large now-playing cover on the Lyrics page is dressed: "Cover"
+    /// (default, the plain square), "CompactDisc", "Vinyl" or "Cassette" — see
+    /// <see cref="ArtworkMedium"/>. Stored as a string like the other style pickers so an
+    /// unknown value from a newer build falls back to the cover instead of failing to load.</summary>
+    public string NowPlayingArtworkStyle { get; set; } = ArtworkMediums.DefaultSetting;
+
+    /// <summary>Mini player design: "Classic" (the size-morphing card), "Pill" or "Sleeve";
+    /// see <see cref="MiniPlayerStyle"/>. Stored by name like the other style pickers.</summary>
+    public string MiniPlayerStyle { get; set; } = MiniPlayerStyles.DefaultSetting;
+
+    /// <summary>Built-in feature switch: the mini player. Off closes it, hides its island
+    /// button and makes the album-art click and shortcut do nothing.</summary>
+    public bool MiniPlayerEnabled { get; set; } = true;
+
+    /// <summary>Layout of the Albums → Cover Flow page: "Carousel" (default, the classic row),
+    /// "Cascade" (tilted diagonal path with the track text beside it) or "Collage" (mosaic) —
+    /// see <see cref="CoverFlowLayout"/>. Also stepped by the top-bar pill segment.</summary>
+    public string CoverFlowLayout { get; set; } = CoverFlowLayouts.DefaultSetting;
+
+    /// <summary>Player island extras (Settings → Appearance → Player Island Buttons) for
+    /// podcast / audiobook listening: skip back/forward by <see cref="PlaybackBarSkipSeconds"/>,
+    /// a playback-speed button and a sleep-timer button. All off by default so the bar stays
+    /// the music-first transport.</summary>
+    public bool PlaybackBarShowSkipButtons { get; set; }
+
+    /// <summary>Seconds the island's skip buttons jump: 10, 15 or 30.</summary>
+    public int PlaybackBarSkipSeconds { get; set; } = 15;
+
+    public bool PlaybackBarShowPlaybackSpeed { get; set; }
+
+    public bool PlaybackBarShowSleepTimer { get; set; }
+
+    /// <summary>GitHub #59: a shuffle button on the island, after Repeat. Off by default —
+    /// shuffle already lives in the Queue panel header.</summary>
+    public bool PlaybackBarShowShuffle { get; set; }
+
+    /// <summary>GitHub #94: an EQ on/off button on the island, after Shuffle. Off by
+    /// default like the other extras (the switch also lives in Settings → Audio).</summary>
+    public bool PlaybackBarShowEqualizer { get; set; }
+
+    /// <summary>Repeat (after Next) and the favorite heart (right cluster) on the island.
+    /// Off by default since the track-box layout: the stock bar mirrors the Apple-Music
+    /// reference — transport, track box, lyrics / queue / volume.</summary>
+    public bool PlaybackBarShowRepeat { get; set; }
+
+    public bool PlaybackBarShowFavorite { get; set; }
+
+    /// <summary>GitHub #80: the mini player button in the island's right cluster. On by
+    /// default so the mini player is discoverable; like the heart it adds 36px when shown.</summary>
+    public bool PlaybackBarShowMiniPlayer { get; set; } = true;
+
+    /// <summary>GitHub #92: the "Nothing playing · Queue" pill that stands in for the island
+    /// while nothing is loaded. Off by default (owner, 2026-09-24).</summary>
+    public bool PlaybackBarShowIdlePill { get; set; }
+
+    /// <summary>Discord (Luwi, 2026-09-21): elapsed / remaining time of the current title in
+    /// the island's track box, stacked beside the title. Off by default — the stock LCD
+    /// carries no time labels.</summary>
+    public bool PlaybackBarShowTime { get; set; }
+
+    /// <summary>GitHub #93: the island and mini player seek bars draw the track's waveform
+    /// (decoded in the background with ffmpeg, cached under cache/waveforms). Off by
+    /// default — when off nothing is decoded and the plain seek line stays.</summary>
+    public bool WaveformSeekBarEnabled { get; set; }
+
+    /// <summary>Whether tracks marked explicit (ITUNESADVISORY=1) may play automatically.
+    /// On by default. When off they are skipped on queue advance, excluded from shuffle,
+    /// Autoplay and Radio, and pruned from the queue — but a track the user plays
+    /// directly still plays (this is a playback filter, not a library filter).</summary>
+    public bool AllowExplicitContent { get; set; } = true;
+
+    /// <summary>Whether the sidebar expands on hover (with its slide animation). When false the
+    /// sidebar stays in the icon-only rail and never expands. Off by default: the rail should
+    /// not move unless the user asks it to.</summary>
+    public bool SidebarHoverExpand { get; set; } = false;
+
+    /// <summary>Keeps the sidebar pinned open at its full width at all times, so the labels
+    /// stay readable without hovering. Overrides <see cref="SidebarHoverExpand"/> while on.
+    /// Off by default to preserve the compact icon rail.</summary>
+    public bool SidebarAlwaysExpanded { get; set; } = false;
+
+    /// <summary>Executable the "Open in …" track context-menu item launches with the audio
+    /// file (e.g. an audio editor or analyzer). Empty by default: on Windows the item falls
+    /// back to the native "Open with" picker; elsewhere it is hidden until a path is set.</summary>
+    public string ExternalOpenAppPath { get; set; } = "";
+
+    /// <summary>Liquid Glass appearance: the main window renders on a translucent
+    /// acrylic/blur backdrop (Apple Music-style frosted glass) and the structural
+    /// surfaces (window background, sidebar, content panels) switch to translucent
+    /// tints so the blur shows through. Main window only — dialogs keep their opaque
+    /// surfaces. Off by default; when off, rendering is identical to before.</summary>
+    public bool LiquidGlassEnabled { get; set; } = false;
+
+    /// <summary>When true, the album grids collapse multiple editions/issues of the same release
+    /// (same album-artist + normalized base title) into a single representative tile. Hidden
+    /// editions remain reachable via the album page's "Other Versions" section. Default off.</summary>
+    public bool CollapseAlbumEditions { get; set; } = false;
+
+    /// <summary>Windows only (GitHub #53): paint the current song's progress on the app's
+    /// taskbar button. Off by default — it is a visible change to the taskbar the user
+    /// should opt into.</summary>
+    public bool TaskbarProgressEnabled { get; set; } = false;
+
+    /// <summary>Windows only: Previous / Play-Pause / Forward / Favorite buttons under the
+    /// taskbar thumbnail (the preview when you hover the app's taskbar icon). On by default,
+    /// as they always were before the toggle existed.</summary>
+    public bool TaskbarMediaControlsEnabled { get; set; } = true;
+
+    /// <summary>When true (default), "feat./ft." credits found in track titles — or file names,
+    /// which stand in for the title on untagged files — are merged into the artist credit at
+    /// scan time so collaborations show the full credit. Off: artist tags are used exactly as
+    /// written. Flipping the toggle re-applies to already-indexed tracks right away
+    /// (LibraryService.ApplyMergeFeaturedFromTitlesAsync).</summary>
+    public bool MergeFeaturedFromTitles { get; set; } = true;
+
+    /// <summary>Which tag the Artists section groups by (GitHub #51): "Artist" (default, the
+    /// first credited track artist) or "AlbumArtist". Parsed by name via ArtistGroupModes.Parse.</summary>
+    public string ArtistGroupMode { get; set; } = ArtistGroupModes.DefaultSetting;
+
+    /// <summary>Separators that split a multi-artist tag into credited names ("/", ",", "feat.").
+    /// Applies to both artist and album-artist tags; see ArtistCredit.DefaultSeparators.</summary>
+    public List<string> ArtistTagSeparators { get; set; } = ArtistCredit.DefaultSeparators.ToList();
+
+    /// <summary>"Keep these names together": artist names never cut apart by the separators
+    /// ("Tyler, The Creator", "AC/DC"). Settings saved before the list existed load the
+    /// built-ins (ArtistCredit.DefaultProtectedNames); an emptied list stays empty.</summary>
+    public List<string> ArtistProtectedNames { get; set; } = ArtistCredit.DefaultProtectedNames.ToList();
+
+    /// <summary>The join (ArtistCredit.JoinText) the indexed artist credits were read with —
+    /// multi-value artist tags are joined with it. Every build before GitHub #117 used ", ".
+    /// When the active join differs, LibraryService.ApplyArtistCreditJoinAsync re-reads the
+    /// affected tracks' tags so their credits split under the current separators.</summary>
+    public string ArtistCreditJoin { get; set; } = ", ";
+
+    /// <summary>GitHub #99: the Artists grid's name sort skips a leading word from
+    /// <see cref="ArtistSortIgnoredWords"/> ("The Beatles" sorts under B). On for new installs
+    /// (2026-10-18); a settings.json saved before the toggle existed keeps it off
+    /// (<see cref="OnDeserializing"/>).</summary>
+    public bool IgnoreLeadingWordsInArtistSort { get; set; } = true;
+
+    /// <summary>Leading words skipped while <see cref="IgnoreLeadingWordsInArtistSort"/> is on;
+    /// see ArtistSortWords.SortKey for the matching rule.</summary>
+    public List<string> ArtistSortIgnoredWords { get; set; } = ArtistSortWords.DefaultWords.ToList();
+
+    /// <summary>Whether long track titles in the Lyrics page should scroll.</summary>
+    public bool LyricsTitleMarqueeEnabled { get; set; } = true;
+
+    /// <summary>Whether long artist/album names in the Lyrics page should scroll.</summary>
+    public bool LyricsArtistMarqueeEnabled { get; set; } = true;
+
+    /// <summary>Whether long track titles in the mini player should scroll.</summary>
+    public bool MiniPlayerTitleMarqueeEnabled { get; set; } = true;
+
+    /// <summary>Whether long album titles in the mini player should scroll.</summary>
+    public bool MiniPlayerAlbumMarqueeEnabled { get; set; } = true;
+
+    // ── Equalizer settings ──
+
+    /// <summary>Whether the advanced equalizer is enabled.</summary>
+    public bool EqualizerEnabled { get; set; } = true;
+
+    /// <summary>Selected EQ preset index. -1 = Custom, 0+ = VLC built-in preset.</summary>
+    public int EqualizerPresetIndex { get; set; } = 0; // 0 = VLC "Flat" preset
+
+    /// <summary>Legacy 10-band graphic amplitudes in dB (-12 to +12). Still read to
+    /// migrate pre-parametric settings and written as a downgrade-safe mirror of
+    /// the applied curve; <see cref="ParametricEqBands"/> is the source of truth.</summary>
+    public float[] EqualizerBands { get; set; } = new float[10];
+
+    /// <summary>Parametric EQ bands (frequency / gain / Q). Null on settings files
+    /// written before the parametric EQ existed — migrated from
+    /// <see cref="EqualizerBands"/> on first load.</summary>
+    public List<ParametricEqBand>? ParametricEqBands { get; set; }
+
+    /// <summary>EQ pre-amp in dB relative to native level (0 = unchanged). Applied
+    /// before the EQ curve, so a negative value creates the headroom that keeps
+    /// boosted bands from clipping — the post-mix volume slider cannot.</summary>
+    public double EqPreampDb { get; set; } = 0.0;
+
+    /// <summary>GitHub #95: user-saved presets (parametric bands + pre-amp), listed after
+    /// the built-ins in the preset dropdown.</summary>
+    public List<UserEqPreset> UserEqPresets { get; set; } = new();
+
+    /// <summary>GitHub #95: built-in preset names the user deleted. Hidden from the
+    /// dropdown rather than removed, so "Restore built-in presets" can bring them back.</summary>
+    public List<string> HiddenEqPresets { get; set; } = new();
+
+    /// <summary>The selected user preset, by name. Null when a built-in or Custom is
+    /// selected (see <see cref="EqualizerPresetIndex"/>, which is -1 while this is set).</summary>
+    public string? SelectedUserEqPreset { get; set; }
+
+    // ── Integration settings ──
+
+    /// <summary>Whether Discord Rich Presence is enabled.</summary>
+    public bool DiscordRichPresenceEnabled { get; set; }
+
+    /// <summary>Whether the Discord card shows the album name under the artist (the large
+    /// image's hover text). Off drops that line for a leaner card (Discord ask, 2026-09-03).</summary>
+    public bool DiscordShowAlbum { get; set; } = true;
+
+    /// <summary>What Discord's status line reads after "Listening to": "Artist", "Title" or
+    /// "AppName" (see <see cref="Models.DiscordStatusDisplay"/>). Discord ask, 2026-10-14.</summary>
+    public string DiscordStatusDisplay { get; set; } = nameof(Models.DiscordStatusDisplay.Artist);
+
+    /// <summary>Loon server URL for Discord cover art (e.g. "wss://loon.example.com").</summary>
+    public string LoonServerUrl { get; set; } = "https://undertone-loon.duckdns.org";
+
+    /// <summary>Whether Last.fm scrobbling is enabled. Off until an account is connected —
+    /// scrobbling is gated on IsAuthenticated anyway, so defaulting it on only produced a
+    /// toggle that read "active" while nothing was ever sent. Connecting turns it on.</summary>
+    public bool LastFmScrobblingEnabled { get; set; } = false;
+
+    /// <summary>Last.fm session key for authenticated API calls.</summary>
+    public string LastFmSessionKey { get; set; } = "";
+
+    /// <summary>Last.fm username (populated after successful auth).</summary>
+    public string LastFmUsername { get; set; } = "";
+
+    /// <summary>Whether ListenBrainz scrobbling is enabled (independent of Last.fm).
+    /// Off until a token is validated, matching <see cref="LastFmScrobblingEnabled"/>.</summary>
+    public bool ListenBrainzScrobblingEnabled { get; set; } = false;
+
+    /// <summary>Songs, albums and artists never sent to Last.fm or ListenBrainz (nor to plugins'
+    /// scrobble hook): "track:{id}", "album:{id}", "artist:{name}"; see
+    /// Helpers.ScrobbleExclusionKeys. Plays still count in Undertone itself.</summary>
+    public List<string>? ScrobbleExcludedKeys { get; set; }
+
+    /// <summary>ListenBrainz user token (single-string credential pasted by the user from listenbrainz.org/profile/).</summary>
+    public string ListenBrainzToken { get; set; } = "";
+
+    /// <summary>ListenBrainz username (populated after a successful validate-token call).</summary>
+    public string ListenBrainzUsername { get; set; } = "";
+
+    /// <summary>ListenBrainz-compatible API URL for self-hosted servers (Koito, Maloja, …).
+    /// Empty = the official api.listenbrainz.org (GitHub #118).</summary>
+    public string ListenBrainzApiUrl { get; set; } = "";
+
+    /// <summary>
+    /// Internal metadata schema version used for one-time library backfills
+    /// when parsing rules are improved (for example explicit tag detection).
+    /// </summary>
+    public int MetadataSchemaVersion { get; set; }
+
+    // ── Cache / Offline ──
+
+    /// <summary>Enable stream-first on-demand cache.</summary>
+    public bool StreamFirstEnabled { get; set; } = true;
+
+    /// <summary>Enable automatic caching of recently streamed tracks.</summary>
+    public bool AutoCacheEnabled { get; set; } = true;
+
+    /// <summary>Maximum cache size in MB before eviction starts.</summary>
+    public int OfflineCacheLimitMb { get; set; } = 4096;
+
+    // ── Lyrics view ──
+
+    /// <summary>Custom background color hex for lyrics view (empty = auto from album art).</summary>
+    public string LyricsBackgroundColorHex { get; set; } = "";
+
+    /// <summary>When true, the lyrics page shows the blurred album artwork as background.
+    /// When false, the chosen solid/gradient color shows through instead.</summary>
+    public bool LyricsShowArtworkBackground { get; set; } = true;
+
+    /// <summary>With the artwork background off: Gradient (true) or Solid. A picked swatch says
+    /// it too, but Auto saves none, so without this Gradient on Auto came back as Solid.</summary>
+    public bool LyricsBackgroundGradient { get; set; }
+
+    /// <summary>Whether the blurred artwork background drifts and pulses with the beat
+    /// behind the lyrics (page, side panel and mini player; issue #22). Only applies
+    /// while the artwork mode is active.
+    /// Ships off: animated artwork is the only Appearance extra that defaults on.</summary>
+    public bool LyricsFlowingLightEnabled { get; set; }
+
+    /// <summary>Which flowing background draws when <see cref="LyricsFlowingLightEnabled"/> is on:
+    /// <see cref="FlowingStyles.Drift"/> (built in) or the name of a plugin visual layer (e.g. "Kawarp").
+    /// An absent plugin falls back to Drift at render time; the choice is kept for when it returns.</summary>
+    public string LyricsFlowingStyle { get; set; } = FlowingStyles.Drift;
+
+    /// <summary>Kawarp styles: 0–3, how far the cover is pushed around (GitHub #58).</summary>
+    public double LyricsKawarpWarp { get; set; } = 1.0;
+
+    /// <summary>Kawarp styles: 1–16 box-blur passes on the cover before warping; more = dreamier.</summary>
+    public int LyricsKawarpBlur { get; set; } = 6;
+
+    /// <summary>Fresh-install value of the three Drift knobs below (GitHub #111): 100% is the
+    /// look Drift had before they existed. Double-tapping a slider in Settings snaps back to it.</summary>
+    public const int LyricsDriftKnobDefault = 100;
+
+    /// <summary>Drift styles: how fast the cover copies drift and turn, in percent of the stock
+    /// speed (0–300). 0 holds them still; the beat pulse is the style's own choice.</summary>
+    public int LyricsDriftMovement { get; set; } = LyricsDriftKnobDefault;
+
+    /// <summary>Drift styles: colour saturation of the blurred cover, in percent (0–200; 0 = grey).</summary>
+    public int LyricsDriftSaturation { get; set; } = LyricsDriftKnobDefault;
+
+    /// <summary>Drift styles: blur strength of the cover, in percent of the stock blur (0–200).</summary>
+    public int LyricsDriftBlur { get; set; } = LyricsDriftKnobDefault;
+
+    /// <summary>Live audio visualizer (spectrum) drawn behind the lyrics on the lyrics page.
+    /// Reads the samples the app renders, so it needs an output chain with a sample tap
+    /// (the Windows engines); elsewhere it rests flat. Ships off like the other extras.</summary>
+    public bool LyricsVisualizerEnabled { get; set; }
+
+    /// <summary>Built-in feature switch: the audio visualizer. Off removes the Visualizer page
+    /// from the sidebar and stops the lyrics-page visualizer, whatever
+    /// <see cref="LyricsVisualizerEnabled"/> says (kept for when it returns).</summary>
+    public bool VisualizerEnabled { get; set; } = true;
+
+    /// <summary>Visualizer look: a <see cref="VisualizerStyle"/> name ("Bars", "Mirror", "Wave").</summary>
+    public string LyricsVisualizerStyle { get; set; } = VisualizerStyles.DefaultSetting;
+
+    /// <summary>Visualizer bars take the current artwork's colour (default) instead of white/accent.</summary>
+    public bool LyricsVisualizerArtworkColor { get; set; } = true;
+
+    /// <summary>Optional looping video/GIF the lyrics page paints behind the lyrics
+    /// (copied into the data root by Settings → Appearance). Empty = none; the blurred
+    /// artwork background shows as usual.</summary>
+    public string LyricsBackgroundMediaPath { get; set; } = "";
+
+    /// <summary>Per-song / per-album lyrics background clips: "track:{id}" or "album:{id}"
+    /// → a copy under the data root (see Helpers.LyricsBackgroundOverrides). A song's own
+    /// clip beats its album's, which beats <see cref="LyricsBackgroundMediaPath"/>.</summary>
+    public Dictionary<string, string>? LyricsBackgroundMediaOverrides { get; set; }
+
+    /// <summary>Freeze the lyrics background video while playback is paused (off = keep looping).</summary>
+    public bool LyricsBackgroundPausesWithPlayback { get; set; }
+
+    /// <summary>Show a music video found next to the song (same name, or a videos folder) in place of the cover on the lyrics page.</summary>
+    public bool MusicVideosEnabled { get; set; } = true;
+
+    /// <summary>Music video frame: rounded like the cover (true) or flat (false).</summary>
+    public bool MusicVideoRoundedCorners { get; set; } = true;
+
+    /// <summary>A song with a music video plays the clip's own audio instead of the song file
+    /// (decided at each song start; the song file is the fallback). Off by default.</summary>
+    public bool MusicVideoUseVideoAudio { get; set; }
+
+    /// <summary>The music video fills the lyrics page behind the lyrics (muted, dimmed, in step
+    /// with the song) instead of replacing the cover. Off by default.</summary>
+    public bool MusicVideoAsBackground { get; set; }
+
+    /// <summary>Opt-in fullscreen focus — dims everything but the active line and its
+    /// closest neighbors while the lyrics page is fullscreen.</summary>
+    public bool LyricsFullScreenFocusEnabled { get; set; }
+
+    /// <summary>Fresh-install value of <see cref="LyricsMinLineOpacity"/>; double-tapping the
+    /// slider thumb in Settings snaps back to it.</summary>
+    public const int LyricsMinLineOpacityDefault = 15;
+
+    /// <summary>Floor for the dimmed lyric lines, in percent (0–60). At 0 the ramp runs as
+    /// designed: lines far from the current one fade out completely and stop taking clicks.
+    /// Anything above keeps every line faintly visible and clickable, so a listener can
+    /// jump to any part of the song from its lyrics.</summary>
+    public int LyricsMinLineOpacity { get; set; } = LyricsMinLineOpacityDefault;
+
+    /// <summary>Whether a word split across several timed TTML spans renders as one
+    /// unbroken word ("compromise", not "com pro mise" — issue #32). The sweep still
+    /// follows each syllable's own timing. Ships off, keeping the authored spacing.</summary>
+    public bool LyricsJoinSplitWords { get; set; }
+
+    /// <summary>Apple Music word motion on word-synced lyrics: sung words float up and held
+    /// notes swell and glow letter by letter. Ships on; off keeps the words still (the
+    /// sweep alone marks the vocal).</summary>
+    public bool LyricsGlowAndLift { get; set; } = true;
+
+    /// <summary>Show a TTML file's translation under each lyric line (issue #78).</summary>
+    public bool LyricsShowTranslations { get; set; } = true;
+
+    /// <summary>Show a TTML file's romanization under each lyric line (issue #78).</summary>
+    public bool LyricsShowRomanization { get; set; } = true;
+
+    /// <summary>Show the background-vocal (adlib) row under lyric lines.</summary>
+    public bool LyricsShowBackgroundVocals { get; set; } = true;
+
+    /// <summary>Where saved lyrics go: "Sidecar" (.lrc / .elrc files beside the song, the default),
+    /// "Embedded" (the audio file's tags) or "Both". See <see cref="LyricsSaveOptions.ParseTarget"/> (GitHub #135).</summary>
+    public string LyricsSaveTarget { get; set; } = nameof(Models.LyricsSaveTarget.Sidecar);
+
+    /// <summary>Search online by itself when the lyrics view opens on a song with no lyrics (GitHub #135).</summary>
+    public bool LyricsAutoDownload { get; set; }
+
+    /// <summary>Search and save lyrics in the background for newly imported or discovered songs.</summary>
+    public bool LyricsFetchOnImport { get; set; }
+
+    /// <summary>What an automatic online pick keeps: "WordSynced" (the richest, the default),
+    /// "LineSynced" or "Plain". See <see cref="LyricsSaveOptions.ParsePreferredType"/> (GitHub #135).</summary>
+    public string LyricsPreferredType { get; set; } = nameof(Models.LyricsPreferredType.WordSynced);
+
+    // ── Lyrics providers ──
+
+    /// <summary>Whether LRCLIB online lyrics search is enabled.</summary>
+    public bool LrcLibEnabled { get; set; } = true;
+
+    /// <summary>Whether NetEase Cloud Music online lyrics search is enabled.</summary>
+    public bool NetEaseEnabled { get; set; } = true;
+
+    /// <summary>Whether Musixmatch (anonymous app token, word-synced richsync) is searched
+    /// automatically. Off on fresh installs: its token endpoint answers a captcha after a burst
+    /// of requests (issue #113 testing). Always available in the Search Lyrics source picker.</summary>
+    public bool MusixmatchEnabled { get; set; }
+
+    /// <summary>Whether Kugou (word-synced KRC lyrics) is searched automatically.</summary>
+    public bool KugouEnabled { get; set; } = true;
+
+    /// <summary>Whether lrc.red (TTML: word-synced with duet voices, else line-synced or plain) is
+    /// searched automatically. Off on fresh installs: its word-synced files carry Apple Music's
+    /// agent ids and fields, and Apple Music lyrics stay plugin-only (#119); opt in here
+    /// (2026-10-17). Always available in the Search Lyrics source picker.</summary>
+    public bool LrcRedEnabled { get; set; }
+
+    /// <summary>Whether Unison (Better Lyrics' community lyrics, mostly word-synced TTML) is searched
+    /// automatically. On: keyless, documented for third-party reads (120 a minute per IP), two
+    /// small requests per lookup.</summary>
+    public bool UnisonEnabled { get; set; } = true;
+
+    /// <summary>Whether YouTube Music (line-synced) is searched automatically. Off on fresh
+    /// installs: three round trips and ~1 MB of responses per lookup, on pinned client versions.</summary>
+    public bool YouTubeMusicLyricsEnabled { get; set; }
+
+    // ── Metadata providers ──
+
+    /// <summary>Whether Deezer is used as the primary tag source (keyless).</summary>
+    public bool DeezerEnabled { get; set; } = true;
+
+    /// <summary>Whether MusicBrainz is used as the fallback tag source.</summary>
+    public bool MusicBrainzEnabled { get; set; } = true;
+
+    /// <summary>Whether the metadata editor's Search Metadata asks Apple Music (the keyless
+    /// iTunes Search API) — covers, copyright, explicit flags, track/disc counts.</summary>
+    public bool AppleMusicMetadataEnabled { get; set; } = true;
+
+    // ── Audio Converter ──
+
+    /// <summary>Override path to ffmpeg. Empty = auto-detect (app dir, then PATH).</summary>
+    public string FfmpegPath { get; set; } = string.Empty;
+
+    // ── ReplayGain ──
+
+    /// <summary>"Off", "Track", "Album", or "Auto" (album when same-album sequence else track).
+    /// Off on fresh installs: ReplayGain only does anything when the files carry
+    /// REPLAYGAIN_* tags, which most libraries lack until the scanner is run — so defaulting
+    /// it on produced a toggle that read "active" while bypassing every track. Stored
+    /// values are respected, and switching the toggle back on restores "Auto".</summary>
+    public string ReplayGainMode { get; set; } = "Off";
+
+    /// <summary>Pre-amp in dB applied on top of the RG tag value.</summary>
+    public double ReplayGainPreampDb { get; set; } = 0.0;
+
+    /// <summary>GitHub #148: measure new files (found by the folder watcher or a library scan)
+    /// and write ReplayGain tags into them once their album has finished copying. Off by
+    /// default: it rewrites the user's files.</summary>
+    public bool AutoReplayGainScanEnabled { get; set; } = false;
+
+    // ── Audio analysis (BPM / key) ──
+
+    /// <summary>Whether background BPM + musical-key analysis runs (scan-time + backfill).
+    /// Off on fresh installs: it is real CPU across the whole library on the first scan,
+    /// and the features that consume it (AutoMix beat-matching, Track Radio) are themselves
+    /// off by default.</summary>
+    public bool BpmKeyAnalysisEnabled { get; set; } = false;
+
+    /// <summary>When true, computed BPM/key are also written to file tags (TBPM/TKEY). Off by default.</summary>
+    public bool WriteAnalysisToTags { get; set; } = false;
+
+    // ── Shortcuts ──
+    /// <summary>
+    /// Rebound keyboard shortcuts, keyed by <see cref="ShortcutAction"/> name with the
+    /// gesture as Avalonia's <c>KeyGesture</c> string ("Ctrl+Right"). Only overrides are
+    /// stored; an empty string means the user unbound that action. Null = all defaults.
+    /// </summary>
+    public Dictionary<string, string>? Shortcuts { get; set; }
+
+    /// <summary>
+    /// Clamps the numeric fields whose bounds were previously enforced only by the
+    /// Settings UI. A hand-edited (or partially corrupt) settings.json could otherwise
+    /// hand the app a volume of 400, a port of 0 — which throws inside the web-remote
+    /// start — or a pre-amp the slider can't even render. Called once on load, so every
+    /// reader sees an in-range value.
+    /// </summary>
+    public void ClampToValidRanges()
+    {
+        Volume = Math.Clamp(Volume, 0, 100);
+        // Below 1024 needs privileges on Unix; 65535 is the top of the port space.
+        WebRemotePort = WebRemotePort is >= 1024 and <= 65535 ? WebRemotePort : 9420;
+        LocalApiPort = LocalApiPort is >= 1024 and <= 65535 ? LocalApiPort : 9421;
+        UndertoneServerPort = UndertoneServerPort is >= 1024 and <= 65535 ? UndertoneServerPort : 4747;
+        ReplayGainPreampDb = Math.Clamp(ReplayGainPreampDb, -12, 12);
+        EqPreampDb = Math.Clamp(EqPreampDb, Services.ParametricEqMath.EqPreampMinDb, Services.ParametricEqMath.EqPreampMaxDb);
+        CrossfadeDuration = Math.Clamp(CrossfadeDuration, 1, 12);
+        PlayPauseFadeMs = Math.Clamp(PlayPauseFadeMs, 100, 2000);
+        AudioBalance = Math.Clamp(AudioBalance, -100, 100);
+        SleepTimerFadeSeconds = SnapSleepTimerFadeSeconds(SleepTimerFadeSeconds);
+        PlayCountThresholdPercent = SnapPlayCountThreshold(PlayCountThresholdPercent);
+        UiScalePercent = SnapUiScale(UiScalePercent);
+        HomeRecentAlbumsCount = SnapHomeAlbumCount(HomeRecentAlbumsCount);
+        HomeNewAlbumsCount = SnapHomeAlbumCount(HomeNewAlbumsCount);
+        PlaybackBarBackgroundOpacity = Math.Clamp(PlaybackBarBackgroundOpacity, 0, 1);
+        BackgroundBlurAmount = double.IsFinite(BackgroundBlurAmount)
+            ? Math.Clamp(BackgroundBlurAmount, 0, 1)
+            : BackgroundBlurAmountDefault;
+        PlaybackBarTrackBoxOpacity = double.IsFinite(PlaybackBarTrackBoxOpacity)
+            ? Math.Clamp(PlaybackBarTrackBoxOpacity, 0, 1)
+            : 0.07;
+        // IsFinite first: Math.Clamp propagates NaN, and NaN here would erase the card fill.
+        MiniPlayerBackgroundOpacity = double.IsFinite(MiniPlayerBackgroundOpacity)
+            ? Math.Clamp(MiniPlayerBackgroundOpacity, 0, 1)
+            : 0.35;
+        // IsFinite first: a NaN target would poison the album-grid column math.
+        AlbumTileTargetSize = double.IsFinite(AlbumTileTargetSize)
+            ? Math.Clamp(AlbumTileTargetSize, Helpers.AlbumGridMetrics.MinTargetSize, Helpers.AlbumGridMetrics.MaxTargetSize)
+            : 220;
+        // IsFinite first: Math.Clamp propagates NaN, and a NaN width would wedge the bar.
+        PlaybackBarWidth = double.IsFinite(PlaybackBarWidth)
+            ? Math.Clamp(PlaybackBarWidth, 340, 4096)
+            : 536;
+        // 1.4.8: the bar grew a favorite heart (+36px) and its default went 590 → 626. A
+        // stored 590 is the untouched OLD default, not a choice — move it along so existing
+        // installs keep the full layout instead of dropping to the narrowed "bar-mid" shape.
+        if (PlaybackBarWidth == 590) PlaybackBarWidth = 626;
+        // Track-box layout: the default went 626 → 536 (short LCD-style box, heart and
+        // dots no longer in the right cluster). Same rule: a stored 626 is the untouched
+        // old default, so it follows the new one instead of leaving a stretched pill.
+        if (PlaybackBarWidth == 626) PlaybackBarWidth = 536;
+        PlaybackBarSkipSeconds = PlaybackBarSkipSeconds is 10 or 15 or 30 ? PlaybackBarSkipSeconds : 15;
+        QueuePanelWidth = QueuePanelMetrics.Clamp(QueuePanelWidth);
+    }
+
+    /// <summary>
+    /// Runs when a stored settings file is read, after the initializers and before the file's
+    /// own values go in. Defaults that went from off to on after release (2026-10-18) start
+    /// back at their old value here: a key the file has still wins, and a file without the
+    /// key was saved by a build that predates the setting, so that user never saw it and keeps
+    /// the old behaviour. Only a brand-new install (and Reset, both <c>new AppSettings()</c>)
+    /// gets the new default. Every save writes every key, so this only matters once per file.
+    /// </summary>
+    public void OnDeserializing()
+    {
+        AlbumPageTintEnabled = false;
+        PlayPauseFadeEnabled = false;
+        IgnoreLeadingWordsInArtistSort = false;
+        // Sleep timer Fade Out (2026-10-29): the timer used to pause outright.
+        SleepTimerFadeSeconds = 0;
+    }
+}
+
+/// <summary>Names of the flowing-lyrics-background styles. Plugins add their own by layer name.</summary>
+public static class FlowingStyles
+{
+    /// <summary>The built-in drifting, beat-pulsing blurred cover (FlowingArtworkAnimator).</summary>
+    public const string Drift = "Drift";
+
+    /// <summary>Built-in liquid warp of the cover that swells on the beat (Controls/KawarpBackground).</summary>
+    public const string Kawarp = "Kawarp";
+
+    /// <summary>Kawarp without the beat swell — same flow, no bounce.</summary>
+    public const string KawarpCalm = "KawarpCalm";
+
+    /// <summary>Drift without the beat pulse (Discord, aaron/Mistery 2026-09-21): the cover
+    /// still drifts and rotates, but the backdrop scale and glow never swell.</summary>
+    public const string DriftCalm = "DriftCalm";
+
+    public static bool IsKawarp(string? value) => value is Kawarp or KawarpCalm;
+
+    /// <summary>Either built-in Drift flavour (the FlowingArtworkAnimator layers).</summary>
+    public static bool IsDrift(string? value) => value is Drift or DriftCalm;
+
+    /// <summary>False for the "(no beat)" flavours, whose motion ignores the beat meter.</summary>
+    public static bool IsBeatReactive(string? value) => value is not (KawarpCalm or DriftCalm);
+
+    public static string Normalize(string? value) => string.IsNullOrWhiteSpace(value) ? Drift : value.Trim();
+}

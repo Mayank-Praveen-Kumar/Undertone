@@ -1,0 +1,517 @@
+using System.Collections.ObjectModel;
+using Avalonia.Threading;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using Undertone.Helpers;
+using Undertone.Models;
+using Undertone.Services;
+
+namespace Undertone.ViewModels;
+
+/// <summary>
+/// ViewModel for the "Folders" library view — browses tracks by on-disk folder hierarchy
+/// under the user's configured music roots.
+/// </summary>
+public partial class LibraryFoldersViewModel : ViewModelBase, ISearchable, IDisposable
+{
+    private readonly ILibraryService _library;
+    private readonly PlayerViewModel _player;
+    private readonly IPersistenceService _persistence;
+    private readonly SidebarViewModel _sidebar;
+
+    private EventHandler? _libraryUpdatedHandler;
+    private bool _isDirty = true;
+    private string _currentFilter = string.Empty;
+
+    /// <summary>Root nodes of the folder forest (one per configured music root).</summary>
+    public ObservableCollection<FolderNode> RootNodes { get; } = new();
+
+    /// <summary>Tracks to display in the right-hand pane (direct + descendant tracks of SelectedNode).</summary>
+    public BulkObservableCollection<Track> SelectedFolderTracks { get; } = new();
+
+    /// <summary>Exposed so row templates can drive the playing-track EQ visualizer off player state.</summary>
+    public PlayerViewModel Player => _player;
+
+    /// <summary>Track-list scroll offset saved when the view detaches (e.g. opening an
+    /// artist/album page from a row link) and restored when it re-attaches on Back.</summary>
+    public double SavedScrollOffset { get; set; }
+
+    [ObservableProperty] private FolderNode? _selectedNode;
+
+    /// <summary>"2,144 items · 61.2 GB" line for the selected folder's header.</summary>
+    [ObservableProperty] private string _folderSummaryText = string.Empty;
+
+    /// <summary>Track-pane order (GitHub #89): "default" (folder order), "modified-newest"
+    /// or "modified-oldest" (file last-modified time).</summary>
+    [ObservableProperty] private string _sortMode = "default";
+
+    public string SortLabel => SortMode switch
+    {
+        "modified-newest" => "Date Modified (Newest)",
+        "modified-oldest" => "Date Modified (Oldest)",
+        _ => "Folder Order",
+    };
+
+    partial void OnSortModeChanged(string value)
+    {
+        OnPropertyChanged(nameof(SortLabel));
+        RebuildTrackPane();
+    }
+
+    [RelayCommand]
+    private void SetSort(string mode) => SortMode = mode;
+
+    /// <summary>Orders the flattened folder tracks for display. LINQ's OrderBy is stable,
+    /// so tracks sharing a timestamp (a batch retag) keep their folder order.</summary>
+    public static List<Track> SortTracks(List<Track> tracks, string mode) => mode switch
+    {
+        "modified-newest" => tracks.OrderByDescending(t => t.LastModified).ToList(),
+        "modified-oldest" => tracks.OrderBy(t => t.LastModified).ToList(),
+        _ => tracks,
+    };
+
+    /// <summary>Fires when the user clicks "Manage media folders…" — handled by MainWindowViewModel to switch views.</summary>
+    public event EventHandler? NavigateToSettingsRequested;
+
+    public LibraryFoldersViewModel(ILibraryService library, PlayerViewModel player, IPersistenceService persistence, SidebarViewModel sidebar)
+    {
+        _library = library;
+        _player = player;
+        _persistence = persistence;
+        _sidebar = sidebar;
+
+        // Only rebuild immediately while this view is current — a scan fires LibraryUpdated
+        // every ~1.5 s and rebuilding the folder forest for a hidden view burns CPU for
+        // nothing. Hidden views catch up via the dirty flag when activated.
+        _libraryUpdatedHandler = (_, _) =>
+        {
+            _isDirty = true;
+            if (_isActive)
+                Dispatcher.UIThread.Post(() => UiStallWatchdog.Time("FoldersRefresh", Refresh));
+        };
+        _library.LibraryUpdated += _libraryUpdatedHandler;
+    }
+
+    /// <summary>
+    /// Set by MainWindowViewModel when Folders becomes (or stops being) the current view.
+    /// Mirrors CoverFlowViewModel.IsActive: gates LibraryUpdated-driven rebuilds while
+    /// hidden, and catches up on activation (no-op when nothing changed).
+    /// </summary>
+    public bool IsActive
+    {
+        get => _isActive;
+        set
+        {
+            if (_isActive == value) return;
+            _isActive = value;
+            // Covers back-navigation paths that swap CurrentView without a Refresh call.
+            if (value) Refresh();
+        }
+    }
+
+    private bool _isActive;
+
+    /// <summary>Forces the next Refresh() call to rebuild even if data hasn't changed.</summary>
+    public void MarkDirty() => _isDirty = true;
+
+    /// <summary>Non-blocking refresh — loads settings, rebuilds forest, updates collections on UI thread.</summary>
+    public async void Refresh()
+    {
+        // async void: never let an exception escape to the synchronization context
+        // (an unhandled one here can terminate the app), so log and swallow instead.
+        try
+        {
+            await RefreshAsync();
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[FoldersVM] Refresh failed: {ex.Message}");
+        }
+    }
+
+    private async Task RefreshAsync()
+    {
+        if (!_isDirty && RootNodes.Count > 0)
+            return;
+        _isDirty = false;
+
+        var settings = await _persistence.LoadSettingsAsync();
+        // Read before the snapshot: a scan ending in between errs toward "partial", and
+        // the authoritative publish that follows refreshes again.
+        var partial = _library.IsPublishingPartial;
+        // AllTracks: a hidden folder stays in the tree (dimmed) so it can be shown again.
+        // Inbox songs are not in the library yet; the Inbox page lists them.
+        var tracks = _library.AllTracks.Where(t => !t.IsInInbox).ToList();
+        var hidden = _library.HiddenFolders.ToArray();
+        // Tracks added on their own (GitHub #108) show under their own folder.
+        var roots = FolderTreeBuilder.WithAddedFileFolders(settings.MusicFolders,
+            tracks.Where(t => t.AddedIndividually).Select(t => t.FilePath));
+
+        // Capture the selected folder's path before the rebuild swaps in fresh
+        // FolderNode instances. Clearing RootNodes drops the TreeView's selection, so
+        // without re-selecting the equivalent new node a background refresh (e.g. a
+        // dropped/added track) kicks the user out of the folder they were viewing.
+        var selectedPath = SelectedNode?.FullPath;
+
+        // Rebuilds create fresh FolderNode instances, so carry expansion over
+        // by folder path or the tree collapses on every library update.
+        var expansion = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        foreach (var root in RootNodes)
+            CaptureExpansion(root, expansion);
+
+        var forest = await Task.Run(() => FolderTreeBuilder.Build(tracks, roots));
+
+        // A scan's progressive fill carries only the folders walked so far, so a selected
+        // folder missing from it is "not walked yet", not removed. Deselecting here stuck:
+        // the next pass read selectedPath from the null node, so the user stayed kicked out
+        // of their folder after the scan. Keep the current tree until a later publish.
+        var reselected = selectedPath != null ? FindNode(forest, selectedPath) : null;
+        if (partial && selectedPath != null && reselected == null)
+        {
+            _isDirty = true;
+            return;
+        }
+
+        foreach (var root in forest)
+        {
+            RestoreExpansion(root, expansion);
+            MarkHidden(root, hidden, parentHidden: false);
+        }
+
+        RootNodes.Clear();
+        foreach (var root in forest)
+            RootNodes.Add(root);
+
+        // Re-select the equivalent node in the rebuilt forest (matched by path) so the
+        // user stays in their folder and the track pane refreshes against the NEW node —
+        // which includes any just-added tracks in folder order.
+        if (reselected != null)
+        {
+            SelectedNode = reselected;
+        }
+        else
+        {
+            SelectedNode = null;
+            SelectedFolderTracks.ReplaceAll(Array.Empty<Track>());
+            UpdateFolderSummary();
+        }
+    }
+
+    partial void OnSelectedNodeChanged(FolderNode? value) => RebuildTrackPane();
+
+    /// <summary>Applies the top-bar search filter ("Find in Folders"). Empty clears it.</summary>
+    public void ApplyFilter(string query)
+    {
+        _currentFilter = query ?? string.Empty;
+        RebuildTrackPane();
+    }
+
+    /// <summary>Raised when a search should reveal a track in a selected folder — the
+    /// view scrolls it into view and selects it (a "find", not a filter).</summary>
+    public event EventHandler<Track>? ScrollToTrackRequested;
+
+    private void RebuildTrackPane()
+    {
+        var hasFilter = !string.IsNullOrWhiteSpace(_currentFilter);
+
+        // With a folder selected, a search does NOT filter the list: it keeps the full
+        // folder (numbered by real position) and scrolls to / highlights the first
+        // matching track, so it shows in context with its neighbours.
+        if (SelectedNode != null)
+        {
+            var sink = new List<Track>();
+            Collect(SelectedNode, sink);
+            sink = SortTracks(sink, SortMode);
+            for (int i = 0; i < sink.Count; i++)
+                sink[i].RowNumber = i + 1;
+            SelectedFolderTracks.ReplaceAll(sink);
+            UpdateFolderSummary();
+
+            if (hasFilter)
+            {
+                var query = Helpers.SearchQuery.Parse(_currentFilter);
+                var match = sink.FirstOrDefault(query.Matches);
+                if (match != null)
+                    ScrollToTrackRequested?.Invoke(this, match);
+            }
+            return;
+        }
+
+        // No folder selected: fall back to filtering across all roots so the box still
+        // does something (there's no single list to scroll within). Numbers reflect the
+        // combined all-roots order.
+        var all = new List<Track>();
+        if (hasFilter)
+        {
+            foreach (var root in RootNodes)
+                Collect(root, all);
+            all = SortTracks(all, SortMode);
+            for (int i = 0; i < all.Count; i++)
+                all[i].RowNumber = i + 1;
+            all = all.Where(Helpers.SearchQuery.Parse(_currentFilter).Matches).ToList();
+        }
+        SelectedFolderTracks.ReplaceAll(all);
+        UpdateFolderSummary();
+    }
+
+    private void UpdateFolderSummary()
+    {
+        var count = SelectedFolderTracks.Count;
+        if (count == 0)
+        {
+            FolderSummaryText = string.Empty;
+            return;
+        }
+
+        long bytes = 0;
+        foreach (var t in SelectedFolderTracks)
+            bytes += t.FileSize;
+
+        var items = count == 1 ? "1 item" : $"{count:N0} items";
+        var gb = bytes / (1024.0 * 1024.0 * 1024.0);
+        var size = gb >= 1 ? $"{gb:0.#} GB" : $"{bytes / (1024.0 * 1024.0):0} MB";
+        FolderSummaryText = $"{items} · {size}";
+    }
+
+    private static void Collect(FolderNode node, List<Track> sink)
+    {
+        // A hidden folder's tracks are out of the library everywhere, this pane included.
+        if (!node.IsInHiddenFolder)
+            sink.AddRange(node.DirectTracks);
+        foreach (var child in node.Children)
+            Collect(child, sink);
+    }
+
+    private static void CaptureExpansion(FolderNode node, Dictionary<string, bool> map)
+    {
+        map[node.FullPath] = node.IsExpanded;
+        foreach (var child in node.Children)
+            CaptureExpansion(child, map);
+    }
+
+    private static void RestoreExpansion(FolderNode node, Dictionary<string, bool> map)
+    {
+        if (map.TryGetValue(node.FullPath, out var isExpanded))
+            node.IsExpanded = isExpanded;
+        foreach (var child in node.Children)
+            RestoreExpansion(child, map);
+    }
+
+    private static void MarkHidden(FolderNode node, IReadOnlyList<string> hidden, bool parentHidden)
+    {
+        node.IsHiddenFromLibrary = hidden.Any(f => FolderPathMatch.IsSame(f, node.FullPath));
+        node.IsInHiddenFolder = parentHidden || node.IsHiddenFromLibrary;
+        foreach (var child in node.Children)
+            MarkHidden(child, hidden, node.IsInHiddenFolder);
+    }
+
+    private static FolderNode? FindNode(IReadOnlyList<FolderNode> forest, string fullPath)
+    {
+        foreach (var n in forest)
+        {
+            if (string.Equals(n.FullPath, fullPath, StringComparison.OrdinalIgnoreCase))
+                return n;
+            var found = FindNode(n.Children.ToList(), fullPath);
+            if (found != null)
+                return found;
+        }
+        return null;
+    }
+
+    [RelayCommand]
+    private void PlayFolder()
+    {
+        if (SelectedFolderTracks.Count == 0) return;
+        _player.ReplaceQueueAndPlay(SelectedFolderTracks.ToList(), 0);
+    }
+
+    [RelayCommand]
+    private void ShuffleFolder()
+    {
+        if (SelectedFolderTracks.Count == 0) return;
+        _player.PlayShuffled(SelectedFolderTracks.ToList());
+    }
+
+    [RelayCommand]
+    private void OpenMediaFolderSettings()
+    {
+        NavigateToSettingsRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    [RelayCommand]
+    private void PlayTrack(Track track)
+    {
+        var list = SelectedFolderTracks.ToList();
+        var index = list.IndexOf(track);
+        if (index < 0) index = 0;
+        _player.ReplaceQueueAndPlay(list, index);
+    }
+
+    // ── Folder context-menu commands (right-click on a folder in the tree) ──
+
+    /// <summary>All tracks under a folder node (direct + descendants), in tree order.</summary>
+    private static List<Track> CollectTracks(FolderNode? node)
+    {
+        var sink = new List<Track>();
+        if (node != null)
+            Collect(node, sink);
+        return sink;
+    }
+
+    [RelayCommand]
+    private void PlayNode(FolderNode node)
+    {
+        var tracks = CollectTracks(node);
+        if (tracks.Count == 0) return;
+        _player.ReplaceQueueAndPlay(tracks, 0);
+    }
+
+    [RelayCommand]
+    private void ShuffleNode(FolderNode node)
+    {
+        var tracks = CollectTracks(node);
+        if (tracks.Count == 0) return;
+        _player.PlayShuffled(tracks);
+    }
+
+    [RelayCommand]
+    private void PlayNodeNext(FolderNode node)
+    {
+        // AddNextRange keeps folder order when the batch goes in up front.
+        _player.AddNextRange(CollectTracks(node), node.DisplayName);
+    }
+
+    [RelayCommand]
+    private void AddNodeToQueue(FolderNode node)
+    {
+        var tracks = CollectTracks(node);
+        if (tracks.Count == 0) return;
+        _player.AddRangeToQueue(tracks, node.DisplayName);
+    }
+
+    [RelayCommand]
+    private async Task AddNodeToNewPlaylist(FolderNode node)
+    {
+        var tracks = CollectTracks(node);
+        if (tracks.Count == 0) return;
+        await _sidebar.CreatePlaylistWithTracksAsync(tracks);
+    }
+
+    /// <summary>"Hide from Library" / "Show in Library" (Discord, Luwi 10-03): hides every
+    /// track under the folder from the rest of the app without removing anything. A folder
+    /// hidden only through a parent is shown again from that parent.</summary>
+    [RelayCommand]
+    private async Task ToggleNodeHidden(FolderNode node)
+    {
+        if (node == null) return;
+        if (node.IsInHiddenFolder && !node.IsHiddenFromLibrary) return;
+        await _library.SetFolderHiddenAsync(node.FullPath, !node.IsHiddenFromLibrary);
+    }
+
+    [RelayCommand]
+    private void ShowNodeInExplorer(FolderNode node)
+    {
+        if (node == null || !Directory.Exists(node.FullPath)) return;
+        PlatformHelper.OpenFolder(node.FullPath);
+    }
+
+    // ── Track context-menu commands (same menu as the Songs view) ──
+
+    [RelayCommand]
+    private void PlayNext(Track track) => _player.AddNext(track);
+
+    [RelayCommand]
+    private void AddToQueue(Track track) => _player.AddToQueue(track);
+
+    [RelayCommand]
+    private void StartRadio(Track track) => _player.StartRadioCommand.Execute(track);
+
+    [RelayCommand]
+    private void SnoozeForMonth(Track track) => _player.SnoozeForMonthCommand.Execute(track);
+
+    [RelayCommand]
+    private async Task AddToNewPlaylist(Track track)
+    {
+        if (track == null) return;
+        await _sidebar.CreatePlaylistWithTracksAsync(new List<Track> { track });
+    }
+
+    [RelayCommand]
+    private async Task OpenMetadata(Track track)
+    {
+        if (track == null) return;
+        await MetadataHelper.OpenMetadataWindow(track);
+    }
+
+    [RelayCommand]
+    private async Task ConvertTracks(Track track)
+    {
+        if (track == null) return;
+        await MetadataHelper.OpenAudioConverterDialog(new List<Track> { track });
+    }
+
+    [RelayCommand]
+    private async Task ScanReplayGain(Track track)
+    {
+        if (track == null) return;
+        await MetadataHelper.OpenReplayGainScannerDialog(new List<Track> { track });
+    }
+
+    [RelayCommand]
+    private async Task ToggleFavorite(Track track)
+    {
+        if (track == null) return;
+        track.IsFavorite = !track.IsFavorite;
+        await _library.SaveTrackUserStateAsync(new[] { track });
+        _library.NotifyFavoritesChanged(new[] { track });
+    }
+
+    [RelayCommand]
+    private void ShowInExplorer(Track track)
+    {
+        if (track == null || !File.Exists(track.FilePath)) return;
+        PlatformHelper.ShowInFileManager(track.FilePath);
+    }
+
+    [RelayCommand]
+    private async Task RemoveFromLibrary(Track track)
+    {
+        if (track == null) return;
+        await LibraryRemovalHelper.RemoveWithPromptAsync(_library, new List<Track> { track });
+    }
+
+    private Action<Track>? _searchLyricsAction;
+    public void SetSearchLyricsAction(Action<Track> action) => _searchLyricsAction = action;
+
+    [RelayCommand]
+    private void SearchLyrics(Track track) => _searchLyricsAction?.Invoke(track);
+
+    /// <summary>Fires when a track title is clicked — MainWindowViewModel opens the album detail page.</summary>
+    public event EventHandler<Track>? ViewAlbumRequested;
+
+    [RelayCommand]
+    private void ViewAlbum(Track track)
+    {
+        if (track == null) return;
+        ViewAlbumRequested?.Invoke(this, track);
+    }
+
+    private Action<string>? _viewArtistAction;
+    public void SetViewArtistAction(Action<string> action) => _viewArtistAction = action;
+
+    [RelayCommand]
+    private void ViewArtist(string artistName)
+    {
+        if (!string.IsNullOrWhiteSpace(artistName))
+            _viewArtistAction?.Invoke(artistName);
+    }
+
+    public void Dispose()
+    {
+        if (_libraryUpdatedHandler != null)
+        {
+            _library.LibraryUpdated -= _libraryUpdatedHandler;
+            _libraryUpdatedHandler = null;
+        }
+    }
+}

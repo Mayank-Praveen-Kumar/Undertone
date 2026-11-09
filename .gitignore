@@ -1,0 +1,101 @@
+## .NET
+bin/
+obj/
+publish/
+artifacts/
+
+## Release artifacts (built locally, uploaded to GitHub Releases)
+/Undertone-windows-x64.zip
+installer-output/
+ci-artifacts/
+ci-fresh/
+.tmp-scoop-bucket/
+
+## IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.csproj.user
+
+## OS
+Thumbs.db
+.DS_Store
+
+## NuGet
+*.nupkg
+packages/
+
+## AI / Claude tools
+.claude/
+CLAUDE.md
+undertone-v2/
+# Contents (not the dir itself), so the relay below can be re-included:
+# git will not descend into a directory excluded as `tools/`.
+tools/*
+# ...but the Chocolatey package's tools/ dir is intentionally tracked.
+!packaging/chocolatey/tools/
+!packaging/chocolatey/tools/**
+# ...and so is the cover-art relay, which is app source, not AI tooling.
+!tools/UndertoneCoverProxy/
+tools/UndertoneCoverProxy/bin/
+tools/UndertoneCoverProxy/obj/
+# ...and the plugin submission checker (.github/workflows/plugin-submission.yml).
+!tools/Undertone.PluginCheck/
+tools/Undertone.PluginCheck/bin/
+tools/Undertone.PluginCheck/obj/
+
+## Temp / build scratch
+build_tmp_verify/
+tmp_frames/
+undertone_pid.txt
+
+## Release build outputs
+release-artifacts/
+release-assets/
+release-staging/
+release-staging-*/
+release-v*/
+installer-output/
+packaged/
+
+## Local dev data & tooling caches (never committed)
+devdata/
+.serena/
+
+## Internal docs (not for public repo)
+DesignNotes.md
+ICON_PLACEMENT_INSTRUCTIONS.md
+IMPLEMENTATION_SUMMARY.md
+QA_PHASE0_CHECKLIST.md
+USAGE.md
+RELEASE_NOTES_*.md
+docs/plans/
+docs/superpowers/
+
+## Node (undertone-v2 experiment)
+node_modules/
+
+## Local .NET SDK artifacts
+.dotnet/
+.templateengine/
+dotnet
+.avalonia-build-tasks/
+
+# Superpowers brainstorm mockups (local visual companion)
+.superpowers/
+
+## Android signing (the upload key lives in %USERPROFILE%\.undertone, never in the repo;
+## these patterns are a second fence in case one is ever copied here)
+*.jks
+*.keystore
+*.p12
+__pycache__/
+
+# Local-only profiles and credentials
+.env
+.env.*
+qbittorrent-connection.bin
+*-data/
+.runtime/

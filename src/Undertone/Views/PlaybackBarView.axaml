@@ -1,0 +1,1868 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:loc="using:Undertone.Localization"
+             xmlns:vm="using:Undertone.ViewModels"
+             xmlns:m="using:Undertone.Models"
+             xmlns:controls="using:Undertone.Controls"
+             xmlns:conv="using:Undertone.Converters"
+             xmlns:helpers="using:Undertone.Helpers"
+             x:Class="Undertone.Views.PlaybackBarView"
+             x:DataType="vm:PlayerViewModel"
+             Background="Transparent">
+
+    <UserControl.Resources>
+        <conv:TrackDisplayTitleConverter x:Key="DisplayTitle" />
+        <conv:TrackArtistConverter x:Key="DisplayArtist" />
+        <conv:BoolToOpacityConverter x:Key="BoolToOpacity" />
+        <conv:VolumeToIconConverter x:Key="VolumeToIcon" />
+        <conv:ArtworkPathConverter x:Key="ArtworkConverter" />
+        <conv:IntEqualsConverter x:Key="IntEquals" />
+    </UserControl.Resources>
+
+    <UserControl.Styles>
+        <!-- Pill-shaped playback button style -->
+        <Style Selector="Button.pill-btn">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="RenderTransformOrigin" Value="0.5,0.5"/>
+            <Setter Property="Transitions">
+                <Transitions>
+                    <TransformOperationsTransition Property="RenderTransform" Duration="0:0:0.06">
+                        <TransformOperationsTransition.Easing>
+                            <CubicEaseOut/>
+                        </TransformOperationsTransition.Easing>
+                    </TransformOperationsTransition>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.06"/>
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Button.pill-btn:pressed">
+            <Setter Property="RenderTransform" Value="scale(1)"/>
+        </Style>
+        <Style Selector="Button.pill-btn:pointerover">
+            <Setter Property="RenderTransform" Value="scale(1)"/>
+        </Style>
+        <Style Selector="Button.pill-btn /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+        </Style>
+        <Style Selector="Button.pill-btn:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+        <Style Selector="Button.pill-btn:pressed /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+        <Style Selector="Button.pill-btn:focus /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+        <Style Selector="Button.pill-btn:focus-within /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+
+        <!-- Main play button (larger, no background fill) -->
+        <Style Selector="Button.pill-btn-play">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="RenderTransformOrigin" Value="0.5,0.5"/>
+            <Setter Property="Transitions">
+                <Transitions>
+                    <TransformOperationsTransition Property="RenderTransform" Duration="0:0:0.06">
+                        <TransformOperationsTransition.Easing>
+                            <CubicEaseOut/>
+                        </TransformOperationsTransition.Easing>
+                    </TransformOperationsTransition>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.06"/>
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Button.pill-btn-play:pressed">
+            <Setter Property="RenderTransform" Value="scale(1)"/>
+        </Style>
+        <Style Selector="Button.pill-btn-play:pointerover">
+            <Setter Property="RenderTransform" Value="scale(1)"/>
+        </Style>
+        <Style Selector="Button.pill-btn-play /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+        </Style>
+        <Style Selector="Button.pill-btn-play:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+        <Style Selector="Button.pill-btn-play:pressed /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+        <Style Selector="Button.pill-btn-play:focus /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+        <Style Selector="Button.pill-btn-play:focus-within /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+
+        <!-- Press feel for the transport buttons (previous / play-pause / next / repeat):
+             a soft opacity dip that eases back on release — deliberately NO scale, the
+             cluster must never zoom. Reusable — add the class alongside a button's visual
+             class to opt in (QueueView's shuffle/repeat toggles mirror it locally). Must
+             stay declared AFTER the pill-btn / pill-btn-play blocks: their :pressed/
+             :pointerover scale(1) setters neutralize the global Button press scale, and
+             within the same style scope the last declaration wins. Selector-driven state
+             + a single transition keeps quick taps reversing smoothly mid-flight. -->
+        <Style Selector="Button.transport-btn">
+            <Setter Property="RenderTransformOrigin" Value="0.5,0.5"/>
+            <Setter Property="RenderTransform" Value="scale(1)"/>
+            <Setter Property="Transitions">
+                <Transitions>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.15">
+                        <DoubleTransition.Easing>
+                            <CubicEaseOut/>
+                        </DoubleTransition.Easing>
+                    </DoubleTransition>
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Button.transport-btn:pressed">
+            <Setter Property="RenderTransform" Value="scale(1)"/>
+            <Setter Property="Opacity" Value="0.45"/>
+        </Style>
+        <!-- Previous / Play-Pause / Next press with Apple Music's feel instead (TransportGlyph:
+             a circle behind the glyph, the glyph dips and springs back), so no opacity dip. -->
+        <Style Selector="Button.transport-btn.tx:pressed">
+            <Setter Property="Opacity" Value="1"/>
+        </Style>
+        <!-- Next with nothing after it (end of queue): dimmed, not a lit button that does
+             nothing. Fluent's disabled grey fill is kept off the transparent pill. -->
+        <Style Selector="Button.transport-btn:disabled">
+            <Setter Property="Opacity" Value="0.35"/>
+        </Style>
+        <Style Selector="Button.transport-btn:disabled /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+        </Style>
+
+        <!-- Secondary controls (volume, menu) -->
+        <Style Selector="Button.secondary-btn">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Opacity" Value="1.0"/>
+            <Setter Property="Transitions">
+                <Transitions>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.06"/>
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Button.secondary-btn:pointerover">
+            <Setter Property="RenderTransform" Value="scale(1)"/>
+        </Style>
+        <Style Selector="Button.secondary-btn:pressed">
+            <Setter Property="RenderTransform" Value="scale(1)"/>
+        </Style>
+        <Style Selector="Button.secondary-btn /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+        </Style>
+        <Style Selector="Button.secondary-btn:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+        <Style Selector="Button.secondary-btn:pressed /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+        <Style Selector="Button.secondary-btn:focus /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+        <Style Selector="Button.secondary-btn:focus-within /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+
+        <Style Selector="Button.artist-link-btn:pointerover">
+            <Setter Property="RenderTransform" Value="scale(1)" />
+        </Style>
+        <Style Selector="Button.artist-link-btn:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="Button.artist-link-btn:pressed /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <!-- GitHub #82: the title is disabled for a track with no library album — it keeps
+             the enabled look (Fluent's disabled template would paint a grey fill). -->
+        <Style Selector="Button.artist-link-btn:disabled /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderBrush" Value="Transparent" />
+        </Style>
+        <!-- Highlight tracks the button, which now wraps only the artist text (it lives
+             inside the 200px clip viewport), so hover/press only fire over the name. -->
+        <Style Selector="Button.artist-link-btn:pointerover Border.artist-text-hover">
+            <Setter Property="Background" Value="#22FFFFFF" />
+        </Style>
+        <Style Selector="Button.artist-link-btn:pressed Border.artist-text-hover">
+            <Setter Property="Background" Value="#33FFFFFF" />
+        </Style>
+        <!-- Artist name in the track box: accent, or the bar's secondary text colour when
+             Settings → "Accent colour on artist and album names" is off (GitHub #125;
+             MainWindow's plain-track-links class). Style setters, not local values. -->
+        <Style Selector="TextBlock.bar-artist">
+            <Setter Property="Foreground" Value="{DynamicResource AccentColorBrush}" />
+        </Style>
+        <Style Selector=":is(Window).plain-track-links TextBlock.bar-artist">
+            <Setter Property="Foreground" Value="{DynamicResource IslandForegroundSecondary}" />
+        </Style>
+
+        <!-- Compact vertical volume slider -->
+        <Style Selector="Slider.volume-vertical">
+            <Setter Property="Orientation" Value="Vertical"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="{DynamicResource IslandSliderFilled}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Width" Value="22"/>
+            <Setter Property="Height" Value="48"/>
+        </Style>
+
+        <Style Selector="Slider.volume-vertical /template/ Track">
+            <Setter Property="Width" Value="4"/>
+        </Style>
+
+        <Style Selector="Slider.volume-vertical /template/ RepeatButton">
+            <Setter Property="Background" Value="Transparent"/>
+        </Style>
+
+        <Style Selector="Slider.volume-vertical /template/ RepeatButton /template/ Border">
+            <Setter Property="Background" Value="{DynamicResource IslandSliderFilled}"/>
+            <Setter Property="Width" Value="4"/>
+            <Setter Property="CornerRadius" Value="2"/>
+        </Style>
+
+        <Style Selector="Slider.volume-vertical /template/ RepeatButton#PART_IncreaseButton /template/ Border">
+            <Setter Property="Background" Value="{DynamicResource IslandSliderUnfilled}"/>
+            <Setter Property="Width" Value="4"/>
+            <Setter Property="CornerRadius" Value="2"/>
+            <Setter Property="Opacity" Value="0.6"/>
+        </Style>
+
+        <Style Selector="Slider.volume-vertical /template/ Thumb">
+            <Setter Property="Background" Value="{DynamicResource IslandSliderFilled}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Width" Value="10"/>
+            <Setter Property="Height" Value="10"/>
+            <Setter Property="Opacity" Value="1.0"/>
+            <Setter Property="Transitions">
+                <Transitions>
+                    <TransformOperationsTransition Property="RenderTransform" Duration="0:0:0.15">
+                        <TransformOperationsTransition.Easing>
+                            <CubicEaseOut/>
+                        </TransformOperationsTransition.Easing>
+                    </TransformOperationsTransition>
+                </Transitions>
+            </Setter>
+        </Style>
+
+        <Style Selector="Slider.volume-vertical /template/ Thumb /template/ Border">
+            <Setter Property="Background" Value="{DynamicResource IslandSliderFilled}"/>
+            <Setter Property="CornerRadius" Value="5"/>
+            <Setter Property="BoxShadow" Value="0 1 3 0 #40000000"/>
+        </Style>
+
+        <Style Selector="Slider.volume-vertical:pointerover /template/ Thumb">
+            <Setter Property="RenderTransform" Value="scale(1.15)"/>
+        </Style>
+
+        <Style Selector="Slider.volume-vertical:pressed /template/ Thumb">
+            <Setter Property="RenderTransform" Value="scale(1.05)"/>
+        </Style>
+
+        <!-- Horizontal volume slider (pill-shaped) -->
+        <Style Selector="Slider.volume-horizontal">
+            <Setter Property="Orientation" Value="Horizontal"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="{DynamicResource IslandSliderFilled}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Height" Value="20"/>
+            <Setter Property="Width" Value="90"/>
+            <Setter Property="Margin" Value="0,0,8,0"/>
+            <Setter Property="Opacity" Value="0"/>
+            <Setter Property="Template">
+                <ControlTemplate>
+                    <Border Background="Transparent"/>
+                </ControlTemplate>
+            </Setter>
+        </Style>
+
+        <Style Selector="Slider.volume-horizontal /template/ Track">
+            <Setter Property="Height" Value="6"/>
+            <Setter Property="Margin" Value="7,0"/>
+        </Style>
+
+        <Style Selector="Slider.volume-horizontal /template/ RepeatButton /template/ Border">
+            <Setter Property="Background" Value="{DynamicResource IslandSliderFilled}"/>
+            <Setter Property="Height" Value="6"/>
+            <Setter Property="CornerRadius" Value="3,0,0,3"/>
+        </Style>
+
+        <Style Selector="Slider.volume-horizontal /template/ RepeatButton#PART_IncreaseButton /template/ Border">
+            <Setter Property="Background" Value="{DynamicResource IslandSliderUnfilled}"/>
+            <Setter Property="Opacity" Value="0.4"/>
+            <Setter Property="Height" Value="6"/>
+            <Setter Property="CornerRadius" Value="0,3,3,0"/>
+        </Style>
+
+        <Style Selector="Slider.volume-horizontal /template/ Thumb">
+            <Setter Property="Background" Value="{DynamicResource IslandSliderFilled}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Width" Value="14"/>
+            <Setter Property="Height" Value="14"/>
+            <Setter Property="Opacity" Value="1.0"/>
+            <Setter Property="Transitions">
+                <Transitions>
+                    <TransformOperationsTransition Property="RenderTransform" Duration="0:0:0.06">
+                        <TransformOperationsTransition.Easing>
+                            <CubicEaseOut/>
+                        </TransformOperationsTransition.Easing>
+                    </TransformOperationsTransition>
+                </Transitions>
+            </Setter>
+        </Style>
+
+        <Style Selector="Slider.volume-horizontal /template/ Thumb /template/ Border">
+            <Setter Property="Background" Value="{DynamicResource IslandSliderFilled}"/>
+            <Setter Property="CornerRadius" Value="7"/>
+            <Setter Property="BoxShadow" Value="0 1 3 0 #40000000"/>
+        </Style>
+
+        <Style Selector="Slider.volume-horizontal:pointerover /template/ Thumb">
+            <Setter Property="RenderTransform" Value="scale(1.1)"/>
+        </Style>
+
+        <!-- Volume pill (10-08). Thumb growth as the Settings accent slider: a touch larger on
+             hover, larger again while dragging (".dragging" is set by code-behind; declared
+             last so it wins while the captured pointer also reads as hover). -->
+        <Style Selector="Border#VolumeThumbDot">
+            <Setter Property="RenderTransformOrigin" Value="50%,50%"/>
+            <Setter Property="RenderTransform" Value="scale(1)"/>
+            <Setter Property="Transitions">
+                <Transitions>
+                    <TransformOperationsTransition Property="RenderTransform" Duration="0:0:0.14">
+                        <TransformOperationsTransition.Easing>
+                            <CubicEaseOut/>
+                        </TransformOperationsTransition.Easing>
+                    </TransformOperationsTransition>
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Grid#VolumeTrackHost:pointerover Border#VolumeThumbDot">
+            <Setter Property="RenderTransform" Value="scale(1.1)"/>
+        </Style>
+        <Style Selector="Grid#VolumePill.dragging Border#VolumeThumbDot">
+            <Setter Property="RenderTransform" Value="scale(1.2)"/>
+        </Style>
+        <!-- Muted: the level stays visible (unmuting restores it) but steps back. The track is
+             dimmed in code through an OpacityMask (one composited layer — a plain Opacity is
+             applied per child, so the fill and track showed through the dimmed thumb); the
+             readout dims here. -->
+        <Style Selector="Grid#VolumePill TextBlock#VolumeReadout">
+            <Setter Property="Transitions">
+                <Transitions>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.16">
+                        <DoubleTransition.Easing>
+                            <CubicEaseOut/>
+                        </DoubleTransition.Easing>
+                    </DoubleTransition>
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Grid#VolumePill TextBlock#VolumeReadout">
+            <Setter Property="Opacity" Value="0.9"/>
+        </Style>
+        <Style Selector="Grid#VolumePill.muted TextBlock#VolumeReadout">
+            <Setter Property="Opacity" Value="0.45"/>
+        </Style>
+
+        <!-- Seek slider (horizontal) -->
+        <Style Selector="Slider.seek-slider">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="{DynamicResource IslandSliderFilled}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Height" Value="20"/>
+            <Setter Property="Opacity" Value="0"/>
+            <Setter Property="Template">
+                <ControlTemplate>
+                    <Border Background="Transparent"/>
+                </ControlTemplate>
+            </Setter>
+        </Style>
+
+        <!-- Seek row hover: the track keeps its 3px height and there are no time labels
+             (the thicker-on-hover track and the side times were dropped — the card's
+             bottom-edge line stays exactly as it rests). Only a small thumb fades in so
+             there is still a handle to grab. CornerRadius 999 keeps the track ends round. -->
+        <Style Selector="Grid.seek-row Border.seek-track">
+            <Setter Property="Height" Value="3"/>
+        </Style>
+
+        <!-- Thumb: hidden at rest, fades in on hover at a fixed 6px (any larger and the
+             card's rounded clip would shave its bottom). The host Panel carries the fade
+             because PillSliderVisualHelper writes SeekThumb.Opacity (enabled state) on
+             every position tick, which would clobber a style on the thumb itself. -->
+        <Style Selector="Grid.seek-row Panel.seek-thumb-host">
+            <Setter Property="Opacity" Value="0"/>
+            <Setter Property="Transitions">
+                <Transitions>
+                    <DoubleTransition Property="Opacity" Duration="0:0:0.18"/>
+                </Transitions>
+            </Setter>
+        </Style>
+        <Style Selector="Grid.seek-row:pointerover Panel.seek-thumb-host">
+            <Setter Property="Opacity" Value="1"/>
+        </Style>
+        <Style Selector="Grid.seek-row Border.seek-thumb">
+            <Setter Property="Width" Value="6"/>
+            <Setter Property="Height" Value="6"/>
+        </Style>
+
+        <!-- Track-info viewport widths live here (not as local values) so the mid
+             resize shape can narrow them: a style can never override a local Width.
+             "bar-mid" is toggled on the island by code-behind when the user drags
+             the persistent bar below the full-layout width (see ApplyIslandShape). -->
+        <Style Selector="Border#TrackTitleViewport">
+            <Setter Property="Width" Value="160"/>
+        </Style>
+        <Style Selector="Border#ArtistNameViewport">
+            <Setter Property="Width" Value="160"/>
+        </Style>
+        <Style Selector="Border.island.bar-mid Border#TrackTitleViewport">
+            <Setter Property="Width" Value="110"/>
+        </Style>
+        <Style Selector="Border.island.bar-mid Border#ArtistNameViewport">
+            <Setter Property="Width" Value="110"/>
+        </Style>
+
+        <!-- Marquee edge fade (09-14): while the title overflows, the viewport clips the
+             text mid-glyph and a sliver of the next letter sat hard against the edge (the
+             "artifact" after "…Version"). Code-behind sets .overflow while the marquee
+             owns the title (static/ellipsized titles never cut a glyph) and .scrolled once
+             the text has moved left, so the leading edge fades too. 10% ≈ 16px at the
+             160px width, 11px at bar-mid. -->
+        <Style Selector="Border#TrackTitleViewport.overflow">
+            <Setter Property="OpacityMask">
+                <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,0%">
+                    <GradientStop Offset="0" Color="White"/>
+                    <GradientStop Offset="0.9" Color="White"/>
+                    <GradientStop Offset="1" Color="Transparent"/>
+                </LinearGradientBrush>
+            </Setter>
+        </Style>
+        <Style Selector="Border#TrackTitleViewport.overflow.scrolled">
+            <Setter Property="OpacityMask">
+                <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,0%">
+                    <GradientStop Offset="0" Color="Transparent"/>
+                    <GradientStop Offset="0.1" Color="White"/>
+                    <GradientStop Offset="0.9" Color="White"/>
+                    <GradientStop Offset="1" Color="Transparent"/>
+                </LinearGradientBrush>
+            </Setter>
+        </Style>
+
+        <!-- GitHub #52 (Aosneg, 1.4.7): hovering a bar button long enough for its tooltip
+             made the FIRST click do nothing. The bar sits on the bottom edge, so
+             Avalonia's default Pointer placement (20px below the cursor) has no room and
+             flips the tooltip UP — over the button, under the pointer. The click then
+             landed on the tooltip's own popup window (dismissing it) instead of the
+             button. Anchor every bar tooltip above its control instead: never under the
+             pointer, and it reads better over a bottom bar anyway. -->
+        <Style Selector="Border#IslandBorder :is(Button)">
+            <Setter Property="ToolTip.Placement" Value="Top" />
+            <Setter Property="ToolTip.VerticalOffset" Value="-6" />
+        </Style>
+
+        <!-- Liquid Glass island menus (GitHub #104). GlassMenuFlyout hosts the menu in the
+             window's overlay layer (a native popup window cannot be frosted) and adds the
+             "glass-menu" class while glass is on. The chrome is then a GlassPanel tinted with
+             the menu's own colour at Glass Opacity, and the open/close motion fades its Fade
+             (plus the items' Opacity) instead of the presenter's Opacity, which the GPU
+             backend does not apply to the blur. Mirrors the Fluent MenuFlyoutPresenter template. -->
+        <Style Selector="MenuFlyoutPresenter.glass-menu">
+            <Setter Property="(helpers:MenuOpenAnimation.UseFade)" Value="True" />
+            <Setter Property="Template">
+                <ControlTemplate>
+                    <controls:GlassPanel Name="GlassMenuRoot"
+                                         Background="{TemplateBinding Background}"
+                                         CornerRadius="{TemplateBinding CornerRadius}"
+                                         Padding="{TemplateBinding Padding}"
+                                         MaxWidth="{DynamicResource FlyoutThemeMaxWidth}"
+                                         MinHeight="{DynamicResource MenuFlyoutThemeMinHeight}"
+                                         HorizontalAlignment="{TemplateBinding HorizontalAlignment}"
+                                         GlassTintOpacity="{Binding IslandBackgroundOpacity}"
+                                         BlurRadius="14"
+                                         Fade="{TemplateBinding (helpers:MenuOpenAnimation.Fade)}">
+                        <ScrollViewer Theme="{StaticResource FluentMenuScrollViewer}"
+                                      Opacity="{TemplateBinding (helpers:MenuOpenAnimation.Fade)}"
+                                      HorizontalScrollBarVisibility="{TemplateBinding (ScrollViewer.HorizontalScrollBarVisibility)}"
+                                      VerticalScrollBarVisibility="{TemplateBinding (ScrollViewer.VerticalScrollBarVisibility)}">
+                            <ItemsPresenter Name="PART_ItemsPresenter"
+                                            ItemsPanel="{TemplateBinding ItemsPanel}"
+                                            Margin="{DynamicResource MenuFlyoutScrollerMargin}"
+                                            KeyboardNavigation.TabNavigation="Continue"
+                                            Grid.IsSharedSizeScope="True" />
+                        </ScrollViewer>
+                    </controls:GlassPanel>
+                </ControlTemplate>
+            </Setter>
+        </Style>
+    </UserControl.Styles>
+
+        <!-- Dynamic Island: Single unified glass pill-shaped container -->
+        <!-- The outline is a 1.5px ring rather than 1px: at 1px the semi-transparent stroke
+             snaps cleanly along the straight top/bottom edges but anti-aliases to partial
+             coverage around the rounded ends, so the corners looked faded. 1.5px gives the
+             curve enough width to read at the same strength as the edges. -->
+        <Border x:Name="IslandBorder"
+                Classes="island"
+                BorderBrush="{DynamicResource IslandOutlineBrush}"
+                BorderThickness="1.5"
+                CornerRadius="999"
+                Padding="12,0,12,0"
+                HorizontalAlignment="Center"
+                VerticalAlignment="Center"
+                Height="50"
+                Width="536">
+            <!-- No Width transition: the compact (lyrics-page) and base widths belong to
+                 two different bar instances, so there is never a width change worth
+                 animating — the pill is simply born at whichever width its page needs.
+                 A transition here only ever caught navigation churn: ToggleLyrics drives
+                 IsLyricsPageActive true→false→true in one pass while the lyrics page's
+                 bar is already attached, which played as a visible shrink/settle every
+                 time the page opened. -->
+
+            <!-- Panel wrapper: hosts the content grid plus the invisible edge grips the
+                 user drags to resize the persistent bar (see the resize handlers in
+                 code-behind). Grips overlay the pill's rounded ends via the negative
+                 margins that reach back across the island's 12px padding. -->
+            <!-- Glass fill: opaque colour with user-controlled opacity (Settings → Glass
+                 Opacity). Driving the brush opacity (not the panel's) keeps text/controls crisp.
+                 With Liquid Glass on the same brush becomes the tint over a live frost of the
+                 content scrolling under the pill. Negative margin reaches back across the
+                 Border's 12px padding so the fill covers the whole pill as before. -->
+            <controls:GlassPanel CornerRadius="999" Margin="-12,0" Padding="12,0" BlurRadius="14">
+              <controls:GlassPanel.Background>
+                <SolidColorBrush Color="{DynamicResource IslandBackgroundColor}" Opacity="{Binding IslandBackgroundOpacity}"/>
+              </controls:GlassPanel.Background>
+            <Panel>
+            <Grid HorizontalAlignment="Center">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/> <!-- Playback controls -->
+                    <ColumnDefinition Width="Auto"/> <!-- Album art + track info -->
+                    <ColumnDefinition Width="Auto"/> <!-- Right controls -->
+                </Grid.ColumnDefinitions>
+
+                <!-- LEFT: Playback Controls -->
+                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="2" VerticalAlignment="Center" Margin="0,0,14,0">
+
+                    <!-- Shuffle lives in the Queue panel's Up Next header; Repeat is also surfaced here on the bar. -->
+
+                    <!-- Island extras (Settings → Appearance → Player Island Buttons): podcast /
+                         audiobook transport, each opt-in. Playback speed: a small "1×" label that
+                         opens the speed menu. -->
+                    <Button x:Name="PlaybackSpeedButton"
+                            Classes="pill-btn transport-btn"
+                            ToolTip.Tip="{loc:T PlaybackBar.PlaybackSpeedTip}"
+                            IsVisible="{Binding IslandShowPlaybackSpeed}"
+                            Width="34" Height="34">
+                        <Panel Width="34" Height="34">
+                            <Border Width="28" Height="28"
+                                    CornerRadius="8"
+                                    Background="{DynamicResource AccentColorBrush}"
+                                    Opacity="0.18"
+                                    IsVisible="{Binding IsSpeedOrPitchChanged}" />
+                            <TextBlock Text="{Binding PlaybackRateText}"
+                                       FontSize="11" FontWeight="SemiBold"
+                                       Foreground="{DynamicResource IslandIconFill}"
+                                       HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Panel>
+                        <Button.Flyout>
+                            <MenuFlyout Placement="Top"
+                                        PlacementConstraintAdjustment="FlipY"
+                                        helpers:MenuOpenAnimation.EnableFlyoutClose="True"
+                                        helpers:GlassMenuFlyout.Enable="True">
+                                <MenuItem Header="0.75×" Command="{Binding SetPlaybackRateCommand}" CommandParameter="75">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PlaybackRatePercent, Converter={StaticResource IntEquals}, ConverterParameter=75}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <MenuItem Header="{loc:T PlaybackBar.1Normal}" Command="{Binding SetPlaybackRateCommand}" CommandParameter="100">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PlaybackRatePercent, Converter={StaticResource IntEquals}, ConverterParameter=100}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <MenuItem Header="1.25×" Command="{Binding SetPlaybackRateCommand}" CommandParameter="125">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PlaybackRatePercent, Converter={StaticResource IntEquals}, ConverterParameter=125}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <MenuItem Header="1.5×" Command="{Binding SetPlaybackRateCommand}" CommandParameter="150">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PlaybackRatePercent, Converter={StaticResource IntEquals}, ConverterParameter=150}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <MenuItem Header="1.75×" Command="{Binding SetPlaybackRateCommand}" CommandParameter="175">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PlaybackRatePercent, Converter={StaticResource IntEquals}, ConverterParameter=175}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <MenuItem Header="2×" Command="{Binding SetPlaybackRateCommand}" CommandParameter="200">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding PlaybackRatePercent, Converter={StaticResource IntEquals}, ConverterParameter=200}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <Separator IsVisible="{Binding IsPitchSupported}"/>
+                                <!-- Pitch (Harmonoid-style, independent of speed): semitones on the
+                                     engine's resampler; the WSOLA stage keeps the tempo. Hidden where
+                                     there is no engine (macOS), since LibVLC output ignores pitch. -->
+                                <MenuItem IsVisible="{Binding IsPitchSupported}">
+                                    <MenuItem.Header>
+                                        <StackPanel Orientation="Horizontal" Spacing="6">
+                                            <TextBlock Text="{loc:T PlaybackBar.Pitch}"/>
+                                            <TextBlock Text="{Binding PitchText}" Opacity="0.6"/>
+                                        </StackPanel>
+                                    </MenuItem.Header>
+                                    <MenuItem Header="+3" Command="{Binding SetPitchCommand}" CommandParameter="3"/>
+                                    <MenuItem Header="+2" Command="{Binding SetPitchCommand}" CommandParameter="2"/>
+                                    <MenuItem Header="+1" Command="{Binding SetPitchCommand}" CommandParameter="1"/>
+                                    <MenuItem Header="{loc:T PlaybackBar.PitchNormal}" Command="{Binding SetPitchCommand}" CommandParameter="0">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding !IsPitchChanged}"/>
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="−1" Command="{Binding SetPitchCommand}" CommandParameter="-1"/>
+                                    <MenuItem Header="−2" Command="{Binding SetPitchCommand}" CommandParameter="-2"/>
+                                    <MenuItem Header="−3" Command="{Binding SetPitchCommand}" CommandParameter="-3"/>
+                                </MenuItem>
+                            </MenuFlyout>
+                        </Button.Flyout>
+                    </Button>
+
+                    <!-- Skip back N seconds (island extra) -->
+                    <Button Classes="pill-btn transport-btn"
+                            Command="{Binding SkipBackCommand}"
+                            ToolTip.Tip="{Binding SkipBackTooltip}"
+                            IsVisible="{Binding IslandShowSkipButtons}"
+                            Width="34" Height="34">
+                        <!-- Podcast-style glyph: a ring open at the top-left, the arrowhead at
+                             12 o'clock pointing left (counter-clockwise = back), the seconds inside. -->
+                        <Viewbox Width="22" Height="22">
+                            <Canvas Width="24" Height="24">
+                                <Path Stroke="{DynamicResource IslandIconFill}" StrokeThickness="1.75"
+                                      StrokeLineCap="Round" StrokeJoin="Round"
+                                      Data="M12 5 A8 8 0 1 1 5.07 9 M15 2 L12 5 L15 8" />
+                                <!-- The seconds as scaled geometry: a big-font TextBlock in a Viewbox pinned
+                                     on the ring's centre (12,13). A tiny font laid out directly landed a pixel
+                                     low-left after DPI rounding; measured this way it sits within 0.6 device px
+                                     of centre at 100–200% scale for 10 / 15 / 30. -->
+                                <Viewbox Canvas.Left="5.975" Canvas.Top="7.75" Width="12.65" Height="11">
+                                    <TextBlock Text="{Binding IslandSkipLabel}"
+                                               FontSize="20" FontWeight="SemiBold"
+                                               Foreground="{DynamicResource IslandIconFill}" />
+                                </Viewbox>
+                            </Canvas>
+                        </Viewbox>
+                    </Button>
+
+                    <!-- Previous button -->
+                    <Button Classes="pill-btn transport-btn tx"
+                            Command="{Binding PreviousCommand}"
+                            ToolTip.Tip="{loc:T PlaybackBar.PreviousTip}"
+                            Width="34" Height="34">
+                        <controls:TransportGlyph Kind="Previous" Width="18" Height="18"
+                                                 Foreground="{DynamicResource IslandIconFill}" />
+                    </Button>
+
+                    <!-- Play/Pause button (prominent). No extra Margin: the panel's 2px
+                         Spacing alone keeps the prev/play/next/repeat cluster tight,
+                         Apple-Music style — gaps shrink, hit targets stay full size. -->
+                    <Button Classes="pill-btn-play transport-btn tx"
+                            Command="{Binding PlayPauseCommand}"
+                            ToolTip.Tip="{Binding PlayPauseTooltip}"
+                            Width="40"
+                            Height="40">
+                        <!-- Play when not playing, Pause while playing; morphs between them. -->
+                        <controls:TransportGlyph Kind="PlayPause" Width="20" Height="20"
+                                                 Foreground="{DynamicResource IslandIconFill}"
+                                                 IsPlaying="{Binding State, Converter={x:Static ObjectConverters.Equal}, ConverterParameter={x:Static m:PlaybackState.Playing}}" />
+                    </Button>
+
+                    <!-- Forward button -->
+                    <Button Classes="pill-btn transport-btn tx"
+                            Command="{Binding NextCommand}"
+                            ToolTip.Tip="{loc:T PlaybackBar.ForwardTip}"
+                            Width="34" Height="34">
+                        <controls:TransportGlyph Kind="Next" Width="18" Height="18"
+                                                 Foreground="{DynamicResource IslandIconFill}" />
+                    </Button>
+
+                    <!-- Skip forward N seconds (island extra) -->
+                    <Button Classes="pill-btn transport-btn"
+                            Command="{Binding SkipForwardCommand}"
+                            ToolTip.Tip="{Binding SkipForwardTooltip}"
+                            IsVisible="{Binding IslandShowSkipButtons}"
+                            Width="34" Height="34">
+                        <!-- Mirror of the back glyph: ring open at the top-right, arrowhead
+                             pointing right (clockwise = forward), the seconds inside. -->
+                        <Viewbox Width="22" Height="22">
+                            <Canvas Width="24" Height="24">
+                                <Path Stroke="{DynamicResource IslandIconFill}" StrokeThickness="1.75"
+                                      StrokeLineCap="Round" StrokeJoin="Round"
+                                      Data="M12 5 A8 8 0 1 0 18.93 9 M9 2 L12 5 L9 8" />
+                                <!-- The seconds as scaled geometry: a big-font TextBlock in a Viewbox pinned
+                                     on the ring's centre (12,13). A tiny font laid out directly landed a pixel
+                                     low-left after DPI rounding; measured this way it sits within 0.6 device px
+                                     of centre at 100–200% scale for 10 / 15 / 30. -->
+                                <Viewbox Canvas.Left="5.975" Canvas.Top="7.75" Width="12.65" Height="11">
+                                    <TextBlock Text="{Binding IslandSkipLabel}"
+                                               FontSize="20" FontWeight="SemiBold"
+                                               Foreground="{DynamicResource IslandIconFill}" />
+                                </Viewbox>
+                            </Canvas>
+                        </Viewbox>
+                    </Button>
+
+                    <!-- Sleep timer (island extra): the Options menu's sleep submenu, one click away.
+                         The accent pill lights while a timer (or end-of-track stop) is armed. -->
+                    <Button x:Name="SleepTimerButton"
+                            Classes="pill-btn transport-btn"
+                            ToolTip.Tip="{loc:T PlaybackBar.SleepTimerTip}"
+                            IsVisible="{Binding IslandShowSleepTimer}"
+                            Width="34" Height="34">
+                        <Panel Width="34" Height="34">
+                            <Border Width="28" Height="28"
+                                    CornerRadius="8"
+                                    Background="{DynamicResource AccentColorBrush}"
+                                    Opacity="0.18"
+                                    IsVisible="{Binding IsSleepTimerActive}" />
+                            <Border Width="28" Height="28"
+                                    CornerRadius="8"
+                                    Background="{DynamicResource AccentColorBrush}"
+                                    Opacity="0.18"
+                                    IsVisible="{Binding StopAfterCurrentTrack}" />
+                            <Viewbox Width="18" Height="18">
+                                <Canvas Width="24" Height="24">
+                                    <Path Stroke="{DynamicResource IslandIconFill}" StrokeThickness="2"
+                                          StrokeLineCap="Round" StrokeJoin="Round"
+                                          Data="M12 12 m-8 0 a8 8 0 1 0 16 0 a8 8 0 1 0 -16 0 M12 7.5 V12 L15 14.5" />
+                                </Canvas>
+                            </Viewbox>
+                        </Panel>
+                        <Button.Flyout>
+                            <MenuFlyout Placement="Top"
+                                        PlacementConstraintAdjustment="FlipY"
+                                        helpers:MenuOpenAnimation.EnableFlyoutClose="True"
+                                        helpers:GlassMenuFlyout.Enable="True">
+                                <MenuItem IsEnabled="False" IsVisible="{Binding IsSleepTimerActive}">
+                                    <MenuItem.Header>
+                                        <TextBlock FontSize="12" Opacity="0.7">
+                                            <Run Text="{loc:T PlaybackBar.Pausing}"/>
+                                            <Run Text="{Binding SleepTimerRemainingText}"/>
+                                        </TextBlock>
+                                    </MenuItem.Header>
+                                </MenuItem>
+                                <Separator IsVisible="{Binding IsSleepTimerActive}"/>
+                                <MenuItem Header="{loc:T PlaybackBar.15Minutes}" Command="{Binding StartSleepTimerCommand}" CommandParameter="15">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding SleepTimerMinutes, Converter={StaticResource IntEquals}, ConverterParameter=15}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <MenuItem Header="{loc:T PlaybackBar.30Minutes}" Command="{Binding StartSleepTimerCommand}" CommandParameter="30">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding SleepTimerMinutes, Converter={StaticResource IntEquals}, ConverterParameter=30}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <MenuItem Header="{loc:T PlaybackBar.45Minutes}" Command="{Binding StartSleepTimerCommand}" CommandParameter="45">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding SleepTimerMinutes, Converter={StaticResource IntEquals}, ConverterParameter=45}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <MenuItem Header="{loc:T PlaybackBar.1Hour}" Command="{Binding StartSleepTimerCommand}" CommandParameter="60">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding SleepTimerMinutes, Converter={StaticResource IntEquals}, ConverterParameter=60}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <MenuItem Header="{loc:T PlaybackBar.EndTrack}" Command="{Binding ToggleStopAfterCurrentCommand}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding StopAfterCurrentTrack}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <Separator IsVisible="{Binding IsSleepTimerActive}"/>
+                                <MenuItem Header="{loc:T PlaybackBar.CancelTimer}" IsVisible="{Binding IsSleepTimerActive}" Command="{Binding CancelSleepTimerCommand}"/>
+                            </MenuFlyout>
+                        </Button.Flyout>
+                    </Button>
+
+                    <!-- Repeat: cycles Off → All → One. A single PNG glyph is tinted by
+                         state (dimmed when off, accent when on); the centered "1" marks
+                         repeat-one, since there is no separate one-shot icon. While on,
+                         an Apple-Music-style soft accent pill sits behind the glyph:
+                         AccentColorBrush (Settings accent, kept live by App.SetAccent)
+                         knocked back by Border.Opacity — never a solid accent fill.
+                         Opt-in like the other island extras (Settings → Player Island
+                         Buttons → Repeat). -->
+                    <Button Classes="pill-btn transport-btn"
+                            Command="{Binding CycleRepeatCommand}"
+                            ToolTip.Tip="{Binding RepeatModeTip}"
+                            IsVisible="{Binding IslandShowRepeat}"
+                            Width="34" Height="34">
+                        <Panel Width="34" Height="34">
+                            <Border Width="28" Height="28"
+                                    CornerRadius="8"
+                                    Background="{DynamicResource AccentColorBrush}"
+                                    Opacity="0.18"
+                                    IsVisible="{Binding RepeatMode, Converter={x:Static ObjectConverters.NotEqual}, ConverterParameter={x:Static m:RepeatMode.Off}}" />
+                            <!-- The same filled repeat glyphs as the queue header and the mini player
+                                 (RepeatAllIcon / RepeatOneIcon): off in the island's icon colour,
+                                 all / one in the accent; repeat-one carries its own "1". -->
+                            <Panel Width="18" Height="18">
+                                <Viewbox Width="18" Height="18"
+                                         IsVisible="{Binding RepeatMode, Converter={x:Static ObjectConverters.Equal}, ConverterParameter={x:Static m:RepeatMode.Off}}">
+                                    <Canvas Width="24" Height="24">
+                                        <Path Fill="{DynamicResource IslandIconFill}" Data="{StaticResource RepeatAllIcon}"/>
+                                    </Canvas>
+                                </Viewbox>
+                                <Viewbox Width="18" Height="18"
+                                         IsVisible="{Binding RepeatMode, Converter={x:Static ObjectConverters.Equal}, ConverterParameter={x:Static m:RepeatMode.All}}">
+                                    <Canvas Width="24" Height="24">
+                                        <Path Fill="{DynamicResource AccentColorBrush}" Data="{StaticResource RepeatAllIcon}"/>
+                                    </Canvas>
+                                </Viewbox>
+                                <Viewbox Width="18" Height="18"
+                                         IsVisible="{Binding RepeatMode, Converter={x:Static ObjectConverters.Equal}, ConverterParameter={x:Static m:RepeatMode.One}}">
+                                    <Canvas Width="24" Height="24">
+                                        <Path Fill="{DynamicResource AccentColorBrush}" Data="{StaticResource RepeatOneIcon}"/>
+                                    </Canvas>
+                                </Viewbox>
+                            </Panel>
+                        </Panel>
+                    </Button>
+
+                    <!-- Shuffle (island extra, GitHub #59): after Repeat, same accent pill
+                         treatment while shuffle is on. Shuffle also stays in the Queue header. -->
+                    <Button Classes="pill-btn transport-btn"
+                            Command="{Binding ToggleShuffleCommand}"
+                            ToolTip.Tip="{loc:T PlaybackBar.ShuffleTip}"
+                            IsVisible="{Binding IslandShowShuffle}"
+                            Width="34" Height="34">
+                        <Panel Width="34" Height="34">
+                            <Border Width="28" Height="28"
+                                    CornerRadius="8"
+                                    Background="{DynamicResource AccentColorBrush}"
+                                    Opacity="0.18"
+                                    IsVisible="{Binding IsShuffleEnabled}" />
+                            <!-- Off: white glyph like the transport icons; on: accent glyph
+                                 like Repeat (Discord, Mistery 2026-09-21: arrows stayed white
+                                 on the accent wash). -->
+                            <Viewbox Width="18" Height="18">
+                                <Canvas Width="24" Height="24">
+                                    <Path Fill="{DynamicResource IslandIconFill}"
+                                          Data="{StaticResource ShuffleIcon}"
+                                          IsVisible="{Binding !IsShuffleEnabled}" />
+                                    <Path Fill="{DynamicResource AccentColorBrush}"
+                                          Data="{StaticResource ShuffleIcon}"
+                                          IsVisible="{Binding IsShuffleEnabled}" />
+                                </Canvas>
+                            </Viewbox>
+                        </Panel>
+                    </Button>
+
+                    <!-- EQ on/off (island extra, GitHub #94): the Settings → Audio master switch,
+                         same accent pill + accent glyph as Shuffle while the EQ is on. -->
+                    
+
+                </StackPanel>
+
+                <!-- CENTER: the track box — album art, title/artist, the now-playing bars
+                     and the options button in one rounded card, with the seek bar running
+                     along the card's bottom edge (right-click anywhere in it opens options).
+                     IsVisible is code-managed (UpdateTrackInfoVisibility): hidden on the
+                     lyrics page AND in the compact resize shape — a binding here would
+                     be a local value no width-driven style could ever override. -->
+                <Grid x:Name="TrackInfoPanel"
+                      Grid.Column="1"
+                      VerticalAlignment="Center"
+                      Margin="0,0,8,0"
+                      Background="Transparent">
+                  <!-- ClipToBounds (rounded, it follows CornerRadius): the seek track runs
+                       the card's full width so its ends are trimmed by the bottom corners
+                       and the line reads as coming out of the card's sides, like the
+                       reference LCD. Everything else stays clear of the edges. -->
+                  <!-- Fill: IslandTrackBoxColor (white; a light derived theme's is dark) at a
+                       user-set opacity (Settings → Player Island → Track Box Opacity, default
+                       7%); 0 hides the card entirely. -->
+                  <Border x:Name="TrackInfoBox"
+                          Height="41"
+                          CornerRadius="10"
+                          ClipToBounds="True">
+                    <Border.Background>
+                      <SolidColorBrush Color="{DynamicResource IslandTrackBoxColor}" Opacity="{Binding IslandTrackBoxOpacity}"/>
+                    </Border.Background>
+                  <Grid RowDefinitions="*,6">
+                  <!-- Art nearly fills the card (34px, 1px from the top, 3px in from the
+                       left) like the reference LCD. Its corner radius is the card's minus
+                       the inset (10 − 3 = 7) so the two corners run concentric — a smaller
+                       radius left a bright sliver of card fill inside the card's corner. -->
+                  <Grid Grid.Row="0" ColumnDefinitions="Auto,*,Auto,Auto" Margin="3,0,3,0">
+
+                    <!-- Album art thumbnail (a click opens the Mini Player). 32px, not 34: the
+                         2px it gives up is a gap above the seek line, and the seek hit strip
+                         below reaches up over the art's bottom edge. Flush against the line,
+                         a seek aimed a pixel high opened the Mini Player (Discord Luwi
+                         2026-10-05). It toggles on RELEASE over the art, so a drag that starts
+                         on it no longer fires. Dragged past the threshold, the art (and the
+                         title/artist block) drags the playing song like a library row — onto a
+                         sidebar playlist or the queue (Discord, Luwi 2026-10-17). -->
+                    <Border Grid.Column="0"
+                            x:Name="AlbumArtThumb"
+                            helpers:DragFileBehavior.DragItem="{Binding CurrentTrack}"
+                            helpers:DragFileBehavior.EnableFileDrag="True"
+                            Width="32" Height="32"
+                            CornerRadius="7"
+                            ClipToBounds="True"
+                            Margin="1,1,8,0"
+                            VerticalAlignment="Top"
+                            Cursor="Hand"
+                            ToolTip.Tip="{loc:T PlaybackBar.MiniPlayerTip}"
+                            ToolTip.Placement="Top"
+                            ToolTip.VerticalOffset="-6"
+                            PointerPressed="OnAlbumArtPressed"
+                            PointerMoved="OnAlbumArtMoved"
+                            PointerReleased="OnAlbumArtReleased"
+                            Background="{DynamicResource IslandAlbumArtPlaceholder}">
+                        <Panel>
+                            <!-- Placeholder when no art -->
+                            <TextBlock Text="♪"
+                                       FontSize="22"
+                                       HorizontalAlignment="Center"
+                                       VerticalAlignment="Center"
+                                       Opacity="0.3"
+                                       Foreground="{DynamicResource IslandForegroundTertiary}"
+                                       IsVisible="{Binding CurrentArtPath, Converter={x:Static StringConverters.IsNullOrEmpty}}" />
+                            <!-- Actual artwork — always the still cover here; the animated
+                                 cover is shown on the album, lyrics and cover-flow pages only.
+                                 CachedImage keeps the previous bitmap visible during async
+                                 cache-miss decode so there's no flash on track switch. -->
+                            <controls:CachedImage SourcePath="{Binding CurrentArtPath}" ClearOnSourceChange="False"
+                                                  Stretch="UniformToFill"
+                                                  RenderOptions.BitmapInterpolationMode="HighQuality"
+                                                  IsVisible="{Binding CurrentArtPath, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                        </Panel>
+                    </Border>
+
+                    <!-- Track info: title + artist (the seek bar is the box's bottom row) -->
+                    <Grid Grid.Column="1"
+                          x:Name="TrackInfoContent"
+                          helpers:DragFileBehavior.DragItem="{Binding CurrentTrack}"
+                          helpers:DragFileBehavior.EnableFileDrag="True"
+                          VerticalAlignment="Center"
+                          MinWidth="80"
+                          MaxWidth="520"
+                          ClipToBounds="False">
+                        <StackPanel>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+
+                            <!-- Track title + explicit badge -->
+                            <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="6">
+                            <!-- Width (styled, so the bar-mid resize shape can narrow it) + right
+                                 margin keep the original 200px footprint but pull the clip edge
+                                 8px inward, so clipped/ellipsized text always has a gap before
+                                 whatever sits to the right. (Shrinking the width alone is a
+                                 no-op: the auto-sized column shrinks with it.) -->
+                            <Border x:Name="TrackTitleViewport"
+                                    Margin="0,0,8,0"
+                                    ClipToBounds="True"
+                                    HorizontalAlignment="Left"
+                                    VerticalAlignment="Center">
+                                <!-- Title is a link button: clicking it opens the current
+                                     track's album. Mirrors the artist link below. -->
+                                <Button Classes="artist-link-btn"
+                                        Background="Transparent" BorderThickness="0" Padding="0"
+                                        Cursor="Hand" HorizontalAlignment="Left"
+                                        Command="{Binding ViewCurrentTrackAlbumCommand}"
+                                        ToolTip.Tip="{loc:T PlaybackBar.ViewAlbumTip}">
+                                <StackPanel x:Name="TrackTitleContent"
+                                            Orientation="Horizontal"
+                                            Spacing="6">
+                                    <StackPanel.RenderTransform>
+                                        <TranslateTransform X="0" />
+                                    </StackPanel.RenderTransform>
+                                    <Border Classes="artist-text-hover"
+                                            CornerRadius="2"
+                                            Padding="1,0,2,0">
+                                        <TextBlock x:Name="TrackTitleTextBlock"
+                                                   Text="{Binding CurrentTrack, Converter={StaticResource DisplayTitle}, FallbackValue='No track selected'}"
+                                                   Classes="one-line-explicit-title"
+                                                   FontSize="12"
+                                                   FontWeight="SemiBold"
+                                                   MaxLines="1"
+                                                   VerticalAlignment="Center"
+                                                   Foreground="{DynamicResource IslandForeground}" />
+                                    </Border>
+                                    <!-- DataContext narrows to the Track (null while nothing plays), so
+                                         IsVisible never walks a null CurrentTrack chain — a chain broken
+                                         mid-path logs an Avalonia binding warning at every startup, while a
+                                         null DataContext is silently "no value" and FallbackValue keeps the
+                                         badge hidden. Track's IsExplicit INPC still drives live updates. -->
+                                    <Border x:Name="ExplicitBadge"
+                                            Background="{DynamicResource IslandExplicitBadge}"
+                                            CornerRadius="2"
+                                            Padding="4,0"
+                                            Height="14"
+                                            VerticalAlignment="Center"
+                                            DataContext="{Binding CurrentTrack}"
+                                            x:DataType="m:Track"
+                                            IsVisible="{Binding IsExplicit, FallbackValue=False}"
+                                            ToolTip.Tip="{loc:T PlaybackBar.ExplicitTip}">
+                                        <TextBlock Text="E"
+                                                   FontSize="9"
+                                                   FontWeight="Bold"
+                                                   VerticalAlignment="Center"
+                                                   TextAlignment="Center"
+                                                   Foreground="{DynamicResource IslandIconFill}" />
+                                    </Border>
+                                    <!-- Ticker loop copy (09-17): the same title + badge one gap behind,
+                                         so the head is already sliding in from the right while the tail
+                                         leaves on the left — the viewport is never blank. Margin absorbs
+                                         the panel spacing (48 − 6); code-behind shows it only while the
+                                         marquee owns the title. -->
+                                    <StackPanel x:Name="TrackTitleLoopCopy"
+                                                Orientation="Horizontal"
+                                                Spacing="6"
+                                                Margin="42,0,0,0"
+                                                IsVisible="False">
+                                        <TextBlock Text="{Binding CurrentTrack, Converter={StaticResource DisplayTitle}, FallbackValue=''}"
+                                                   Classes="one-line-explicit-title"
+                                                   FontSize="12"
+                                                   FontWeight="SemiBold"
+                                                   MaxLines="1"
+                                                   Margin="1,0,2,0"
+                                                   VerticalAlignment="Center"
+                                                   Foreground="{DynamicResource IslandForeground}" />
+                                        <Border Background="{DynamicResource IslandExplicitBadge}"
+                                                CornerRadius="2"
+                                                Padding="4,0"
+                                                Height="14"
+                                                VerticalAlignment="Center"
+                                                DataContext="{Binding CurrentTrack}"
+                                                x:DataType="m:Track"
+                                                IsVisible="{Binding IsExplicit, FallbackValue=False}">
+                                            <TextBlock Text="E"
+                                                       FontSize="9"
+                                                       FontWeight="Bold"
+                                                       VerticalAlignment="Center"
+                                                       TextAlignment="Center"
+                                                       Foreground="{DynamicResource IslandIconFill}" />
+                                        </Border>
+                                    </StackPanel>
+                                </StackPanel>
+                                </Button>
+                            </Border>
+                            </StackPanel>
+
+                            <!-- Artist name. The 200px viewport clips the marquee; the Button
+                                 sits inside and wraps only the text, so hover/click are limited
+                                 to the artist name itself, not the blank space to its right.
+                                 Clicking opens the discography of the name under the pointer —
+                                 a multi-artist credit stays one marquee run, so the code-behind
+                                 resolves the clicked character to a name (ArtistCreditSpans)
+                                 and falls back to the primary artist over a separator. -->
+                            <Border x:Name="ArtistNameViewport"
+                                    Grid.Row="1"
+                                    Margin="0,0,8,0"
+                                    ClipToBounds="True"
+                                    HorizontalAlignment="Left">
+                                <Button x:Name="ArtistNameButton"
+                                        Classes="artist-link-btn"
+                                        Background="Transparent" BorderThickness="0" Padding="0"
+                                        Cursor="Hand" HorizontalAlignment="Left"
+                                        ToolTip.Tip="{loc:T PlaybackBar.ViewArtistTip}">
+                                    <StackPanel Orientation="Horizontal">
+                                        <!-- No artist-text-hover class: the hover/press box is painted
+                                             behind the ONE name under the pointer, on the marquee run
+                                             itself so it scrolls with the text (code-behind
+                                             PaintArtistNameBox; the rows' ArtistCreditLink box).
+                                             Discord (Luwi, 2026-10-17). -->
+                                        <Border CornerRadius="2"
+                                                Padding="1,0,2,0"
+                                                Margin="0,0,0,-2">
+                                            <!-- Converter form (same shape as the title above): binding through
+                                                 CurrentTrack.Artist broke mid-chain while no track was playing
+                                                 and logged a warning at every startup. Artist raises no INPC, so
+                                                 re-evaluating on CurrentTrack change is exactly equivalent. -->
+                                            <TextBlock x:Name="ArtistNameTextBlock"
+                                                       Classes="bar-artist"
+                                                       Text="{Binding CurrentTrack, Converter={StaticResource DisplayArtist}, FallbackValue=''}"
+                                                       FontSize="10"
+                                                       MaxLines="1"
+                                                       Margin="0,1,0,0">
+                                                <TextBlock.RenderTransform>
+                                                    <TranslateTransform X="0" />
+                                                </TextBlock.RenderTransform>
+                                            </TextBlock>
+                                        </Border>
+                                        <!-- Ticker loop copy (09-17), see TrackTitleLoopCopy. Margin =
+                                             48 − the hover border's 3px padding, so it sits one gap after
+                                             the text; it rides the same offset as the text. -->
+                                        <TextBlock x:Name="ArtistNameLoopCopy"
+                                                   Classes="bar-artist"
+                                                   Text="{Binding CurrentTrack, Converter={StaticResource DisplayArtist}, FallbackValue=''}"
+                                                   FontSize="10"
+                                                   MaxLines="1"
+                                                   Margin="45,1,0,0"
+                                                   IsVisible="False">
+                                            <TextBlock.RenderTransform>
+                                                <TranslateTransform X="0" />
+                                            </TextBlock.RenderTransform>
+                                        </TextBlock>
+                                    </StackPanel>
+                                </Button>
+                            </Border>
+
+                            </Grid>
+                        </StackPanel>
+                    </Grid>
+
+                    <!-- Playback time (Settings → Player → Playback time; Discord, Luwi 09-21):
+                         elapsed over remaining, stacked like the LCD's own two text rows and
+                         right-aligned so the digits tick in place. The island grows by
+                         IslandTimeWidth while this is on (see ExtraTransportWidth) so the
+                         title/artist viewports keep their full width. -->
+                    <StackPanel Grid.Column="2"
+                                x:Name="TrackTimeStack"
+                                VerticalAlignment="Center"
+                                Margin="0,0,8,0"
+                                MinWidth="36"
+                                IsVisible="{Binding IslandShowTime}">
+                        <TextBlock Text="{Binding PositionText}"
+                                   FontSize="10"
+                                   FontWeight="SemiBold"
+                                   TextAlignment="Right"
+                                   HorizontalAlignment="Right"
+                                   Foreground="{DynamicResource IslandForeground}" />
+                        <TextBlock Text="{Binding RemainingTimeText, StringFormat='-{0}'}"
+                                   FontSize="10"
+                                   TextAlignment="Right"
+                                   HorizontalAlignment="Right"
+                                   Foreground="{DynamicResource IslandForegroundSecondary}" />
+                    </StackPanel>
+
+                    <!-- Now-playing bars (the same EqVisualizer the album/track rows use,
+                         accent-coloured by its default style) + the options button, on the
+                         box's right edge. The MenuFlyout itself stays declared on the right
+                         cluster's OptionsButton — the fallback shown only while this box is
+                         hidden — and this button opens that same flyout anchored here. -->
+                    <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center">
+                        <controls:EqVisualizer Width="22" Height="18"
+                                               VerticalAlignment="Center"
+                                               IsPlaying="{Binding IsPlaying}" />
+                        <Button x:Name="BoxOptionsButton"
+                                Classes="secondary-btn"
+                                Click="OnBoxOptionsClick"
+                                ToolTip.Tip="{loc:T PlaybackBar.OptionsTip}"
+                                Width="28" Height="28">
+                            <Viewbox Width="16" Height="16">
+                                <Canvas Width="24" Height="24">
+                                    <Path Fill="{DynamicResource IslandIconFill}"
+                                          Data="{StaticResource MoreDotsIcon}" />
+                                </Canvas>
+                            </Viewbox>
+                        </Button>
+                    </StackPanel>
+                  </Grid>
+
+                  <!-- Seek bar along the card's bottom edge: a 6px row whose 3px track sits
+                       2px under the art and 1px above the card's bottom — the line IS the
+                       card's bottom edge, as in the reference LCD. PillSliderVisualHelper
+                       insets the track by half the 12px thumb host on each side, so the
+                       row hangs 6px past the card on both sides: the track then spans the
+                       card edge to edge and the card's rounded clip trims its ends into the
+                       corners. The 6px thumb (centre y = 3.5 in the row) stays inside the
+                       card; hovering only fades it in — no time labels, no thicker track
+                       (see the seek-row styles above). -->
+                  <Grid Grid.Row="1" Height="6" Margin="-6,0,-6,0" ClipToBounds="False"
+                        Classes="seek-row" Background="Transparent">
+                      <Grid Height="6" ClipToBounds="False">
+                          <!-- Waveform seek bar (Settings → Player, GitHub #93): replaces the
+                               3px line below while on. 7px tall with the extra pixel hanging
+                               under the row so its centre (3.5) is the line's centre; the
+                               card's rounded clip trims it like the line. Visual only — the
+                               Slider on top still does the seeking. -->
+                          <controls:WaveformSeekBar x:Name="SeekWaveform"
+                                                    IsVisible="{Binding WaveformSeekBarEnabled}"
+                                                    Waveform="{Binding CurrentWaveform}"
+                                                    Value="{Binding #SeekSlider.Value}"
+                                                    PlayedBrush="{DynamicResource IslandSliderFilled}"
+                                                    UnplayedBrush="{DynamicResource IslandTrackBoxSliderUnfilled}"
+                                                    TrackInset="6" LineInset="6" LineThickness="3"
+                                                    MaxBarHeight="6"
+                                                    Height="7" Margin="0,0,0,-1"
+                                                    VerticalAlignment="Top"
+                                                    IsHitTestVisible="False"/>
+                          <Canvas x:Name="SeekVisual"
+                                  Height="6"
+                                  ClipToBounds="False"
+                                  IsHitTestVisible="False">
+                              <!-- Remainder: a faint light line, not IslandSliderUnfilled —
+                                   that opaque dark grey (#3A3A3A in the Dark theme) sat
+                                   darker than the card and read as a shadow trough. -->
+                              <Border x:Name="SeekTrackBackground"
+                                      Classes="seek-track"
+                                      IsVisible="{Binding !WaveformSeekBarEnabled}"
+                                      CornerRadius="999"
+                                      Background="{DynamicResource IslandTrackBoxSliderUnfilled}"
+                                      Canvas.Top="2"/>
+                              <Border x:Name="SeekTrackFill"
+                                      Classes="seek-track"
+                                      IsVisible="{Binding !WaveformSeekBarEnabled}"
+                                      CornerRadius="999"
+                                      Background="{DynamicResource IslandSliderFilled}"
+                                      Canvas.Top="2"/>
+                              <!-- Fixed 12x12 host keeps the thumb's centre where the
+                                   code-behind transform expects it (on the track's centre
+                                   line, y = 3.5) while the inner circle fades with the
+                                   hover styles. -->
+                              <Panel Classes="seek-thumb-host"
+                                     Width="12"
+                                     Height="12"
+                                     Canvas.Top="-2.5">
+                                  <Border x:Name="SeekThumb"
+                                          Classes="seek-thumb"
+                                          HorizontalAlignment="Center"
+                                          VerticalAlignment="Center"
+                                          CornerRadius="999"
+                                          Background="{DynamicResource IslandSliderFilled}"
+                                          BoxShadow="0 2 4 0 #40000000"/>
+                              </Panel>
+                          </Canvas>
+                          <!-- Hit strip 14px tall, bottom-aligned: it reaches 8px up over the
+                               row above (the art's bottom edge included — this row is drawn
+                               later, so it wins the hit test). The drawn line is unchanged; the
+                               old 6px strip made a seek near the art open the Mini Player. -->
+                          <Slider Value="{Binding PositionFraction, Mode=TwoWay}"
+                                  Classes="seek-slider"
+                                  AutomationProperties.Name="{loc:T PlaybackBar.Seek}"
+                                  Minimum="0" Maximum="1"
+                                  Focusable="False"
+                                  Height="14"
+                                  Margin="0,-8,0,0"
+                                  VerticalAlignment="Bottom"
+                                  x:Name="SeekSlider" />
+                      </Grid>
+                  </Grid>
+                  </Grid>
+                  </Border>
+                </Grid>
+
+                <!-- RIGHT: Additional Controls -->
+                <StackPanel Grid.Column="2"
+                            Orientation="Horizontal"
+                            Spacing="2"
+                            VerticalAlignment="Center">
+
+                    <!-- Favorite (Discord, Reuben Strides 2026-08-25): one click instead of
+                         "… → Favorites". Opt-in like the other island extras (Settings →
+                         Player Island Buttons → Favorite); its width is budgeted with them
+                         in the code-behind (ExtraTransportWidth). -->
+                    <Button x:Name="FavoriteButton"
+                            Classes="secondary-btn"
+                            Command="{Binding ToggleCurrentTrackFavoriteCommand}"
+                            IsEnabled="{Binding CurrentTrack, Converter={x:Static ObjectConverters.IsNotNull}}"
+                            IsVisible="{Binding IslandShowFavorite}"
+                            ToolTip.Tip="{loc:T PlaybackBar.FavoriteTip}"
+                            Width="34" Height="34">
+                        <controls:HeartIcon Size="16"
+                                            OffBrush="{DynamicResource IslandIconFill}" OffOpacity="0.7"
+                                            IsFavorite="{Binding CurrentTrack.IsFavorite, FallbackValue=False}" />
+                    </Button>
+
+                    <!-- More options: the everyday "…" lives inside the track box
+                         (BoxOptionsButton). This one owns the MenuFlyout and is the
+                         fallback shown only while the box is hidden — the lyrics-page bar
+                         and the compact resize shape — so the lyrics-only menu entries
+                         stay reachable there. IsVisible is code-managed
+                         (UpdateTrackInfoVisibility), the inverse of TrackInfoPanel. -->
+                    <Button x:Name="OptionsButton"
+                            Classes="secondary-btn"
+                            ToolTip.Tip="{loc:T PlaybackBar.OptionsTip}"
+                            IsVisible="False"
+                            Width="34" Height="34">
+                        <Viewbox Width="16" Height="16">
+                            <Canvas Width="24" Height="24">
+                                <Path Fill="{DynamicResource IslandIconFill}"
+                                      Data="{StaticResource MoreDotsIcon}" />
+                            </Canvas>
+                        </Viewbox>
+                        <Button.Flyout>
+                            <MenuFlyout Placement="TopEdgeAlignedLeft"
+                                        PlacementConstraintAdjustment="FlipY"
+                                        helpers:MenuOpenAnimation.EnableFlyoutClose="True"
+                                        helpers:GlassMenuFlyout.Enable="True">
+                                <!-- Same layout as the track menus elsewhere (Home, Songs, albums; owner
+                                     10-10): the Play / Shuffle / Play Next / Add to Queue tiles go in on
+                                     top from code (OnOptionsMenuOpening), then the same groups in the same
+                                     order, with the player's own entries (sleep timer, lyrics page) in
+                                     groups of their own. Separators settle per open (MenuV2.RefreshLayout). -->
+                                <Separator />
+                                <MenuItem x:Name="AddToPlaylistMenuItem"
+                                          Header="{loc:T PlaybackBar.AddPlaylist}"
+                                          Command="{Binding AddCurrentTrackToNewPlaylistCommand}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLinePlaylistAdd}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <MenuItem Header="{loc:T PlaybackBar.Favorites}"
+                                          Command="{Binding ToggleCurrentTrackFavoriteCommand}"
+                                          IsVisible="{Binding CurrentTrack.IsFavorite, Converter={x:Static BoolConverters.Not}, FallbackValue=True}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineHeart}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <MenuItem Header="{loc:T PlaybackBar.RemoveFromFavorites}"
+                                          Command="{Binding ToggleCurrentTrackFavoriteCommand}"
+                                          IsVisible="{Binding CurrentTrack.IsFavorite, FallbackValue=False}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon mv2-fav" Data="{StaticResource MenuLineHeart}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <Separator />
+                                <MenuItem Header="{loc:T PlaybackBar.ViewAlbumTip}"
+                                          Command="{Binding ViewCurrentTrackAlbumCommand}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineAlbum}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <!-- One credited artist opens directly; several get one entry each
+                                     (filled per open, like TrackContextMenuBuilder.BindViewArtist). -->
+                                <MenuItem x:Name="ViewArtistMenuItem"
+                                          Header="{loc:T PlaybackBar.ViewArtistTip}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineArtist}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <Separator />
+                                <MenuItem Header="{loc:T PlaybackBar.Metadata}"
+                                          Command="{Binding OpenCurrentTrackMetadataCommand}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineEdit}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <MenuItem Header="{loc:T Tab.Lyrics}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineLyrics}"/>
+                                    </MenuItem.Icon>
+                                    <MenuItem Header="{loc:T PlaybackBar.SearchLyrics}"
+                                              Command="{Binding SearchCurrentTrackLyricsCommand}">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineSearch}"/>
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                    <!-- Lyrics page (GitHub #115): save the lyrics next to the song under its
+                                         name, replacing its lyrics files (asks first). LRC for online lyrics;
+                                         TTML (Discord, nutf!xx) for any time-synced lyrics not read from a .ttml. -->
+                                    <MenuItem Header="{loc:T PlaybackBar.SaveLyrics}"
+                                              IsVisible="{Binding HasSaveLyricsMenu}">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineSave}"/>
+                                        </MenuItem.Icon>
+                                        <MenuItem Header="{loc:T PlaybackBar.SaveLyricsLrc}"
+                                                  Command="{Binding SaveCurrentTrackLyricsCommand}"
+                                                  IsVisible="{Binding CanSaveLyricsToFile}">
+                                            <MenuItem.Icon>
+                                                <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineText}"/>
+                                            </MenuItem.Icon>
+                                        </MenuItem>
+                                        <MenuItem Header="{loc:T PlaybackBar.SaveLyricsTtml}"
+                                                  Command="{Binding SaveCurrentTrackLyricsAsTtmlCommand}"
+                                                  IsEnabled="{Binding CanSaveLyricsAsTtml}">
+                                            <MenuItem.Icon>
+                                                <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineLyrics}"/>
+                                            </MenuItem.Icon>
+                                        </MenuItem>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T PlaybackBar.ShareLyrics}"
+                                              Command="{Binding ShareCurrentTrackLyricsCommand}"
+                                              IsVisible="{Binding CanShareLyrics}">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineCamera}"/>
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                    <!-- Lyrics side-panel toggle (everywhere but the lyrics full view). -->
+                                    <MenuItem Header="{loc:T PlaybackBar.LyricsPanel}"
+                                              Click="OnLyricsPanelButtonClick"
+                                              IsVisible="{Binding !IsLyricsPageActive}">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineLyricsPanel}"/>
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                    <!-- GitHub #162: the song has no lyrics (an instrumental) — nothing
+                                         searches it automatically any more; Undo from the same place. -->
+                                    <MenuItem Header="{loc:T PlaybackBar.MarkNoLyrics}"
+                                              Command="{Binding MarkCurrentTrackNoLyricsCommand}"
+                                              IsVisible="{Binding CanMarkNoLyrics}">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineLyrics}"/>
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T PlaybackBar.UnmarkNoLyrics}"
+                                              Command="{Binding UnmarkCurrentTrackNoLyricsCommand}"
+                                              IsVisible="{Binding IsLyricsMarkedNoLyrics}">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineLyrics}"/>
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T PlaybackBar.RemoveLyrics}" Classes="danger"
+                                              Command="{Binding RemoveCurrentTrackLyricsCommand}"
+                                              IsVisible="{Binding IsLyricsPageActive}">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineTrash}"/>
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                </MenuItem>
+                                <MenuItem Header="{loc:T AlbumDetail.LyricsBackgroundVideo}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineVideo}"/>
+                                    </MenuItem.Icon>
+                                    <MenuItem Header="{loc:T Menu.ChooseSongVideo}"
+                                              Command="{x:Static helpers:LyricsBackgroundOverrides.ChooseForTrackCommand}"
+                                              CommandParameter="{Binding CurrentTrack}" />
+                                    <MenuItem x:Name="LyricsBackgroundClearMenuItem"
+                                              Header="{loc:T AlbumDetail.UseDefaultVideo}"
+                                              Command="{x:Static helpers:LyricsBackgroundOverrides.ClearForTrackCommand}"
+                                              CommandParameter="{Binding CurrentTrack}" />
+                                </MenuItem>
+                                <Separator />
+                                <MenuItem Header="{loc:T PlaybackBar.ShowFolder}"
+                                          Command="{Binding ShowCurrentTrackInExplorerCommand}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineFolder}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <MenuItem Header="{loc:T Favorites.Tools}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineTools}"/>
+                                    </MenuItem.Icon>
+                                    <MenuItem Header="{loc:T Favorites.Spectrogram}"
+                                              Command="{x:Static helpers:SpectrogramLauncher.OpenCommand}"
+                                              CommandParameter="{Binding CurrentTrack}">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineSpectrogram}"/>
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                    <!-- Header, visibility and command per open (ExternalOpenApp reads Settings). -->
+                                    <MenuItem x:Name="OpenWithMenuItem"
+                                              CommandParameter="{Binding CurrentTrack}">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineOpenWith}"/>
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                </MenuItem>
+                                <Separator />
+                                <!-- Audiobook chapters (.m4b, Discord Luwi): one row per chapter, filled
+                                     per open (BindChapters); shown only when the file has two or more. -->
+                                <MenuItem x:Name="ChaptersMenuItem"
+                                          Header="{loc:T PlaybackBar.Chapters}"
+                                          IsVisible="{Binding HasChapters}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineChapters}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <MenuItem Header="{loc:T PlaybackBar.SleepTimer}"
+                                          x:Name="SleepTimerMenuItem">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineTimer}"/>
+                                    </MenuItem.Icon>
+                                    <MenuItem IsEnabled="False" IsVisible="{Binding IsSleepTimerActive}">
+                                        <MenuItem.Header>
+                                            <TextBlock FontSize="12" Opacity="0.7">
+                                                <Run Text="{loc:T PlaybackBar.Pausing}"/>
+                                                <Run Text="{Binding SleepTimerRemainingText}"/>
+                                            </TextBlock>
+                                        </MenuItem.Header>
+                                    </MenuItem>
+                                    <Separator IsVisible="{Binding IsSleepTimerActive}"/>
+                                    <MenuItem Header="{loc:T PlaybackBar.15Minutes}"
+                                              Command="{Binding StartSleepTimerCommand}"
+                                              CommandParameter="15">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding SleepTimerMinutes, Converter={StaticResource IntEquals}, ConverterParameter=15}"/>
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T PlaybackBar.30Minutes}"
+                                              Command="{Binding StartSleepTimerCommand}"
+                                              CommandParameter="30">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding SleepTimerMinutes, Converter={StaticResource IntEquals}, ConverterParameter=30}"/>
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T PlaybackBar.45Minutes}"
+                                              Command="{Binding StartSleepTimerCommand}"
+                                              CommandParameter="45">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding SleepTimerMinutes, Converter={StaticResource IntEquals}, ConverterParameter=45}"/>
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T PlaybackBar.1Hour}"
+                                              Command="{Binding StartSleepTimerCommand}"
+                                              CommandParameter="60">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding SleepTimerMinutes, Converter={StaticResource IntEquals}, ConverterParameter=60}"/>
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T PlaybackBar.EndTrack}"
+                                              Command="{Binding ToggleStopAfterCurrentCommand}">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding StopAfterCurrentTrack}"/>
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                    <Separator IsVisible="{Binding IsSleepTimerActive}"/>
+                                    <MenuItem Header="{loc:T PlaybackBar.CancelTimer}"
+                                              IsVisible="{Binding IsSleepTimerActive}"
+                                              Command="{Binding CancelSleepTimerCommand}"/>
+                                </MenuItem>
+                                <!-- Redundant with Sleep Timer → "End of track"; hidden on the
+                                     lyrics page to slim that menu, kept on the main bar. -->
+                                <MenuItem Header="{loc:T PlaybackBar.StopAfterCurrentTrack}"
+                                          Command="{Binding ToggleStopAfterCurrentCommand}"
+                                          IsVisible="{Binding !IsLyricsPageActive}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding StopAfterCurrentTrack}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <!-- Lyrics-page entries (only while the bar is mounted inside the lyrics
+                                     page): their own group above Remove, so the danger row stays last. -->
+                                <Separator />
+                                <MenuItem x:Name="LyricsDisplayMenuItem"
+                                          Header="{loc:T PlaybackBar.LyricsDisplay}"
+                                          IsVisible="{Binding IsLyricsPageActive}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineText}"/>
+                                    </MenuItem.Icon>
+                                    <MenuItem Header="{loc:T PlaybackBar.Synced}"
+                                              Command="{Binding SetLyricsSyncedCommand}"
+                                              IsEnabled="{Binding IsLyricsSyncedAvailable}">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding IsLyricsSyncedActive}"/>
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{loc:T PlaybackBar.Plain}"
+                                              Command="{Binding SetLyricsPlainCommand}">
+                                        <MenuItem.Icon>
+                                            <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding IsLyricsPlainActive}"/>
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                </MenuItem>
+                                <MenuItem Header="{loc:T PlaybackBar.BackgroundColor}"
+                                          Command="{Binding OpenLyricsBackgroundColorCommand}"
+                                          IsVisible="{Binding IsLyricsPageActive}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLinePalette}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <MenuItem Header="{loc:T PlaybackBar.MusicVideo}"
+                                          Command="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Settings.ToggleMusicVideosCommand}"
+                                          ToolTip.Tip="{loc:T Settings.MusicVideosHint}"
+                                          IsVisible="{Binding CurrentTrackHasMusicVideoFile}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Settings.MusicVideosEnabled}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <MenuItem Header="{loc:T PlaybackBar.MusicVideoAudio}"
+                                          Command="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Settings.ToggleMusicVideoAudioCommand}"
+                                          ToolTip.Tip="{loc:T Settings.MusicVideoAudioHint}"
+                                          IsEnabled="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Settings.MusicVideosEnabled}"
+                                          IsVisible="{Binding CurrentTrackHasMusicVideoFile}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Settings.MusicVideoUseVideoAudio}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <!-- The lyrics page's Audio / Video switch, from the island: shown on the
+                                     lyrics page while the song's clip is on screen. -->
+                                <MenuItem Header="{loc:T PlaybackBar.WatchMusicVideo}"
+                                          Command="{Binding ToggleWatchMusicVideoCommand}"
+                                          IsVisible="{Binding HasMusicVideo}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon mv2-check" Data="{StaticResource MenuLineCheck}" IsVisible="{Binding IsWatchingMusicVideo}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <Separator />
+                                <MenuItem Header="{loc:T PlaybackBar.RemoveFromLibrary}" Classes="danger"
+                                          Command="{Binding RemoveCurrentTrackFromLibraryCommand}">
+                                    <MenuItem.Icon>
+                                        <controls:LineIcon Classes="mv2-icon" Data="{StaticResource MenuLineTrash}"/>
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                            </MenuFlyout>
+                        </Button.Flyout>
+                    </Button>
+
+                    <!-- Mini player (GitHub #80): unlike the album-art toggle it stays on the
+                         lyrics page and the compact shape. Settings → Player, on by default.
+                         Same toggle as OnAlbumArtPressed. -->
+                    <Button x:Name="MiniPlayerButton"
+                            Classes="secondary-btn"
+                            IsVisible="{Binding IslandShowMiniPlayer}"
+                            Click="OnMiniPlayerButtonClick"
+                            ToolTip.Tip="{loc:T PlaybackBar.MiniPlayerTip}"
+                            Width="34" Height="34">
+                        <Viewbox Width="16" Height="16">
+                            <Canvas Width="24" Height="24">
+                                <Path Stroke="{DynamicResource IslandIconFill}" StrokeThickness="1.5"
+                                      StrokeLineCap="Round" StrokeJoin="Round"
+                                      Data="{StaticResource MiniPlayerIcon}" />
+                            </Canvas>
+                        </Viewbox>
+                    </Button>
+
+                    <!-- Lyrics and Queue: while their page / panel is open, the same faint accent
+                         square and accent glyph as Repeat and Shuffle (Discord, Luwi 2026-10-10:
+                         "Show icons in Accent Color when corresponding panels are opened"). -->
+                    <Button Classes="secondary-btn"
+                            Click="OnLyricsButtonClick"
+                            ToolTip.Tip="{loc:T PlaybackBar.LyricsTip}"
+                            Width="34" Height="34">
+                        <Panel Width="34" Height="34">
+                            <Border Width="28" Height="28"
+                                    CornerRadius="8"
+                                    Background="{DynamicResource AccentColorBrush}"
+                                    Opacity="0.18"
+                                    IsVisible="{Binding IsLyricsPageActive}" />
+                            <controls:LineIcon Width="18" Height="18" Data="{StaticResource MenuLineLyrics}" Foreground="{DynamicResource IslandIconFill}"
+                                               IsVisible="{Binding !IsLyricsPageActive}" />
+                            <controls:LineIcon Width="18" Height="18" Data="{StaticResource MenuLineLyrics}" Foreground="{DynamicResource AccentColorBrush}"
+                                               IsVisible="{Binding IsLyricsPageActive}" />
+                        </Panel>
+                    </Button>
+
+                    <!-- Queue button -->
+                    <Button Classes="secondary-btn"
+                            Command="{Binding ShowQueueCommand}"
+                            Tag="QueueToggle"
+                            ToolTip.Tip="{loc:T PlaybackBar.QueueTip}"
+                            Width="34" Height="34">
+                        <Panel Width="34" Height="34">
+                            <Border Width="28" Height="28"
+                                    CornerRadius="8"
+                                    Background="{DynamicResource AccentColorBrush}"
+                                    Opacity="0.18"
+                                    IsVisible="{Binding IsQueuePopupOpen}" />
+                            <controls:LineIcon Width="18" Height="18" Data="{StaticResource MenuLineQueue}" Foreground="{DynamicResource IslandIconFill}"
+                                               IsVisible="{Binding !IsQueuePopupOpen}" />
+                            <controls:LineIcon Width="18" Height="18" Data="{StaticResource MenuLineQueue}" Foreground="{DynamicResource AccentColorBrush}"
+                                               IsVisible="{Binding IsQueuePopupOpen}" />
+                        </Panel>
+                    </Button>
+
+                    <!-- Volume control: clicking the icon opens a small slider popup above it.
+                         Click 1 opens the popup; click 2 (while open) toggles mute and keeps the
+                         popup visible. Moving the cursor off both the icon and the popup closes it. -->
+                    <StackPanel x:Name="VolumeContainer" Orientation="Horizontal" Spacing="5"
+                                VerticalAlignment="Center"
+                                PointerWheelChanged="OnVolumeWheelChanged">
+                        <Button x:Name="VolumeButton"
+                                Classes="secondary-btn"
+                                Click="OnVolumeIconClick"
+                                PointerEntered="OnVolumeButtonPointerEntered"
+                                PointerExited="OnVolumeButtonPointerExited"
+                                ToolTip.Tip="{loc:T PlaybackBar.VolumeTip}"
+                                Width="34" Height="34">
+                            <Panel>
+                                <!-- Muted icon -->
+                                <Viewbox Width="16" Height="16"
+                                         Opacity="0.4"
+                                         IsVisible="{Binding IsMuted}">
+                                    <Canvas Width="24" Height="24">
+                                        <Path Fill="{DynamicResource IslandIconFill}"
+                                              Data="{StaticResource SpeakerMuteIcon}" />
+                                    </Canvas>
+                                </Viewbox>
+                                <!-- Volume-level icon (not muted) -->
+                                <Viewbox Width="16" Height="16"
+                                         IsVisible="{Binding !IsMuted}">
+                                    <Canvas Width="24" Height="24">
+                                        <Path Fill="{DynamicResource IslandIconFill}"
+                                              Data="{Binding Volume, Converter={StaticResource VolumeToIcon}}" />
+                                    </Canvas>
+                                </Viewbox>
+                            </Panel>
+                        </Button>
+
+                        <!-- Overlay-layer hosted: a native popup window is always-on-top and
+                             would float over other apps; the overlay keeps the flyout inside
+                             the window on every platform (and lets Liquid Glass frost it — a
+                             native popup window cannot be frosted).
+                             10-08 redesign: the filled-pill language of Settings and the pop-ups.
+                             No grey outline (was TextControlBorderBrush at 1.5px): the island's
+                             own fill, a soft drop shadow for lift, and with Liquid Glass on a
+                             frost tinted at Glass Opacity exactly like the island menus. Inside:
+                             a compact slider (owner 10-08/10-10 "make it smaller": 4px track,
+                             10px thumb, 22px tall) and a live % readout, so the old floating
+                             drag-only bubble is gone. Reveal and hide (fade + 6px rise +
+                             0.92→1 scale from the bottom edge) are code-built transitions — see
+                             SetVolumeFlyoutRevealed.
+                             Shadow room: the overlay popup host and its LayoutTransformControl
+                             clip to the popup's content, and the pill used to BE the content, so
+                             its shadow was cut at the pill's bounding box (only the four box
+                             corners outside the round caps showed it, ending on straight edges).
+                             The Margin gives the shadow its whole reach (12 sideways, 8 up, 16
+                             down, + the hidden pose's 6px drop). Popup placement leaves a child's
+                             Margin out (measured: the pill still rests 6px above the button with
+                             the same VerticalOffset), and the margin is transparent, so clicks
+                             still reach the button under it. -->
+                        <Popup x:Name="VolumeFlyout"
+                               PlacementTarget="{Binding #VolumeButton}"
+                               Placement="Top"
+                               PlacementAnchor="Bottom"
+                               PlacementGravity="Top"
+                               VerticalOffset="-6"
+                               IsLightDismissEnabled="False"
+                               ShouldUseOverlayLayer="True"
+                               WindowManagerAddShadowHint="False">
+                            <controls:GlassPanel x:Name="VolumeFlyoutContent"
+                                                 Margin="14,10,14,22"
+                                                 CornerRadius="999"
+                                                 Background="{DynamicResource IslandBackground}"
+                                                 GlassTintOpacity="{Binding IslandBackgroundOpacity}"
+                                                 BlurRadius="14"
+                                                 BoxShadow="0 4 12 0 #4D000000, 0 1 3 0 #33000000"
+                                                 RenderTransformOrigin="50%,100%"
+                                                 PointerEntered="OnVolumeFlyoutPointerEntered"
+                                                 PointerExited="OnVolumeFlyoutPointerExited"
+                                                 PointerWheelChanged="OnVolumeWheelChanged">
+                                <!-- Transparent background: the whole pill stays hit-testable even
+                                     when the glass tint is 0 (a GlassPanel's frost op never hit-tests),
+                                     so crossing from the track to the readout is not a PointerExited. -->
+                                <Grid x:Name="VolumePill"
+                                      Classes.muted="{Binding IsMuted}"
+                                      Background="Transparent"
+                                      Height="22"
+                                      Margin="9,0,7,0"
+                                      ColumnDefinitions="Auto,Auto">
+                                    <!-- Track and thumb centred on the pill's 11px mid line; the
+                                         Slider spans the full 30px height so the thinner track keeps
+                                         a full-height hit strip. VolumeThumbSize (code-behind) = 10. -->
+                                    <Grid x:Name="VolumeTrackHost"
+                                          Grid.Column="0"
+                                          Width="64"
+                                          Height="22"
+                                          VerticalAlignment="Center">
+                                        <Canvas x:Name="VolumeVisual"
+                                                Width="64"
+                                                Height="22"
+                                                ClipToBounds="False"
+                                                IsHitTestVisible="False">
+                                            <!-- Quiet rest track: the island's icon colour at low strength
+                                                 (PillSliderVisualHelper owns its Opacity). -->
+                                            <Border x:Name="VolumeTrackBackground"
+                                                    Height="4"
+                                                    CornerRadius="2"
+                                                    Background="{DynamicResource IslandIconFill}"
+                                                    Canvas.Top="9"/>
+                                            <Border x:Name="VolumeTrackFill"
+                                                    Height="4"
+                                                    CornerRadius="2"
+                                                    Background="{DynamicResource IslandSliderFilled}"
+                                                    Canvas.Top="9"/>
+                                            <!-- The host carries the X translate (code-behind); the dot
+                                                 inside carries the hover / drag growth, so the two
+                                                 transforms never fight over one property. -->
+                                            <Panel x:Name="VolumeThumb"
+                                                   Width="10"
+                                                   Height="10"
+                                                   Canvas.Top="6">
+                                                <Border x:Name="VolumeThumbDot"
+                                                        Width="10"
+                                                        Height="10"
+                                                        CornerRadius="999"
+                                                        Background="{DynamicResource IslandSliderFilled}"
+                                                        BoxShadow="0 1 3 0 #59000000"/>
+                                            </Panel>
+                                        </Canvas>
+                                        <Slider Classes="volume-horizontal"
+                                                Value="{Binding Volume, Mode=TwoWay}"
+                                                Minimum="0" Maximum="100"
+                                                Width="64"
+                                                Height="22"
+                                                VerticalAlignment="Center"
+                                                Margin="0"
+                                                x:Name="VolumeSlider"/>
+                                    </Grid>
+                                    <!-- Live level. Fixed width so "5%" → "100%" never resizes the pill. -->
+                                    <TextBlock x:Name="VolumeReadout"
+                                               Grid.Column="1"
+                                               Width="26"
+                                               Margin="4,0,0,0"
+                                               VerticalAlignment="Center"
+                                               TextAlignment="Center"
+                                               FontSize="10"
+                                               FontWeight="SemiBold"
+                                               FontFeatures="+tnum"
+                                               Foreground="{DynamicResource IslandIconFill}"
+                                               IsHitTestVisible="False"/>
+                                </Grid>
+                            </controls:GlassPanel>
+                        </Popup>
+                    </StackPanel>
+                </StackPanel>
+
+            </Grid>
+
+            <!-- Edge resize grips (persistent bar only — code-behind shows them when
+                 CompactWhenLyricsPageActive is off). Plain Borders, never Buttons:
+                 they must not join the tab order or eat Space. Drag adjusts the
+                 island width live; double-click resets to the stock width. -->
+            <Border x:Name="LeftResizeGrip"
+                    Width="8"
+                    HorizontalAlignment="Left"
+                    VerticalAlignment="Stretch"
+                    Margin="-12,0,0,0"
+                    Background="Transparent"
+                    Cursor="SizeWestEast"
+                    IsVisible="False"
+                    PointerPressed="OnResizeGripPressed"
+                    PointerMoved="OnResizeGripMoved"
+                    PointerReleased="OnResizeGripReleased"
+                    PointerCaptureLost="OnResizeGripCaptureLost"/>
+            <Border x:Name="RightResizeGrip"
+                    Width="8"
+                    HorizontalAlignment="Right"
+                    VerticalAlignment="Stretch"
+                    Margin="0,0,-12,0"
+                    Background="Transparent"
+                    Cursor="SizeWestEast"
+                    IsVisible="False"
+                    PointerPressed="OnResizeGripPressed"
+                    PointerMoved="OnResizeGripMoved"
+                    PointerReleased="OnResizeGripReleased"
+                    PointerCaptureLost="OnResizeGripCaptureLost"/>
+            </Panel>
+            </controls:GlassPanel>
+        </Border>
+
+</UserControl>
+

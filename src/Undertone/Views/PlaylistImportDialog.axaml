@@ -1,0 +1,423 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:Undertone.ViewModels"
+        xmlns:loc="using:Undertone.Localization"
+        xmlns:controls="using:Undertone.Controls"
+        x:Class="Undertone.Views.PlaylistImportDialog"
+        x:DataType="vm:PlaylistImportViewModel"
+        Title="{loc:T Import.Title}"
+        CanResize="False"
+        WindowDecorations="None"
+        TransparencyLevelHint="Transparent"
+        Background="Transparent"
+        ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner">
+
+    <Window.Styles>
+        <Style Selector="TextBlock.pi-label">
+            <Setter Property="FontSize" Value="11.5" />
+            <Setter Property="Opacity" Value="0.45" />
+        </Style>
+        <!-- Footer status, as the editor's change summary. -->
+        <Style Selector="TextBlock.pi-status">
+            <Setter Property="FontSize" Value="12.5" />
+            <Setter Property="Opacity" Value="0.6" />
+        </Style>
+
+        <!-- Start panel: the drop target. The 1.5px ring is always there (transparent at
+             rest) so a file dragged over only recolours it and nothing shifts. -->
+        <Style Selector="Border.pi-drop">
+            <Setter Property="BorderThickness" Value="1.5" />
+            <Setter Property="BorderBrush" Value="Transparent" />
+        </Style>
+        <Style Selector="Border.pi-drop.drag">
+            <Setter Property="BorderBrush" Value="{DynamicResource AccentColorBrush}" />
+        </Style>
+
+        <!-- Found / Missing chip on each row: a dot and the word on a faint tint. -->
+        <Style Selector="Border.pi-chip">
+            <Setter Property="CornerRadius" Value="999" />
+            <Setter Property="Padding" Value="8,2,9,2" />
+            <Setter Property="Background" Value="#293BB273" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+        </Style>
+        <Style Selector="Border.pi-chip.missing">
+            <Setter Property="Background" Value="#33F2A33A" />
+        </Style>
+        <Style Selector="Border.pi-chip Ellipse">
+            <Setter Property="Width" Value="6" />
+            <Setter Property="Height" Value="6" />
+            <Setter Property="Fill" Value="#3BB273" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+        </Style>
+        <Style Selector="Border.pi-chip.missing Ellipse">
+            <Setter Property="Fill" Value="#F2A33A" />
+        </Style>
+        <Style Selector="Border.pi-row.missing TextBlock.pi-title">
+            <Setter Property="Opacity" Value="0.7" />
+        </Style>
+        <!-- Left out of the playlist with the row's ✕: the whole row fades. -->
+        <Style Selector="Border.pi-row.out > StackPanel > Grid > StackPanel">
+            <Setter Property="Opacity" Value="0.4" />
+        </Style>
+
+        <!-- Review step (Discord, Cosmo 11-02): small pills for the closest library songs,
+             the search results and "Search library" / "Change". -->
+        <Style Selector="Button.pi-choice">
+            <Setter Property="MinHeight" Value="30" />
+            <Setter Property="Padding" Value="12,0" />
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Margin" Value="0,0,6,6" />
+            <Setter Property="MaxWidth" Value="260" />
+        </Style>
+        <Style Selector="Button.pi-choice TextBlock">
+            <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+        </Style>
+        <Style Selector="Button.pi-x">
+            <Setter Property="Width" Value="30" />
+            <Setter Property="Height" Value="30" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="CornerRadius" Value="999" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Opacity" Value="0.55" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+        </Style>
+        <Style Selector="Button.pi-x:pointerover">
+            <Setter Property="Opacity" Value="1" />
+        </Style>
+        <Style Selector="Button.pi-x:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="{DynamicResource PillFieldBackground}" />
+            <Setter Property="BorderBrush" Value="Transparent" />
+        </Style>
+
+        <!-- Loading skeleton, as Find online's: a slow breath, keyed on [IsVisible=True] so a
+             hidden skeleton's INFINITE clock doesn't keep ticking. -->
+        <Style Selector="Border.pi-skel">
+            <Setter Property="Background" Value="#17FFFFFF" />
+        </Style>
+        <Style Selector="StackPanel.pi-skeleton[IsVisible=True]">
+            <Style.Animations>
+                <Animation Duration="0:0:1.1" IterationCount="INFINITE" PlaybackDirection="Alternate">
+                    <KeyFrame Cue="0%"><Setter Property="Opacity" Value="0.45" /></KeyFrame>
+                    <KeyFrame Cue="100%"><Setter Property="Opacity" Value="1" /></KeyFrame>
+                </Animation>
+            </Style.Animations>
+        </Style>
+    </Window.Styles>
+
+    <!-- Owner 10-08: the rounded pill pop-up of the Metadata editor / Find Metadata.
+         PillDialogHost draws the blurred, dimmed app behind, the card with its shadow, and
+         plays the open/close animation (every close path — Cancel, Esc, the view model's
+         Closed, Alt+F4 — animates out once before the real close). MaxHeight, not Height:
+         the card shrinks with a short list and stays bounded so the list virtualizes. -->
+    <controls:PillDialogHost>
+
+    <Grid Width="640" MaxHeight="680" RowDefinitions="Auto,*,Auto">
+
+        <!-- Header: title and the one-line purpose. -->
+        <Border Grid.Row="0"
+                Padding="28,22,28,16"
+                BorderBrush="{DynamicResource SystemControlForegroundBaseLowBrush}"
+                BorderThickness="0,0,0,1">
+            <Grid ColumnDefinitions="56,16,*">
+                <Border Grid.Column="0" Width="56" Height="56" CornerRadius="18" Classes="pill-well">
+                    <controls:LineIcon x:Name="HeaderIcon" Data="{StaticResource MenuLineImport}" Width="22" Height="22" Opacity="0.6"
+                              HorizontalAlignment="Center" VerticalAlignment="Center" />
+                </Border>
+                <StackPanel Grid.Column="2" Spacing="2" VerticalAlignment="Center">
+                    <TextBlock Text="{loc:T Import.Title}" FontSize="18" FontWeight="Bold" />
+                    <TextBlock Text="{loc:T Import.Subtitle}"
+                               FontSize="13" Opacity="0.7" TextTrimming="CharacterEllipsis" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- Footer: status on the left, Cancel / Create playlist on the right. -->
+        <Border Grid.Row="2"
+                Padding="28,14"
+                BorderBrush="{DynamicResource SystemControlForegroundBaseLowBrush}"
+                BorderThickness="0,1,0,0">
+            <Grid ColumnDefinitions="*,Auto,Auto">
+                <TextBlock Grid.Column="0" Classes="pi-status" Text="{Binding StatusMessage}"
+                           VerticalAlignment="Center" TextTrimming="CharacterEllipsis" Margin="0,0,16,0"
+                           ToolTip.Tip="{Binding StatusMessage}" />
+                <Button Grid.Column="1"
+                        Classes="pill-secondary"
+                        Content="{Binding CancelLabel}"
+                        Command="{Binding CloseCommand}"
+                        MinWidth="108"
+                        Margin="0,0,10,0" />
+                <Button Grid.Column="2"
+                        Classes="pill-primary"
+                        Content="{loc:T Import.CreatePlaylist}"
+                        Command="{Binding CreateCommand}"
+                        IsEnabled="{Binding CanCreate}"
+                        MinWidth="108" />
+            </Grid>
+        </Border>
+
+        <Grid Grid.Row="1" RowDefinitions="Auto,Auto,*">
+
+            <!-- Source: paste a link (imports as soon as it is complete) or pick a file. -->
+            <StackPanel Grid.Row="0" Spacing="10" Margin="28,20,28,0">
+                <Grid ColumnDefinitions="*,8,Auto,8,Auto">
+                    <TextBox x:Name="LinkBox" Grid.Column="0" Classes="pill-field"
+                             Text="{Binding LinkText}"
+                             Watermark="{loc:T Import.LinkWatermark}">
+                        <TextBox.KeyBindings>
+                            <KeyBinding Gesture="Enter" Command="{Binding ImportLinkCommand}" />
+                        </TextBox.KeyBindings>
+                    </TextBox>
+                    <Button x:Name="ImportLinkButton" Grid.Column="2" Classes="pill-primary" Width="40" Padding="0"
+                            Command="{Binding ImportLinkCommand}"
+                            IsEnabled="{Binding CanImportLink}"
+                            ToolTip.Tip="{loc:T Import.LinkButton}"
+                            AutomationProperties.Name="{loc:T Import.LinkButton}">
+                        <!-- Owner 10-27: the arrow sat off-centre (1.5px left at 125%). A 12px
+                             PathIcon stretches the chevron's own 7.41-wide ink box and centres
+                             that fraction, so layout rounding pushed it off. Drawn unstretched in
+                             its whole 24-grid box instead: same 12px-tall chevron, the box lands on
+                             whole pixels, and the glyph keeps its designed slight lean toward the
+                             point (optical centre). -->
+                        <Path Data="{StaticResource ChevronRightIcon}" Width="24" Height="24" Stretch="None"
+                              Fill="{DynamicResource AccentForegroundBrush}"
+                              HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    </Button>
+                    <Button x:Name="ChooseFileButton" Grid.Column="4" Classes="pill-secondary"
+                            Content="{loc:T Import.ChooseFile}" Padding="18,0" />
+                </Grid>
+
+                <!-- Only when needed: a link Undertone can't fetch (Spotify, Apple Music, …) says
+                     what works instead; a TIDAL link without a sign-in offers the sign-in. -->
+                <Border Classes="pill-well" CornerRadius="18" Padding="16,10,10,10"
+                        IsVisible="{Binding HasLinkHelp}">
+                    <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+                        <TextBlock Grid.Column="0" Text="{Binding LinkHelp}" FontSize="12.5" Opacity="0.85"
+                                   TextWrapping="Wrap" VerticalAlignment="Center" />
+                        <Button Grid.Column="1" Classes="pill-primary" MinHeight="34" Padding="16,0"
+                                FontSize="12.5"
+                                Content="{Binding LinkHelpLabel}" Command="{Binding OpenLinkHelpCommand}"
+                                VerticalAlignment="Center" />
+                    </Grid>
+                </Border>
+            </StackPanel>
+
+            <!-- Name of the playlist to create, once there is something to create. -->
+            <StackPanel Grid.Row="1" Spacing="6" Margin="28,18,28,0" IsVisible="{Binding HasPreview}">
+                <TextBlock Classes="pi-label" Text="{loc:T Import.PlaylistName}" Margin="16,0,0,0" />
+                <TextBox Classes="pill-field" Text="{Binding PlaylistName}"
+                         Watermark="{loc:T Import.PlaylistName}" />
+
+                <!-- Add any library song to the import (Discord, Cosmo 11-02). -->
+                <TextBox x:Name="AddSongBox" Classes="pill-field" Margin="0,4,0,0"
+                         Text="{Binding AddSearchText}"
+                         Watermark="{loc:T Import.AddSongWatermark}"
+                         AutomationProperties.Name="{loc:T Import.AddSongWatermark}" />
+                <ItemsControl ItemsSource="{Binding AddSearchResults}" Margin="8,0,0,0">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="vm:PlaylistImportViewModel+Choice">
+                            <Button Classes="pill-secondary pi-choice"
+                                    Command="{Binding $parent[Window].((vm:PlaylistImportViewModel)DataContext).AddSongCommand}"
+                                    CommandParameter="{Binding}"
+                                    ToolTip.Tip="{Binding Label}">
+                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                    <PathIcon Data="{StaticResource AddIcon}" Width="9" Height="9" />
+                                    <TextBlock Text="{Binding Label}" />
+                                </StackPanel>
+                            </Button>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <ItemsControl ItemsSource="{Binding AddedSongs}" Margin="8,0,0,0">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="vm:PlaylistImportViewModel+Choice">
+                            <Border Classes="pi-chip" Margin="0,0,6,6" Padding="10,2,4,2">
+                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                    <Ellipse />
+                                    <TextBlock Text="{Binding Label}" FontSize="11.5" MaxWidth="220"
+                                               TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                                    <Button Classes="pi-x" Width="22" Height="22"
+                                            Command="{Binding $parent[Window].((vm:PlaylistImportViewModel)DataContext).RemoveAddedSongCommand}"
+                                            CommandParameter="{Binding}"
+                                            ToolTip.Tip="{loc:T Import.RemoveAdded}"
+                                            AutomationProperties.Name="{loc:T Import.RemoveAdded}">
+                                        <controls:LineIcon Data="{StaticResource MenuLineClose}" Width="12" Height="12" />
+                                    </Button>
+                                </StackPanel>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </StackPanel>
+
+            <!-- Start: the drop target, with the formats in one muted line (details in its tip). -->
+            <Border x:Name="DropZone" Grid.Row="2" Classes="pill-well pi-drop"
+                    CornerRadius="22" Height="196" Margin="28,16,28,24"
+                    IsVisible="{Binding ShowStart}">
+                <StackPanel Spacing="6" HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <controls:LineIcon Data="{StaticResource MenuLineImport}" Width="30" Height="30" Opacity="0.35"
+                              HorizontalAlignment="Center" Margin="0,0,0,6" />
+                    <TextBlock Text="{loc:T Import.DropTitle}" FontSize="14" FontWeight="SemiBold"
+                               Opacity="0.8" HorizontalAlignment="Center" />
+                    <StackPanel x:Name="FormatsHint" Orientation="Horizontal" Spacing="6"
+                                HorizontalAlignment="Center" Background="Transparent"
+                                ToolTip.Tip="{loc:T Import.FormatsTip}">
+                        <TextBlock Text="{loc:T Import.Formats}" FontSize="12" Opacity="0.5"
+                                   VerticalAlignment="Center" />
+                        <PathIcon Data="{StaticResource InfoIcon}" Width="12" Height="12" Opacity="0.45"
+                                  VerticalAlignment="Center" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <!-- Reading / fetching and matching: skeleton rows where the list will be. -->
+            <StackPanel Grid.Row="2" Classes="pi-skeleton" Spacing="6" Margin="28,16,28,24"
+                        IsVisible="{Binding IsAnalyzing}">
+                <Border Classes="pill-well" CornerRadius="16" Padding="16,12">
+                    <StackPanel Spacing="6">
+                        <Border Classes="pi-skel" Height="10" CornerRadius="5" Width="180" HorizontalAlignment="Left" />
+                        <Border Classes="pi-skel" Height="8" CornerRadius="4" Width="110" HorizontalAlignment="Left" />
+                    </StackPanel>
+                </Border>
+                <Border Classes="pill-well" CornerRadius="16" Padding="16,12">
+                    <StackPanel Spacing="6">
+                        <Border Classes="pi-skel" Height="10" CornerRadius="5" Width="140" HorizontalAlignment="Left" />
+                        <Border Classes="pi-skel" Height="8" CornerRadius="4" Width="150" HorizontalAlignment="Left" />
+                    </StackPanel>
+                </Border>
+                <Border Classes="pill-well" CornerRadius="16" Padding="16,12">
+                    <StackPanel Spacing="6">
+                        <Border Classes="pi-skel" Height="10" CornerRadius="5" Width="210" HorizontalAlignment="Left" />
+                        <Border Classes="pi-skel" Height="8" CornerRadius="4" Width="90" HorizontalAlignment="Left" />
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+
+            <!-- Every entry, missing first, each with its Matched / Missing chip. Right padding
+                 is the overlay scrollbar's lane, so it never sits on a row. -->
+            <ScrollViewer Grid.Row="2"
+                          IsVisible="{Binding HasPreview}"
+                          HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto"
+                          Padding="28,14,28,10">
+                <ItemsControl x:Name="RowsList" ItemsSource="{Binding Rows}">
+                    <!-- Virtualized: a long playlist is thousands of rows. -->
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <VirtualizingStackPanel />
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="vm:PlaylistImportViewModel+ImportRow">
+                            <Border Classes="pill-well pi-row" Classes.missing="{Binding IsMissing}"
+                                    Classes.out="{Binding !IsIncluded}"
+                                    CornerRadius="16" Padding="16,9,12,9" Margin="0,0,0,6">
+                                <StackPanel Spacing="8">
+                                <Grid ColumnDefinitions="*,12,Auto,4,Auto">
+                                    <StackPanel Grid.Column="0" Spacing="1" VerticalAlignment="Center">
+                                        <TextBlock Classes="pi-title" Text="{Binding Title}" FontSize="13"
+                                                   FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                                        <TextBlock Text="{Binding Artist}" FontSize="11.5" Opacity="0.55"
+                                                   TextTrimming="CharacterEllipsis" IsVisible="{Binding HasArtist}" />
+                                        <!-- Matched in the review: the library song it now uses, and Change. -->
+                                        <StackPanel Orientation="Horizontal" Spacing="8" IsVisible="{Binding HasPick}" Margin="0,2,0,0">
+                                            <TextBlock Text="{Binding PickLabel, StringFormat='→ {0}'}" FontSize="11.5"
+                                                       Foreground="{DynamicResource AccentColorBrush}" MaxWidth="360"
+                                                       TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                                            <Button Classes="sp-link" Content="{loc:T Import.Change}" Padding="0" MinHeight="0"
+                                                    Background="Transparent" BorderThickness="0" FontSize="11.5" Cursor="Hand"
+                                                    Foreground="{DynamicResource AccentColorBrush}"
+                                                    Command="{Binding UnpickCommand}" VerticalAlignment="Center" />
+                                        </StackPanel>
+                                    </StackPanel>
+                                    <!-- Leave a matched song out of the playlist, or put it back. -->
+                                    <Button Grid.Column="4" Classes="pi-x" IsVisible="{Binding CanToggleIncluded}"
+                                            Command="{Binding ToggleIncludedCommand}"
+                                            ToolTip.Tip="{loc:T Import.LeaveOut}"
+                                            AutomationProperties.Name="{loc:T Import.LeaveOut}">
+                                        <Panel>
+                                            <controls:LineIcon Data="{StaticResource MenuLineClose}" Width="14" Height="14"
+                                                               IsVisible="{Binding IsIncluded}" />
+                                            <PathIcon Data="{StaticResource AddIcon}" Width="11" Height="11"
+                                                      IsVisible="{Binding !IsIncluded}" />
+                                        </Panel>
+                                    </Button>
+                                    <Panel Grid.Column="2" VerticalAlignment="Center">
+                                        <Border Classes="pi-chip" IsVisible="{Binding IsMatched}">
+                                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                                <Ellipse />
+                                                <TextBlock Text="{loc:T Import.Matched}" FontSize="11.5" Opacity="0.85" />
+                                            </StackPanel>
+                                        </Border>
+                                        <Border Classes="pi-chip missing" IsVisible="{Binding !IsMatched}">
+                                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                                <Ellipse />
+                                                <TextBlock Text="{loc:T Import.Missing}" FontSize="11.5" Opacity="0.85" />
+                                            </StackPanel>
+                                        </Border>
+                                    </Panel>
+                                </Grid>
+
+                                <!-- Missing: the closest library songs, best first, and a library search. -->
+                                <WrapPanel IsVisible="{Binding IsMissing}">
+                                    <ItemsControl ItemsSource="{Binding Candidates}" IsVisible="{Binding ShowCandidates}">
+                                        <ItemsControl.ItemsPanel>
+                                            <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
+                                        </ItemsControl.ItemsPanel>
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate x:DataType="vm:PlaylistImportViewModel+Choice">
+                                                <Button Classes="pill-secondary pi-choice"
+                                                        Command="{Binding $parent[ItemsControl].((vm:PlaylistImportViewModel+ImportRow)DataContext).PickCommand}"
+                                                        CommandParameter="{Binding}"
+                                                        ToolTip.Tip="{loc:T Import.UseThisSong}">
+                                                    <TextBlock Text="{Binding Label}" />
+                                                </Button>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                    <Button Classes="pill-secondary pi-choice" Command="{Binding ToggleSearchCommand}">
+                                        <StackPanel Orientation="Horizontal" Spacing="6">
+                                            <controls:LineIcon Data="{StaticResource MenuLineSearch}" Width="12" Height="12" />
+                                            <TextBlock Text="{loc:T Import.SearchLibrary}" />
+                                        </StackPanel>
+                                    </Button>
+                                </WrapPanel>
+                                <StackPanel Spacing="6" IsVisible="{Binding IsSearchOpen}">
+                                    <TextBox Classes="pill-field" Text="{Binding SearchText}"
+                                             Watermark="{loc:T Import.SearchWatermark}"
+                                             AutomationProperties.Name="{loc:T Import.SearchWatermark}" />
+                                    <ItemsControl ItemsSource="{Binding SearchResults}">
+                                        <ItemsControl.ItemsPanel>
+                                            <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
+                                        </ItemsControl.ItemsPanel>
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate x:DataType="vm:PlaylistImportViewModel+Choice">
+                                                <Button Classes="pill-secondary pi-choice"
+                                                        Command="{Binding $parent[ItemsControl].((vm:PlaylistImportViewModel+ImportRow)DataContext).PickCommand}"
+                                                        CommandParameter="{Binding}"
+                                                        ToolTip.Tip="{loc:T Import.UseThisSong}">
+                                                    <TextBlock Text="{Binding Label}" />
+                                                </Button>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </StackPanel>
+                                </StackPanel>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </ScrollViewer>
+        </Grid>
+    </Grid>
+    </controls:PillDialogHost>
+</Window>

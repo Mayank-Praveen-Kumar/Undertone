@@ -1,0 +1,367 @@
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Linq;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Input;
+using Avalonia.Interactivity;
+using Avalonia.Threading;
+using Avalonia.VisualTree;
+using Undertone.Helpers;
+using Undertone.Localization;
+using Undertone.Models;
+using Undertone.Services;
+using Undertone.ViewModels;
+
+namespace Undertone.Views;
+
+public partial class LibraryAlbumsView : UserControl, ITrackSelectionSource
+{
+    private LibraryAlbumsViewModel? _vm;
+    private EventHandler? _pendingScrollRestore;
+    /// <summary>The VM FilterKey the grid last reset its scroll for (see OnFilteredRowsChanged).</summary>
+    private string? _scrollResetFilterKey;
+    // Track selection by the Album itself (not the tile Button) so that row
+    // virtualization recycling the tile Buttons on scroll doesn't drop the
+    // ctrl-selected highlight. See MultiSelectHelper's "Data-tracked album-tile variants".
+    private readonly HashSet<Album> _selectedAlbums = new();
+
+    /// <summary>The Ctrl-selection, for window shortcuts (GitHub #131 ReplayGain).</summary>
+    public IReadOnlyList<Track> GetSelectedTracks() => TrackSelection.FromAlbums(_selectedAlbums);
+
+    public LibraryAlbumsView()
+    {
+        InitializeComponent();
+
+        DataContextChanged += OnDataContextChanged;
+        AddHandler(PointerPressedEvent, OnTilePointerPressed, RoutingStrategies.Tunnel);
+        // Forward Ctrl+A from the window so it works without first clicking a tile.
+        _ = new WindowKeyForwarder(this, OnViewKeyDown);
+    }
+
+    private void OnTilePointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        var source = e.Source as Control;
+        while (source != null && !(source is Button b && b.Classes.Contains("album-tile")))
+            source = source.Parent as Control;
+        if (source is not Button tile) return;
+        if (tile.DataContext is not Album album) return;
+
+        if (!MultiSelectHelper.HandleAlbumTileClickByData(tile, album, e, _selectedAlbums)
+            && !e.KeyModifiers.HasFlag(PlatformHelper.PrimaryModifier)
+            && e.GetCurrentPoint(null).Properties.IsLeftButtonPressed)
+        {
+            // Plain left-click clears any existing selection (mirrors prior behavior).
+            MultiSelectHelper.ClearAlbumSelectionsByData(_selectedAlbums, CollectAlbumTiles());
+        }
+
+        // Ensure this view has focus so Ctrl+A reaches OnViewKeyDown
+        if (_selectedAlbums.Count > 0)
+            Focus();
+    }
+
+    /// <summary>Re-apply the ctrl-selected visual as tiles are (re)realized on scroll.</summary>
+    private void OnAlbumTileLoaded(object? sender, RoutedEventArgs e)
+    {
+        if (sender is Button tile)
+            MultiSelectHelper.SyncAlbumTileVisual(tile, _selectedAlbums);
+    }
+
+    private void OnViewKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Escape && _selectedAlbums.Count > 0)
+        {
+            MultiSelectHelper.ClearAlbumSelectionsByData(_selectedAlbums, CollectAlbumTiles());
+            if (DataContext is LibraryAlbumsViewModel vm) vm.CtrlSelectedAlbums = new List<Album>();
+            e.Handled = true;
+            return;
+        }
+
+        var allAlbums = _vm?.FilteredAlbumRows.OfType<AlbumRow>().SelectMany(r => r.Albums) ?? Enumerable.Empty<Album>();
+        MultiSelectHelper.HandleAlbumSelectAllByData(e, allAlbums, CollectAlbumTiles(), _selectedAlbums);
+    }
+
+    private List<Button> CollectAlbumTiles()
+    {
+        var allTiles = new List<Button>();
+        foreach (var desc in AlbumListBox.GetVisualDescendants())
+        {
+            if (desc is Button b && b.Classes.Contains("album-tile"))
+                allTiles.Add(b);
+        }
+        return allTiles;
+    }
+
+    /// <summary>Returns the list of ctrl-selected albums, or a single-item list with the given album if none are selected.</summary>
+    private List<Album> GetSelectedAlbumsOr(Album? fallback)
+    {
+        if (_selectedAlbums.Count > 0) return _selectedAlbums.ToList();
+        if (fallback != null) return new List<Album> { fallback };
+        return new List<Album>();
+    }
+
+    // ── Artist page Songs section: shared track context menu (same pattern as HomeView) ──
+
+    private TrackContextMenuBuilder? _trackMenuBuilder;
+    /// <summary>Culture the track menu's strings were read in (they are read once, at Build).</summary>
+    private string? _trackMenuCulture;
+    private Control? _menuOwner;
+
+    private void OnArtistSongContextRequested(object? sender, ContextRequestedEventArgs e)
+    {
+        if (sender is not Control owner) return;
+        // Song pills wrap their Track in a TopSongRow for rank display.
+        if (owner.DataContext is not TopSongRow row) return;
+        if (DataContext is not LibraryAlbumsViewModel vm) return;
+
+        // v2 layout (10-09 redesign); rebuilt after a live language switch so it follows it.
+        if (_trackMenuBuilder == null || _trackMenuCulture != Loc.Instance.Culture.Name)
+        {
+            _trackMenuCulture = Loc.Instance.Culture.Name;
+            _trackMenuBuilder = new TrackContextMenuBuilder();
+            _trackMenuBuilder.Build(Loc.T("LibraryAlbums.RemoveFromLibrary"), null, this, v2: true, removeIsDanger: true);
+        }
+
+        _trackMenuBuilder.Bind(
+            row.Track,
+            playCommand: vm.PlayArtistSongCommand,
+            shuffleCommand: vm.ShuffleArtistSongsCommand,
+            playNextCommand: vm.PlayNextTrackCommand,
+            addToQueueCommand: vm.AddTrackToQueueCommand,
+            addToPlaylistCommand: vm.AddTrackToNewPlaylistCommand,
+            toggleFavoriteCommand: vm.ToggleTrackFavoriteCommand,
+            openMetadataCommand: vm.OpenTrackMetadataCommand,
+            searchLyricsCommand: vm.SearchLyricsTrackCommand,
+            showInExplorerCommand: vm.ShowInExplorerTrackCommand,
+            removeCommand: vm.RemoveTrackFromLibraryCommand);
+
+        OpenMenu(_trackMenuBuilder.Menu, owner);
+        e.Handled = true;
+    }
+
+    private void OpenMenu(ContextMenu menu, Control owner)
+    {
+        // Close any menu still open from a previous rapid right-click so menus
+        // don't stack on top of each other.
+        ContextMenuCoordinator.NotifyOpening(menu);
+        MenuOpenAnimation.CloseNow(menu);
+
+        // Detach from the previous owner so Open() doesn't throw
+        // "Cannot show ContextMenu on a different control".
+        if (_menuOwner != null && !ReferenceEquals(_menuOwner, owner))
+            _menuOwner.ContextMenu = null;
+        if (menu.Parent is Control prev && !ReferenceEquals(prev, owner))
+            prev.ContextMenu = null;
+
+        _menuOwner = owner;
+        owner.ContextMenu = menu;
+        menu.Placement = PlacementMode.Pointer;
+        menu.Open(owner);
+    }
+
+    // ── Album tiles: one shared v2 menu (10-09 redesign), bound to the tile on open ──
+    // Replaces the per-tile XAML ContextMenu: same commands and parameters, plus the
+    // album's Lyrics Background Video ▸ and Search Lyrics the XAML menu lacked.
+
+    private AlbumContextMenuBuilder? _albumMenuBuilder;
+    /// <summary>Culture the menu's strings were read in (they are read once, at Build).</summary>
+    private string? _albumMenuCulture;
+
+    private void OnAlbumTileContextRequested(object? sender, ContextRequestedEventArgs e)
+    {
+        if (sender is Button tile && OpenAlbumMenu(tile,
+                e.TryGetPosition(tile, out var at) ? tile.PointToScreen(at) : null))
+            e.Handled = true;
+    }
+
+    /// <param name="anchor">Screen point the menu grows out of (the click), or null.</param>
+    private bool OpenAlbumMenu(Button tile, PixelPoint? anchor)
+    {
+        if (tile.DataContext is not Album album) return false;
+        if (DataContext is not LibraryAlbumsViewModel vm) return false;
+
+        // Push ctrl-selected albums to ViewModel so commands can operate on all of them
+        vm.CtrlSelectedAlbums = _selectedAlbums.ToList();
+
+        // Rebuilt after a live language switch so the menu follows it.
+        if (_albumMenuBuilder == null || _albumMenuCulture != Loc.Instance.Culture.Name)
+        {
+            _albumMenuCulture = Loc.Instance.Culture.Name;
+            _albumMenuBuilder = new AlbumContextMenuBuilder();
+            _albumMenuBuilder.Build(Loc.T("LibraryAlbums.RemoveFromLibrary"), this, v2: true, removeIsDanger: true);
+            // Trial (10-09): this menu alone opens with the "pop" motion instead of the rise-up.
+            MenuOpenAnimation.SetPop(_albumMenuBuilder.Menu, true);
+        }
+        MenuOpenAnimation.SetPopAnchor(_albumMenuBuilder.Menu, anchor);
+
+        _albumMenuBuilder.Bind(
+            album,
+            playCommand: vm.PlayAlbumCommand,
+            shuffleCommand: vm.ShuffleAlbumCommand,
+            playNextCommand: vm.PlayNextCommand,
+            addToQueueCommand: vm.AddToQueueCommand,
+            addToPlaylistCommand: vm.AddToNewPlaylistCommand,
+            toggleFavoritesCommand: vm.ToggleAlbumFavoritesCommand,
+            openMetadataCommand: vm.OpenMetadataCommand,
+            showInExplorerCommand: vm.ShowInExplorerCommand,
+            removeCommand: vm.RemoveFromLibraryCommand,
+            convertCommand: vm.ConvertAlbumCommand,
+            scanReplayGainCommand: vm.ScanAlbumReplayGainCommand,
+            searchLyricsCommand: vm.SearchLyricsAlbumCommand,
+            snoozeCommand: vm.SnoozeAlbumForMonthCommand);
+        _albumMenuBuilder.BindSendToFolder(album, vm.SendAlbumToFolderCommand); // GitHub #121
+
+        OpenMenu(_albumMenuBuilder.Menu, tile);
+        return true;
+    }
+
+    private void OnDataContextChanged(object? sender, EventArgs e)
+    {
+        if (_vm != null)
+            _vm.FilteredAlbumRows.CollectionChanged -= OnFilteredRowsChanged;
+
+        _vm = DataContext as LibraryAlbumsViewModel;
+        if (_vm != null)
+        {
+            _vm.FilteredAlbumRows.CollectionChanged += OnFilteredRowsChanged;
+            _scrollResetFilterKey = _vm.FilterKey;
+        }
+    }
+
+    private void OnFilteredRowsChanged(object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
+    {
+        // Scroll to top when an active filter (search text, chips or artist) changes, not on
+        // every rebuild: a library reload or column-count change re-fills the same results
+        // and keeps the user's place.
+        // BUT skip if a scroll restore is pending (returning from album detail)
+        if (_vm == null || _vm.FilterKey == _scrollResetFilterKey)
+            return;
+        _scrollResetFilterKey = _vm.FilterKey;
+
+        if (!_vm.HasActiveFilter && !_vm.IsArtistFiltered)
+            return;
+        if (_pendingScrollRestore != null)
+            return;
+
+        Dispatcher.UIThread.Post(() =>
+        {
+            var sv = AlbumListBox.FindDescendantOfType<ScrollViewer>();
+            if (sv != null)
+                sv.Offset = new Vector(0, 0);
+        }, DispatcherPriority.Background);
+    }
+
+    protected override void OnSizeChanged(SizeChangedEventArgs e)
+    {
+        base.OnSizeChanged(e);
+
+        if (e.NewSize.Width <= 0 || DataContext is not LibraryAlbumsViewModel vm)
+            return;
+
+        // DockPanel has Margin="12,8,12,0" → 24px horizontal margin.
+        // Column count and tile size (each tile carries 8px of margin+padding chrome)
+        // are computed in the view model, which folds in the cover-size setting.
+        var usable = e.NewSize.Width - 24;
+
+        // Save and restore scroll position so sidebar hover doesn't reset scroll
+        var sv = AlbumListBox.FindDescendantOfType<ScrollViewer>();
+        var savedY = sv?.Offset.Y ?? 0;
+
+        if (!vm.UpdateGridMetrics(usable))
+            return;
+
+        if (sv != null && savedY > 0)
+        {
+            Dispatcher.UIThread.Post(() =>
+            {
+                sv.Offset = new Vector(0, Math.Min(savedY, Math.Max(0, sv.Extent.Height - sv.Viewport.Height)));
+            }, DispatcherPriority.Background);
+        }
+    }
+
+    protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
+    {
+        CancelPendingScrollRestore();
+
+        if (DataContext is LibraryAlbumsViewModel vm)
+        {
+            var sv = AlbumListBox.FindDescendantOfType<ScrollViewer>();
+            if (sv != null)
+                vm.SavedScrollOffset = sv.Offset.Y;
+        }
+        if (_vm != null)
+            _vm.FilteredAlbumRows.CollectionChanged -= OnFilteredRowsChanged;
+
+        // Reset multi-selection so it doesn't leak back when the view is revisited.
+        MultiSelectHelper.ClearAlbumSelectionsByData(_selectedAlbums, CollectAlbumTiles());
+        if (DataContext is LibraryAlbumsViewModel selVm) selVm.CtrlSelectedAlbums = new List<Album>();
+
+        base.OnDetachedFromVisualTree(e);
+    }
+
+    private void CancelPendingScrollRestore()
+    {
+        if (_pendingScrollRestore != null)
+        {
+            AlbumListBox.LayoutUpdated -= _pendingScrollRestore;
+            _pendingScrollRestore = null;
+            AlbumListBox.Opacity = 1;
+        }
+    }
+
+    protected override void OnAttachedToVisualTree(VisualTreeAttachmentEventArgs e)
+    {
+        base.OnAttachedToVisualTree(e);
+
+        if (DataContext is LibraryAlbumsViewModel vm && vm.SavedScrollOffset > 0)
+        {
+            var targetOffset = vm.SavedScrollOffset;
+
+            // Restore scroll position after layout without hiding the view.
+            // Using a single-shot LayoutUpdated avoids the Opacity=0 blank flash.
+            _pendingScrollRestore = (s, args) =>
+            {
+                var sv = AlbumListBox.FindDescendantOfType<ScrollViewer>();
+                if (sv == null) return;
+
+                var clampedOffset = Math.Min(targetOffset, Math.Max(0, sv.Extent.Height - sv.Viewport.Height));
+                sv.Offset = new Vector(0, clampedOffset);
+                CancelPendingScrollRestore();
+            };
+
+            AlbumListBox.LayoutUpdated += _pendingScrollRestore;
+        }
+        else if (DataContext is LibraryAlbumsViewModel activeVm
+                 && (activeVm.IsArtistFiltered || activeVm.HasActiveFilter))
+        {
+            _pendingScrollRestore = (s, args) =>
+            {
+                var sv = AlbumListBox.FindDescendantOfType<ScrollViewer>();
+                if (sv == null) return;
+
+                sv.Offset = new Vector(0, 0);
+                CancelPendingScrollRestore();
+            };
+
+            AlbumListBox.LayoutUpdated += _pendingScrollRestore;
+        }
+    }
+
+    /// <summary>Tile hover dots: the same menu a right-click on the tile opens.</summary>
+    private void OnTileMoreClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        // Always (re)bind from the tile: a recycled tile may still hold the shared menu
+        // bound to the album it showed before. OpenAlbumMenu also pushes the selection.
+        for (var c = sender as Control; c != null; c = c.Parent as Control)
+        {
+            if (c is Button tile && tile.Classes.Contains("album-tile"))
+            {
+                // Grow out of the dots button's centre.
+                var dots = sender as Control;
+                OpenAlbumMenu(tile, dots?.PointToScreen(new Point(dots.Bounds.Width / 2, dots.Bounds.Height / 2)));
+                break;
+            }
+        }
+        e.Handled = true;
+    }
+}

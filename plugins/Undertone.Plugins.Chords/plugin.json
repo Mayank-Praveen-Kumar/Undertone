@@ -1,0 +1,21 @@
+{
+  "id": "dev.undertone.plugins.chords",
+  "name": "Chords",
+  "version": "1.0.0",
+  "author": "Undertone",
+  "description": "Shows the playing song's chords, found from its audio.",
+  "type": "dotnet",
+  "entry": "Undertone.Plugins.Chords.dll",
+  "apiVersion": "1.6",
+  "minAppVersion": "1.6.6",
+  "platforms": ["windows", "macos", "linux"],
+  "permissions": ["audio.decode", "playback.control", "menu.commands"],
+  "icon": "icon.png",
+  "settings": [
+    { "key": "autoFind", "label": "Find chords automatically", "type": "bool", "default": true,
+      "description": "Work out each new song's chords while Chords is open." },
+    { "key": "sevenths", "label": "Show seventh chords", "type": "bool", "default": false,
+      "description": "Also show 7, maj7 and m7 chords. These are less sure." }
+  ],
+  "homepage": "https://github.com/Mayank-Praveen-Kumar/Undertone/tree/main/plugins/Undertone.Plugins.Chords"
+}

@@ -1,0 +1,189 @@
+using Undertone.Services;
+using Xunit;
+
+namespace Undertone.Tests;
+
+public class AudioKeepAliveTests
+{
+    [Fact]
+    public void WasapiSilenceKeepAlive_ImplementsIAudioKeepAlive()
+    {
+        Assert.True(typeof(IAudioKeepAlive).IsAssignableFrom(typeof(WasapiSilenceKeepAlive)));
+    }
+
+    [Fact]
+    public void VlcSilenceKeepAlive_ImplementsIAudioKeepAlive()
+    {
+        Assert.True(typeof(IAudioKeepAlive).IsAssignableFrom(typeof(VlcSilenceKeepAlive)));
+    }
+
+    [Fact]
+    public void TryStart_ReturnsNull_WhenDisabledByEnv()
+    {
+        var prev = Environment.GetEnvironmentVariable("UNDERTONE_KEEPALIVE");
+        Environment.SetEnvironmentVariable("UNDERTONE_KEEPALIVE", "0");
+        try
+        {
+            // Env gate is checked before the LibVLC argument is used, so null is safe here.
+            Assert.Null(VlcSilenceKeepAlive.TryStart(null!));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("UNDERTONE_KEEPALIVE", prev);
+        }
+    }
+
+    [Fact]
+    public void TryStart_ReturnsNull_OnWindows()
+    {
+        if (!OperatingSystem.IsWindows())
+            return; // Windows-only assertion: the native keep-alive is macOS/Linux.
+
+        var prev = Environment.GetEnvironmentVariable("UNDERTONE_KEEPALIVE");
+        Environment.SetEnvironmentVariable("UNDERTONE_KEEPALIVE", null);
+        try
+        {
+            // The OS gate returns null before the LibVLC argument is used.
+            Assert.Null(VlcSilenceKeepAlive.TryStart(null!));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("UNDERTONE_KEEPALIVE", prev);
+        }
+    }
+
+    [Fact]
+    public void TryStart_ReturnsNull_WhenNotOptedIn_OutsideTheAppImage()
+    {
+        // Default (no UNDERTONE_KEEPALIVE, no UNDERTONE_BUNDLED_VLC): the silent-loop
+        // keep-alive must not start. Windows uses WasapiSilenceKeepAlive instead;
+        // on macOS it corrupts CoreAudio output, and on Linux system-libvlc
+        // installs with a split plugin set it spammed
+        // "VLC is unable to open the MRL '...silence.wav'" at launch (issue #26).
+        // Only the Linux AppImage runs it by default (GitHub #70, see
+        // ShouldStartKeepAlive). On the Linux/macOS CI legs this is THE
+        // regression test for that gate.
+        var prev = Environment.GetEnvironmentVariable("UNDERTONE_KEEPALIVE");
+        var prevBundled = Environment.GetEnvironmentVariable("UNDERTONE_BUNDLED_VLC");
+        Environment.SetEnvironmentVariable("UNDERTONE_KEEPALIVE", null);
+        Environment.SetEnvironmentVariable("UNDERTONE_BUNDLED_VLC", null);
+        try
+        {
+            // All gates fire before the LibVLC argument is used, so null is safe.
+            Assert.Null(VlcSilenceKeepAlive.TryStart(null!));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("UNDERTONE_KEEPALIVE", prev);
+            Environment.SetEnvironmentVariable("UNDERTONE_BUNDLED_VLC", prevBundled);
+        }
+    }
+
+    [Theory]
+    [InlineData(false, null, null, false)]  // macOS: opt-in only
+    [InlineData(false, null, "1", false)]
+    [InlineData(false, "1", null, true)]
+    [InlineData(true, null, null, false)]   // Linux system libvlc: opt-in only (issue #26)
+    [InlineData(true, "", "", false)]
+    [InlineData(true, null, "0", false)]
+    [InlineData(true, "1", null, true)]
+    [InlineData(true, null, "1", true)]     // Linux AppImage: on by default (GitHub #70)
+    [InlineData(true, "", "1", true)]
+    [InlineData(true, "0", "1", false)]     // UNDERTONE_KEEPALIVE=0 still opts out
+    [InlineData(false, "0", null, false)]
+    public void ShouldStartKeepAlive_MatchesPlatformBundleAndEnv(
+        bool isLinux, string? keepAliveEnv, string? bundledVlcEnv, bool expected)
+    {
+        Assert.Equal(expected, VlcSilenceKeepAlive.ShouldStartKeepAlive(isLinux, keepAliveEnv, bundledVlcEnv));
+    }
+
+    [Theory]
+    [InlineData(false, false, 600_000, 1_000L, true)]       // playing: the position timer keeps it fresh
+    [InlineData(false, false, 600_000, 600_000L, true)]     // parks only once the limit is PASSED
+    [InlineData(false, false, 600_000, 600_001L, false)]    // stopped past the idle limit: parks
+    [InlineData(false, true, 600_000, 600_001L, true)]      // GitHub #70: paused past the limit stays warm
+    [InlineData(false, true, 600_000, 86_400_000L, true)]   // ...however long the pause
+    [InlineData(false, false, 0, 86_400_000L, true)]        // UNDERTONE_KEEPALIVE_IDLE_MS=0: never parks
+    [InlineData(true, false, 600_000, 1_000L, false)]       // exclusive output holds the endpoint
+    [InlineData(true, true, 0, 1_000L, false)]              // ...and wins over a held pause
+    public void ShouldRun_HoldsThroughPause_ParksWhenIdleOrSuspended(
+        bool suspended, bool heldByPause, int idleStopMs, long idleForMs, bool expected)
+    {
+        Assert.Equal(expected, VlcSilenceKeepAlive.ShouldRun(suspended, heldByPause, idleStopMs, idleForMs));
+    }
+
+    [Theory]
+    // parked, suspended, warmUpMs, nowMs, pendingWarmUntil → expected warmUntil
+    [InlineData(true, false, 1000, 50_000L, 0L, 51_000L)]        // GitHub #70: first play after a park holds
+    [InlineData(false, false, 1000, 50_000L, 0L, 0L)]            // loop running: no hold, ever
+    [InlineData(true, true, 1000, 50_000L, 0L, 0L)]              // exclusive output: the loop can't run
+    [InlineData(true, false, 0, 50_000L, 0L, 0L)]                // UNDERTONE_KEEPALIVE_WARM_MS=0: off
+    [InlineData(true, false, 1000, 50_300L, 51_000L, 51_000L)]   // a burst of plays keeps ONE deadline
+    [InlineData(false, false, 1000, 50_300L, 51_000L, 51_000L)]  // ...also once the loop restarted
+    [InlineData(true, false, 1000, 90_000L, 51_000L, 91_000L)]   // an expired deadline re-arms on the next park
+    public void NextWarmUntil_ArmsOnlyWhenParked_AndNeverExtends(
+        bool parked, bool suspended, int warmUpMs, long nowMs, long warmUntilMs, long expected)
+    {
+        Assert.Equal(expected, VlcSilenceKeepAlive.NextWarmUntil(parked, suspended, warmUpMs, nowMs, warmUntilMs));
+    }
+
+    [Theory]
+    [InlineData(0L, 50_000L, 0)]            // nothing armed
+    [InlineData(51_000L, 50_000L, 1000)]    // straight after the play
+    [InlineData(51_000L, 50_700L, 300)]     // the worker got the lock later: only the rest
+    [InlineData(51_000L, 52_000L, 0)]       // already warm
+    [InlineData(99_000L, 50_000L, VlcSilenceKeepAlive.MaxWarmUpMs)] // never past the cap
+    public void RemainingWarmUpMs_IsTheRestOfTheDeadline_Capped(long warmUntilMs, long nowMs, int expected)
+    {
+        Assert.Equal(expected, VlcSilenceKeepAlive.RemainingWarmUpMs(warmUntilMs, nowMs));
+    }
+
+    [Theory]
+    [InlineData(null, 1000)]
+    [InlineData("", 1000)]
+    [InlineData("junk", 1000)]
+    [InlineData("-5", 1000)]
+    [InlineData("0", 0)]
+    [InlineData("1500", 1500)]
+    [InlineData("60000", VlcSilenceKeepAlive.MaxWarmUpMs)] // stays under Dispose's 3 s lock wait
+    public void ParseWarmUpMs_DefaultsTo1s_AndIsCapped(string? env, int expected)
+    {
+        Assert.Equal(expected, VlcSilenceKeepAlive.ParseWarmUpMs(env));
+    }
+
+    private sealed class CountingKeepAlive : IAudioKeepAlive
+    {
+        public int Notified;
+        public void NotifyActivity() => Notified++;
+        public void SetSuspended(bool suspended) { }
+        public void Dispose() { }
+    }
+
+    [Fact]
+    public void WakeForPlayback_DefaultsToNotifyWithoutHold()
+    {
+        // WasapiSilenceKeepAlive keeps this default: Windows plays are never held.
+        var keepAlive = new CountingKeepAlive();
+        Assert.Equal(0, ((IAudioKeepAlive)keepAlive).WakeForPlayback());
+        Assert.Equal(1, keepAlive.Notified);
+    }
+
+    [Fact]
+    public void TryStart_ReturnsNull_OnWindows_EvenWhenOptedIn()
+    {
+        if (!OperatingSystem.IsWindows())
+            return; // opt-in actually constructs on macOS/Linux — Windows-only gate test.
+
+        var prev = Environment.GetEnvironmentVariable("UNDERTONE_KEEPALIVE");
+        Environment.SetEnvironmentVariable("UNDERTONE_KEEPALIVE", "1");
+        try
+        {
+            // The OS gate wins over the opt-in: Windows always uses the WASAPI path.
+            Assert.Null(VlcSilenceKeepAlive.TryStart(null!));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("UNDERTONE_KEEPALIVE", prev);
+        }
+    }
+}

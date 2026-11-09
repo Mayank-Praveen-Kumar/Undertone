@@ -1,0 +1,205 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using Avalonia.Controls;
+using Avalonia.Headless;
+using Avalonia.Headless.XUnit;
+using Avalonia.Input;
+using Avalonia.VisualTree;
+using Avalonia.LogicalTree;
+using Undertone.Controls;
+using Undertone.Mobile.Services;
+using Undertone.Mobile.ViewModels;
+using Undertone.Mobile.Views;
+using Undertone.Models;
+using Undertone.Services;
+using Xunit;
+
+namespace Undertone.Tests;
+
+/// <summary>The phone shell mounts headlessly, and the mini bar appears once a track plays.</summary>
+public class MobileShellViewTests
+{
+    private sealed class NoPicker : IFolderPicker
+    {
+        public System.Threading.Tasks.Task<string?> PickFolderAsync() => System.Threading.Tasks.Task.FromResult<string?>(null);
+    }
+
+    private static ShellViewModel MakeShell(string root, out FakeLibraryService library, params Track[] tracks)
+    {
+        library = new FakeLibraryService();
+        library.TrackList.AddRange(tracks);
+        var persistence = new PersistenceService(root);
+        var player = new FakeAudioPlayer();
+        var nowPlaying = new NowPlayingViewModel(player, library, persistence, marshal: a => a());
+        return new ShellViewModel(
+            new LibraryViewModel(library, persistence, new NoPicker(), marshal: a => a()),
+            nowPlaying,
+            new LyricsPageViewModel(player, nowPlaying, new FakeTrackFiles(), persistence, work => Task.FromResult(work())));
+    }
+
+    [Fact]
+    public void TryHandleBack_ClosesLyricsBeforeNowPlaying()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "UndertoneTests", Guid.NewGuid().ToString("N"));
+        var shell = MakeShell(root, out _);
+
+        shell.OpenNowPlayingCommand.Execute(null);
+        shell.ToggleLyricsCommand.Execute(null);
+        Assert.True(shell.IsLyricsOpen);
+
+        Assert.True(shell.TryHandleBack());
+        Assert.False(shell.IsLyricsOpen);
+        Assert.True(shell.IsNowPlayingOpen);
+
+        shell.ToggleLyricsCommand.Execute(null);
+        shell.CloseNowPlayingCommand.Execute(null);        // closing Now Playing closes its overlays
+        Assert.False(shell.IsLyricsOpen);
+        try { Directory.Delete(root, recursive: true); } catch { }
+    }
+
+    /// <summary>
+    /// Android Back must close the topmost overlay rather than finish the activity — both
+    /// pages are full-screen overlays inside the single activity, so the system default reads
+    /// as the app quitting. The activity delegates the whole decision here.
+    /// </summary>
+    [Fact]
+    public void TryHandleBack_ClosesTheTopmostOverlay_ThenFallsThrough()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "UndertoneTests", Guid.NewGuid().ToString("N"));
+        var shell = MakeShell(root, out _);
+
+        Assert.False(shell.TryHandleBack());               // Library page: the system handles it
+
+        shell.OpenNowPlayingCommand.Execute(null);
+        shell.ToggleQueueCommand.Execute(null);
+        Assert.True(shell.IsQueueOpen);
+
+        Assert.True(shell.TryHandleBack());                // innermost first
+        Assert.False(shell.IsQueueOpen);
+        Assert.True(shell.IsNowPlayingOpen);
+
+        Assert.True(shell.TryHandleBack());
+        Assert.False(shell.IsNowPlayingOpen);
+
+        Assert.False(shell.TryHandleBack());               // back at the Library page
+        try { Directory.Delete(root, recursive: true); } catch { }
+    }
+
+    [AvaloniaFact]
+    public void Shell_Mounts_AndMiniBarFollowsPlayback()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "UndertoneTests", Guid.NewGuid().ToString("N"));
+        var track = new Track { Id = Guid.NewGuid(), Title = "Mounted Song", Artist = "Tester", FilePath = "content://x/1", Duration = TimeSpan.FromSeconds(90) };
+        var shell = MakeShell(root, out _, track);
+        shell.Library.InitializeAsync().GetAwaiter().GetResult();
+
+        var view = new ShellView { DataContext = shell };
+        var window = new Window { Width = 412, Height = 915, Content = view };
+        window.Show();
+        window.UpdateLayout();
+
+        var miniBar = view.FindControl<GlassPanel>("MiniBar")!;
+        Assert.False(miniBar.IsVisible);
+        Assert.Equal(1, shell.Library.SongCount);   // the Library root shows tiles; the song list is the Songs page
+
+        shell.PlaySongCommand.Execute(track);
+        window.UpdateLayout();
+
+        Assert.True(miniBar.IsVisible);
+        Assert.Contains(miniBar.GetLogicalDescendants().OfType<TextBlock>(), t => t.Text == "Mounted Song");
+
+        shell.OpenNowPlayingCommand.Execute(null);
+        window.UpdateLayout();
+        var nowPlaying = view.FindControl<NowPlayingPage>("NowPlaying")!;
+        Assert.True(nowPlaying.IsVisible);
+        Assert.False(miniBar.IsVisible);
+
+        // Pins the TimeSpan format on the seek-bar labels (remaining time at position 0).
+        Assert.Contains(nowPlaying.GetLogicalDescendants().OfType<TextBlock>(), t => t.Text == "-01:30");
+
+        window.Close();
+        try { Directory.Delete(root, recursive: true); } catch { }
+    }
+
+    /// <summary>
+    /// Android device run, 2026-09-22: an x-sweep across the mini bar found only x≈80–270 of
+    /// the ~730 px row opened Now Playing — Fluent's Button theme sets HorizontalAlignment to
+    /// Left, so the title button collapsed onto its text and the rest of the bar swallowed
+    /// taps. Measures the button against its own star column rather than a pixel count, so it
+    /// holds at any width.
+    /// </summary>
+    [AvaloniaFact]
+    public void MiniBar_TitleButton_FillsTheWholeRow()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "UndertoneTests", Guid.NewGuid().ToString("N"));
+        var track = new Track { Id = Guid.NewGuid(), Title = "Tone A", Artist = "Undertone Test", FilePath = "content://x/1", Duration = TimeSpan.FromSeconds(8) };
+        var shell = MakeShell(root, out _, track);
+        shell.Library.InitializeAsync().GetAwaiter().GetResult();
+
+        var view = new ShellView { DataContext = shell };
+        var window = new Window { Width = 412, Height = 915, Content = view };
+        window.Show();
+        shell.PlaySongCommand.Execute(track);
+        window.UpdateLayout();
+
+        var miniBar = view.FindControl<GlassPanel>("MiniBar")!;
+        var grid = miniBar.GetLogicalDescendants().OfType<Grid>().First();
+        var title = grid.Children.OfType<Button>().First(b => Grid.GetColumn(b) == 0);
+
+        // The star column's own width, from the first fixed-width sibling's left edge.
+        var transports = grid.Children.OfType<Button>().Where(b => Grid.GetColumn(b) > 0).ToList();
+        var columnWidth = transports.Min(b => b.Bounds.Left);
+
+        Assert.Equal(columnWidth, title.Bounds.Width, 1);
+        Assert.True(title.Bounds.Height >= grid.Bounds.Height - 1,
+            $"title button is {title.Bounds.Height} tall in a {grid.Bounds.Height} row");
+
+        window.Close();
+        try { Directory.Delete(root, recursive: true); } catch { }
+    }
+
+    /// <summary>
+    /// Device run B12, 2026-09-23: after touching any slider (Now Playing seek or volume,
+    /// Settings text size) Android Back did nothing. Avalonia turns the Back key into an
+    /// Escape KeyDown on the focused control and raises BackRequested only if nobody handles
+    /// it; a touched Slider keeps focus and marks Escape handled, so the page never closed.
+    /// The shell takes Escape in the tunnel phase, before any focused control, and leaves it
+    /// unhandled at the root so the activity can still finish.
+    /// </summary>
+    [AvaloniaFact]
+    public async Task Escape_WithAFocusedSlider_StillGoesBack_AndFallsThroughAtTheRoot()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "UndertoneTests", Guid.NewGuid().ToString("N"));
+        var shell = MakeShell(root, out _);
+        var view = new ShellView { DataContext = shell };
+        var window = new Window { Width = 412, Height = 915, Content = view };
+        window.Show();
+        bool? lastHandled = null;
+        window.AddHandler(InputElement.KeyDownEvent, (_, e) => lastHandled = e.Handled, handledEventsToo: true);
+
+        shell.OpenSettingsCommand.Execute(null);
+        var settings = Assert.IsType<SettingsPageViewModel>(shell.CurrentPage);
+        await settings.Loaded;
+        settings.OpenPaneCommand.Execute(SettingsPane.Lyrics);   // the text size lives on Settings → Lyrics
+        window.UpdateLayout();
+        var slider = view.GetVisualDescendants().OfType<Slider>().Single(s => s.Name == "LyricsSizeSlider");
+        Assert.True(slider.Focus());
+
+        window.KeyPressQwerty(PhysicalKey.Escape, RawInputModifiers.None);
+        Assert.Same(settings, shell.CurrentPage);          // out of Lyrics, back on Settings' top level
+        Assert.Equal(SettingsPane.Main, settings.Pane);
+        Assert.True(lastHandled);
+
+        window.KeyPressQwerty(PhysicalKey.Escape, RawInputModifiers.None);
+        Assert.Null(shell.CurrentPage);                    // Settings closed
+        Assert.True(lastHandled);
+
+        window.KeyPressQwerty(PhysicalKey.Escape, RawInputModifiers.None);
+        Assert.False(lastHandled);                         // Library root: left to the system
+
+        window.Close();
+        try { Directory.Delete(root, recursive: true); } catch { }
+    }
+}

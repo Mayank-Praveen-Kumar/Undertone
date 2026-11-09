@@ -1,0 +1,272 @@
+using Undertone.Services.LyricsStudio;
+using Whisper.net;
+using Xunit;
+
+namespace Undertone.Tests;
+
+/// <summary>
+/// Word timing from Whisper's DTW token times, and the one-window-per-call loop that works
+/// around whisper.cpp dropping DTW segments after the first window.
+/// </summary>
+public class WhisperDtwTimingTests
+{
+    private static WhisperTranscriber.DtwTokenView T(string text, long t0, long t1, long dtw, float p = 0.9f) => new(text, t0, t1, dtw, p);
+
+    private static List<RecognizedWord> Words(IEnumerable<WhisperTranscriber.DtwTokenView> tokens, ref long? previousEnd) =>
+        WhisperTranscriber.WordsFromTokens(WhisperTranscriber.DtwTokenSpans(tokens, ref previousEnd), TimeSpan.Zero, TimeSpan.FromSeconds(30), null);
+
+    private static TimeSpan Cs(long cs) => TimeSpan.FromMilliseconds(cs * 10);
+
+    [Fact]
+    public void DtwTime_IsTheTokenEnd_SoAWordStartsWhereThePreviousOneEnded()
+    {
+        long? previous = null;
+        var words = Words(new[]
+        {
+            T(" I", 90, 100, 110),
+            T(" love", 100, 130, 140),
+            T(" hel", 130, 150, 160),
+            T("lo", 150, 170, 175),
+        }, ref previous);
+
+        Assert.Equal(new[] { "I", "love", "hello" }, words.Select(w => w.Text));
+        Assert.Equal(Cs(90), words[0].Start);   // window's first token: its own t0 (within the lead limit)
+        Assert.Equal(Cs(110), words[0].End);
+        Assert.Equal(Cs(110), words[1].Start);  // = end of "I", not its own DTW time (140)
+        Assert.Equal(Cs(140), words[1].End);
+        Assert.Equal(Cs(140), words[2].Start);  // a word's pieces merge: start of the first, end of the last
+        Assert.Equal(Cs(175), words[2].End);
+        Assert.Equal(175, previous);
+    }
+
+    [Fact]
+    public void WordAfterAPause_StartsAtMostTheLeadLimitBeforeItsEnd()
+    {
+        long? previous = 150;
+        var words = Words(new[] { T(" world", 160, 420, 400) }, ref previous);
+
+        Assert.Equal(Cs(400 - WhisperTranscriber.MaxWordLeadCs), words[0].Start);
+        Assert.Equal(Cs(400), words[0].End);
+    }
+
+    [Fact]
+    public void ContinuationPiece_IsNotLimited_OnlyAWordsFirstPiece()
+    {
+        long? previous = 100;
+        var words = Words(new[] { T(" to", 100, 110, 120), T("night", 110, 200, 300) }, ref previous);
+
+        Assert.Single(words);
+        Assert.Equal("tonight", words[0].Text);
+        Assert.Equal(Cs(100), words[0].Start);
+        Assert.Equal(Cs(300), words[0].End);
+    }
+
+    [Fact]
+    public void WindowFirstToken_UsesT0_ButNoEarlierThanTheLeadLimit()
+    {
+        long? previous = null;
+        var words = Words(new[] { T(" Yeah", 0, 50, 200) }, ref previous);
+        Assert.Equal(Cs(200 - WhisperTranscriber.MaxWordLeadCs), words[0].Start);
+
+        previous = null;
+        words = Words(new[] { T(" Yeah", 190, 210, 200) }, ref previous);
+        Assert.Equal(Cs(190), words[0].Start);
+    }
+
+    [Fact]
+    public void SpecialTokens_AndTokensWithoutDtw_KeepHeuristicTimes_AndDoNotMoveTheRunningEnd()
+    {
+        long? previous = null;
+        var spans = WhisperTranscriber.DtwTokenSpans(new[]
+        {
+            T("[_BEG_]", 0, 0, -1),
+            T(" hey", 10, 40, 60),
+            T(" you", 40, 80, -1),
+            T("[_TT_40]", 80, 80, -1),
+        }, ref previous);
+
+        Assert.Equal(new WhisperTranscriber.TokenView("[_BEG_]", 0, 0, 0.9f), spans[0]);
+        Assert.Equal(new WhisperTranscriber.TokenView(" hey", 30, 60, 0.9f), spans[1]);
+        Assert.Equal(new WhisperTranscriber.TokenView(" you", 40, 80, 0.9f), spans[2]);
+        Assert.Equal(60, previous);
+    }
+
+    [Fact]
+    public void RunningEnd_CarriesAcrossSegmentsOfTheSameWindow()
+    {
+        long? previous = null;
+        var first = Words(new[] { T(" one", 0, 50, 50) }, ref previous);
+        var second = Words(new[] { T(" two", 60, 90, 70) }, ref previous);
+
+        Assert.Equal(Cs(50), second[0].Start); // the previous segment's last DTW end, not this segment's t0
+        Assert.Equal(Cs(20), first[0].Start);
+    }
+
+    [Fact]
+    public void Start_NeverAfterEnd_EvenIfDtwTimesStepBack()
+    {
+        long? previous = 300;
+        var spans = WhisperTranscriber.DtwTokenSpans(new[] { T(" back", 200, 260, 250) }, ref previous);
+        Assert.Equal(250, spans[0].StartCs);
+        Assert.Equal(250, spans[0].EndCs);
+    }
+
+    [Fact]
+    public void CharacterSplitOverTwoTokens_TakesItsTextFromTheSegment()
+    {
+        // Whisper.net decodes each token on its own: a Hangul syllable whose UTF-8 bytes the
+        // tokenizer split comes out as U+FFFD pieces (benchmark 10-19, LOVE DIVE: 34 of 185
+        // heard words). The segment's text is decoded whole.
+        var tokens = new[]
+        {
+            new WhisperTranscriber.TokenView(" \uFFFD", 100, 120, 0.9f),
+            new WhisperTranscriber.TokenView("\uFFFD서와서", 120, 180, 0.9f),
+            new WhisperTranscriber.TokenView(" 좋\uFFFD\uFFFD", 190, 230, 0.9f),
+            new WhisperTranscriber.TokenView("\uFFFD", 230, 240, 0.9f),
+            new WhisperTranscriber.TokenView(" love", 250, 290, 0.9f),
+        };
+        var words = WhisperTranscriber.WordsFromTokens(tokens, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(3), " 따서와서 좋아 love");
+
+        Assert.Equal(new[] { "따서와서", "좋아", "love" }, words.Select(w => w.Text));
+        Assert.Equal(Cs(100), words[0].Start); // times stay the tokens'
+        Assert.Equal(Cs(240), words[1].End);
+    }
+
+    [Fact]
+    public void SpaceOnlyToken_StartsTheNextWord()
+    {
+        // Japanese (CRUSH, 10-19): the space between two phrases is a token of its own, and the
+        // phrase after it has no leading space. The two phrases came out as one word, and as the
+        // segment's text then had a word more, its broken characters were not mended either.
+        var tokens = new[]
+        {
+            new WhisperTranscriber.TokenView("\uFFFD", 790, 800, 0.9f),
+            new WhisperTranscriber.TokenView("\uFFFD", 800, 810, 0.9f),
+            new WhisperTranscriber.TokenView("の", 810, 830, 0.9f),
+            new WhisperTranscriber.TokenView("\uFFFD", 830, 840, 0.9f),
+            new WhisperTranscriber.TokenView("\uFFFD", 840, 850, 0.9f),
+            new WhisperTranscriber.TokenView(" ", 850, 860, 0.9f),
+            new WhisperTranscriber.TokenView("重", 900, 920, 0.9f),
+            new WhisperTranscriber.TokenView("なる", 920, 960, 0.9f),
+            new WhisperTranscriber.TokenView("ey", 960, 980, 0.9f),
+            new WhisperTranscriber.TokenView("es", 980, 1000, 0.9f),
+        };
+        var words = WhisperTranscriber.WordsFromTokens(tokens, TimeSpan.FromSeconds(7.9), TimeSpan.FromSeconds(10.5), "瞳の奥 重なるeyes");
+
+        Assert.Equal(new[] { "瞳の奥", "重なるeyes" }, words.Select(w => w.Text));
+        Assert.Equal(Cs(900), words[1].Start);
+    }
+
+    [Fact]
+    public void BrokenPieces_StayAsHeard_WhenTheSegmentTextDoesNotLineUp()
+    {
+        var tokens = new[]
+        {
+            new WhisperTranscriber.TokenView(" \uFFFD서", 100, 120, 0.9f),
+            new WhisperTranscriber.TokenView(" love", 130, 180, 0.9f),
+        };
+        // A word count that differs, and a known letter that is not in the segment's word.
+        Assert.Equal("\uFFFD서", WhisperTranscriber.WordsFromTokens(tokens, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), " 따서 love you")[0].Text);
+        Assert.Equal("\uFFFD서", WhisperTranscriber.WordsFromTokens(tokens, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), " 따와 love")[0].Text);
+    }
+
+    [Fact]
+    public void BracketedSegment_TheAudioDoesNotHold_IsADescriptionOfTheMusic_NotLyrics()
+    {
+        // "(Instrumental)" over an intro (benchmark 10-19, 8 of 11 transcripts): DTW finds no place
+        // for it inside its segment, so it used to be spread over 0:00–0:03 as the draft's first line.
+        var lost = new[]
+        {
+            new WhisperTranscriber.TokenView(" (", 900, 920, 0.6f),
+            new WhisperTranscriber.TokenView("Instrumental", 920, 960, 0.6f),
+            new WhisperTranscriber.TokenView(")", 960, 970, 0.6f),
+        };
+        Assert.Empty(WhisperTranscriber.WordsFromTokens(lost, TimeSpan.Zero, TimeSpan.FromSeconds(3.4), " (Instrumental)"));
+
+        // Not wholly in brackets, or placed by DTW (a backing vocal): kept as before.
+        var sung = new[] { new WhisperTranscriber.TokenView(" (Ooh)", 900, 960, 0.6f), new WhisperTranscriber.TokenView(" yeah", 960, 990, 0.6f) };
+        Assert.Equal(new[] { "(Ooh)", "yeah" }, WhisperTranscriber.WordsFromTokens(sung, TimeSpan.Zero, TimeSpan.FromSeconds(3.4), " (Ooh) yeah").Select(w => w.Text));
+        var twoGroups = new[] { new WhisperTranscriber.TokenView(" (Ooh)", 900, 960, 0.6f), new WhisperTranscriber.TokenView(" (yeah)", 960, 990, 0.6f) };
+        Assert.Equal(2, WhisperTranscriber.WordsFromTokens(twoGroups, TimeSpan.Zero, TimeSpan.FromSeconds(3.4), " (Ooh) (yeah)").Count);
+        var placed = new[] { new WhisperTranscriber.TokenView(" (Ooh)", 100, 160, 0.9f) };
+        Assert.Equal(Cs(100), Assert.Single(WhisperTranscriber.WordsFromTokens(placed, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), " (Ooh)")).Start);
+    }
+
+    private const int Sr = PcmDecoder16k.SampleRate;
+    private const int Window = 30 * Sr;
+
+    [Fact]
+    public void NextWindow_StartsWhereTheLastSegmentEnded()
+    {
+        // whisper.cpp reports floor(100 * 24.3 / 30) = 81 % as it starts the next window.
+        Assert.Equal((int)(24.3 * Sr), WhisperTranscriber.NextWindowOffset(TimeSpan.FromSeconds(24.3), 81, Window));
+    }
+
+    [Fact]
+    public void NextWindow_SkipsTheRestOfTheChunk_WhenWhisperDid()
+    {
+        // Single timestamp ending: whisper.cpp consumed the whole 30 s although the text stopped at 12 s.
+        Assert.Equal(Window, WhisperTranscriber.NextWindowOffset(TimeSpan.FromSeconds(12), 100, Window));
+        // Last timestamp after the last text: follow the reported position.
+        Assert.Equal(18 * Sr, WhisperTranscriber.NextWindowOffset(TimeSpan.FromSeconds(12), 60, Window));
+    }
+
+    [Fact]
+    public void NextWindow_WithoutSegments_FollowsTheReportedPosition_AndNeverStalls()
+    {
+        Assert.Equal(Window, WhisperTranscriber.NextWindowOffset(null, 100, Window));
+        Assert.Equal(15 * Sr, WhisperTranscriber.NextWindowOffset(null, 50, Window));
+        Assert.Equal(Window, WhisperTranscriber.NextWindowOffset(null, 0, Window));
+        Assert.Equal(Window, WhisperTranscriber.NextWindowOffset(TimeSpan.FromSeconds(0.4), 1, Window));
+    }
+
+    [Fact]
+    public void NextWindow_ShortTail_ReportsAgainstItsOwnLength()
+    {
+        var tail = 12 * Sr;
+        Assert.Equal(tail, WhisperTranscriber.NextWindowOffset(TimeSpan.FromSeconds(5), 100, tail));
+        Assert.Equal(9 * Sr, WhisperTranscriber.NextWindowOffset(TimeSpan.FromSeconds(9), 75, tail));
+    }
+
+    [Fact]
+    public void Resume_AfterWhisperSkippedTheRestOfTheWindow_StartsAtTheLastSegmentsEnd()
+    {
+        // One ad-lib at 1.6–2.4 s, then "single timestamp ending": whisper.cpp would jump 30 s.
+        var step = WhisperTranscriber.NextWindowOffset(TimeSpan.FromSeconds(2.4), 100, Window);
+        Assert.Equal(Window, step);
+        Assert.Equal((int)(2.4 * Sr), WhisperTranscriber.ResumeOffset(step, TimeSpan.FromSeconds(2.4)));
+    }
+
+    [Fact]
+    public void Resume_NotWhenTheWindowEndedAtItsLastSegment_OrHadNone()
+    {
+        Assert.Null(WhisperTranscriber.ResumeOffset((int)(24.3 * Sr), TimeSpan.FromSeconds(24.3)));
+        Assert.Null(WhisperTranscriber.ResumeOffset(Window, TimeSpan.FromSeconds(28))); // under 3 s skipped
+        Assert.Null(WhisperTranscriber.ResumeOffset(Window, null));                      // nothing heard: nothing to resume from
+    }
+
+    [Fact]
+    public void Resume_AlwaysMovesAtLeastASecond()
+    {
+        Assert.Equal(Sr, WhisperTranscriber.ResumeOffset(Window, TimeSpan.FromSeconds(0.2)));
+    }
+
+    [Fact]
+    public void DtwShift_PullsMediumEarlier_LeavesBaseAlone()
+    {
+        Assert.Equal(-10, WhisperTranscriber.DtwShiftCs(WhisperAlignmentHeadsPreset.Medium));
+        Assert.Equal(0, WhisperTranscriber.DtwShiftCs(WhisperAlignmentHeadsPreset.Base));
+        Assert.Equal(0, WhisperTranscriber.DtwShiftCs(WhisperAlignmentHeadsPreset.None));
+    }
+
+    [Theory]
+    // One model (09-29/30): every saved size loads lullaby.bin, a Medium underneath, so every size takes Medium's heads.
+    [InlineData(WhisperModelSize.Tiny, WhisperAlignmentHeadsPreset.Medium)]
+    [InlineData(WhisperModelSize.Base, WhisperAlignmentHeadsPreset.Medium)]
+    [InlineData(WhisperModelSize.Small, WhisperAlignmentHeadsPreset.Medium)]
+    [InlineData(WhisperModelSize.Medium, WhisperAlignmentHeadsPreset.Medium)]
+    public void AlignmentHeads_FollowTheModelFileThatIsLoaded(WhisperModelSize size, WhisperAlignmentHeadsPreset expected)
+    {
+        Assert.Equal(expected, WhisperModelManager.AlignmentHeads(size));
+    }
+}

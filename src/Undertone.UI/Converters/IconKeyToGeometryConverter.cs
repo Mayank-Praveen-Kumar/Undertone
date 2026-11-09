@@ -1,0 +1,97 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Globalization;
+using Avalonia;
+using Avalonia.Data.Converters;
+using Avalonia.Media.Imaging;
+using Avalonia.Platform;
+
+namespace Undertone.Converters;
+
+/// <summary>
+/// Maps a sidebar icon key (e.g. "HomeIcon") to a cached, pre-scaled <see cref="Bitmap"/>.
+/// Icons are decoded once and downscaled to <see cref="ScaledSize"/>px with high-quality
+/// interpolation so the OpacityMask rendering path gets a clean small bitmap instead of
+/// having to down-sample the original 512x512 source at runtime.
+/// </summary>
+public class IconKeyToGeometryConverter : IValueConverter
+{
+    private static readonly IReadOnlyDictionary<string, string> IconMap =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["HomeIcon"] = "avares://Undertone.UI/Assets/Icons/Home%20ICON.png",
+            ["SongsIcon"] = "avares://Undertone.UI/Assets/Icons/Songs%20ICON.png",
+            ["AlbumsIcon"] = "avares://Undertone.UI/Assets/Icons/Albums%20ICON.png",
+            ["ArtistsIcon"] = "avares://Undertone.UI/Assets/Icons/Artists%20ICON.png",
+            ["FoldersIcon"] = "avares://Undertone.UI/Assets/Icons/Folder%20ICON.png",
+
+            ["PlaylistsIcon"] = "avares://Undertone.UI/Assets/Icons/Playlist%20icon.png",
+            ["FavoritesIcon"] = "avares://Undertone.UI/Assets/Icons/Favorites%20icon.png",
+            ["SettingsIcon"] = "avares://Undertone.UI/Assets/Icons/Settings%20ICON.png",
+            ["ServerIcon"] = "avares://Undertone.UI/Assets/Icons/Server%20ICON.png",
+            ["CdIcon"] = "avares://Undertone.UI/Assets/Icons/Albums%20ICON.png",
+            // The player island's lyrics bubble, reused by the Settings rail for the Lyrics page.
+            ["LyricsBubbleIcon"] = "avares://Undertone.UI/Assets/Icons/Lyrics%20ICON.png",
+            // Sidebar Lyrics Studio entry: lyric sheet + note, same stroke as the other rail masks.
+            ["LyricsStudioIcon"] = "avares://Undertone.UI/Assets/Icons/Lyrics%20Panel%20ICON.png",
+            // Fallback for smart playlist rows in sidebar.
+            ["SmartPlaylistIcon"] = "avares://Undertone.UI/Assets/Icons/Playlist%20icon.png"
+        };
+
+    /// <summary>True when <paramref name="key"/> names one of the bitmap sidebar icons (the Settings rail mixes these with geometry icons).</summary>
+    public static bool HasKey(string? key) => !string.IsNullOrWhiteSpace(key) && IconMap.ContainsKey(key);
+
+    private static readonly ConcurrentDictionary<string, Bitmap?> BitmapCache = new();
+    private const string FallbackUri = "avares://Undertone.UI/Assets/Icons/Playlist%20icon.png";
+
+    /// <summary>
+    /// Target pixel size for pre-scaled icons.
+    /// 80px covers 20 logical px at up to 4× DPI scaling.
+    /// </summary>
+    private const int ScaledSize = 80;
+
+    public object? Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
+    {
+        // Accept icon key from the bound value (sidebar NavItem) or from
+        // ConverterParameter (static usage in settings / dashboard cards).
+        var key = value as string;
+        if (string.IsNullOrWhiteSpace(key))
+            key = parameter as string;
+        if (string.IsNullOrWhiteSpace(key))
+            return null;
+
+        var uri = IconMap.TryGetValue(key, out var mapped) ? mapped : FallbackUri;
+
+        return BitmapCache.GetOrAdd(uri, static u =>
+        {
+            try
+            {
+                var assetUri = new Uri(u);
+                using var stream = AssetLoader.Open(assetUri);
+                var full = new Bitmap(stream);
+
+                // Pre-scale only large sources (e.g. 512px originals) so the
+                // OpacityMask path gets a clean small bitmap. Small sources
+                // (already ≤ ScaledSize) are returned as-is — upscaling them
+                // here would only add blur before the render-time downscale.
+                if (full.PixelSize.Width <= ScaledSize && full.PixelSize.Height <= ScaledSize)
+                    return full;
+
+                using (full)
+                {
+                    return full.CreateScaledBitmap(
+                        new PixelSize(ScaledSize, ScaledSize),
+                        BitmapInterpolationMode.HighQuality);
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        });
+    }
+
+    public object? ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
+        => throw new NotSupportedException();
+}

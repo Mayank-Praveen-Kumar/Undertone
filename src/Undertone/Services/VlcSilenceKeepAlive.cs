@@ -1,0 +1,259 @@
+using LibVLCSharp.Shared;
+using Undertone.Helpers;
+
+namespace Undertone.Services;
+
+/// <summary>
+/// macOS/Linux counterpart to <see cref="WasapiSilenceKeepAlive"/>, ON by
+/// default only in the Linux AppImage; elsewhere opt-in via UNDERTONE_KEEPALIVE=1
+/// (see <see cref="ShouldStartKeepAlive"/> for why). Holds a
+/// private <see cref="MediaPlayer"/> playing an endless in-memory silent WAV
+/// (<see cref="EndlessSilenceInput"/>) so the native audio device endpoint stays
+/// open. The player is deliberately NOT
+/// muted or volume-zeroed: the source is silent anyway, and on PulseAudio /
+/// PipeWire those writes poison the app-wide stream-restore entry that real
+/// playback streams inherit (see StartSilence). The main player's first
+/// Play() and every Stop()->Play() transition then open against a running device
+/// instead of cold-dropping the first buffers (the track-start clip). Windows
+/// keeps WasapiSilenceKeepAlive (a real silent WASAPI stream); this path relies
+/// on the OS mixing one extra shared stream to keep the endpoint live — true on
+/// CoreAudio / PulseAudio / PipeWire / ALSA-dmix (verified by ear, not by tests).
+///
+/// Mirrors the Windows behavior: streams from construction (covers first play),
+/// idle-parks via Stop() after UNDERTONE_KEEPALIVE_IDLE_MS (default 10 min) so the
+/// OS audio power request is released, and resumes on NotifyActivity(). On Linux
+/// a paused track holds it instead of letting it park (see <see cref="ShouldRun"/>),
+/// and the first play after a park waits for it to wake the device (see
+/// <see cref="WakeForPlayback"/>).
+/// All play/stop happens on the worker thread, never inside a VLC event handler.
+/// </summary>
+internal sealed class VlcSilenceKeepAlive : IAudioKeepAlive
+{
+    private const int DefaultIdleStopMs = 10 * 60 * 1000;
+    private const int WatchdogIntervalMs = 1000;
+    private const int DefaultWarmUpMs = 1000;
+    // Below VlcAudioPlayer.Dispose's 3 s wait for the playback lock the hold sits under.
+    internal const int MaxWarmUpMs = 2000;
+
+    private readonly MediaPlayer _player;
+    private readonly EndlessSilenceInput _source;
+    private readonly Media _silence;
+    private readonly Thread _thread;
+    private readonly ManualResetEventSlim _wake = new(false);
+    private readonly int _idleStopMs;
+    private readonly int _warmUpMs;
+    private readonly Func<bool>? _holdWhilePaused;
+    private long _lastActivityTicks;
+    private long _warmUntilTicks;
+    private volatile bool _disposed;
+    private volatile bool _suspended;
+    private volatile bool _running;
+
+    /// <param name="isPaused">True while a track sits paused and can be resumed; on Linux
+    /// the loop holds through the pause instead of idle-parking (see <see cref="ShouldRun"/>).</param>
+    public static VlcSilenceKeepAlive? TryStart(LibVLC libVlc, Func<bool>? isPaused = null)
+    {
+        if (OperatingSystem.IsWindows()) return null; // Windows uses WasapiSilenceKeepAlive
+        if (!ShouldStartKeepAlive(
+                OperatingSystem.IsLinux(),
+                Environment.GetEnvironmentVariable("UNDERTONE_KEEPALIVE"),
+                Environment.GetEnvironmentVariable("UNDERTONE_BUNDLED_VLC")))
+            return null;
+        try { return new VlcSilenceKeepAlive(libVlc, isPaused); }
+        catch (Exception ex)
+        {
+            DebugLogger.Warn(DebugLogger.Category.Playback, "VlcKeepAlive.StartFailed",
+                $"{ex.GetType().Name}: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Whether the silent loop runs (non-Windows). UNDERTONE_KEEPALIVE=1 forces it on,
+    /// =0 forces it off; otherwise it runs only in the Linux AppImage
+    /// (UNDERTONE_BUNDLED_VLC=1, exported by its AppRun).
+    /// Linux AppImage: on PipeWire the audio cut out twice (~500 ms) on the first
+    /// play after startup and again after idle, and UNDERTONE_KEEPALIVE=1 fixed both
+    /// (GitHub #70). The two old Linux blockers don't apply there: the
+    /// stream-restore poisoning (playback started muted) was fixed by never writing
+    /// Mute/Volume on this player (see StartSilence), and the bundle ships the full
+    /// plugin set (the imem access included, checked by the AppImage build), so the
+    /// silent source always opens.
+    /// Linux system libvlc: stays opt-in — with an incomplete plugin set the silent
+    /// source can't even be opened, spamming "VLC is unable to open the MRL" at
+    /// every launch (issue #26, Arch's split VLC packaging).
+    /// macOS: stays opt-in — running this second looping aout stream alongside real
+    /// playback corrupts audible output on CoreAudio — repeating channel-alternating
+    /// distortion + dropouts (Apple Silicon, VLC.app libvlc, first real-hardware
+    /// report 2026-07-16).
+    /// Internal for tests (InternalsVisibleTo Undertone.Tests).
+    /// </summary>
+    internal static bool ShouldStartKeepAlive(bool isLinux, string? keepAliveEnv, string? bundledVlcEnv)
+        => keepAliveEnv == "1" || (keepAliveEnv != "0" && isLinux && bundledVlcEnv == "1");
+
+    /// <summary>
+    /// Whether the silent loop should be streaming. Exclusive output
+    /// (<see cref="SetSuspended"/>) always parks it; otherwise it parks once
+    /// <paramref name="idleForMs"/> passes <paramref name="idleStopMs"/> (0 = never),
+    /// unless a paused track holds it (<paramref name="heldByPause"/>, Linux only).
+    /// GitHub #70: Pause() corks VLC's PulseAudio stream and PipeWire treats a corked
+    /// stream as inactive, so during a pause this loop is all that keeps the sink
+    /// running. The pause also stops the position-timer heartbeat, so 10 min into the
+    /// pause the loop parked, WirePlumber suspended the idle sink 5 s later, and Resume()
+    /// uncorked against a suspended sink: the same two ~500 ms dropouts as a cold
+    /// first play. Resume's NotifyActivity() can't prevent that — the loop restarts
+    /// on this worker and LibVLC's Play() is asynchronous, while the resume worker
+    /// uncorks straight away. A paused track can resume at any moment, so a pause
+    /// doesn't count as idle. Pure; internal for tests.
+    /// </summary>
+    internal static bool ShouldRun(bool suspended, bool heldByPause, int idleStopMs, long idleForMs)
+        => !suspended && (heldByPause || idleStopMs <= 0 || idleForMs <= idleStopMs);
+
+    /// <summary>
+    /// The warm-up deadline (TickCount64 ms) after a play request. GitHub #70: after a
+    /// single finished and the app sat idle past the idle limit, the loop parked,
+    /// WirePlumber suspended the sink ~5 s later, and the next play cut out like a cold
+    /// first play. Play's NotifyActivity() only signals this worker; the restart is an
+    /// asynchronous LibVLC Play() while the real stream opens at once, so both started
+    /// against the suspended sink. A play that finds the loop parked arms a deadline
+    /// <paramref name="warmUpMs"/> ahead, and the real stream holds until it, giving the
+    /// restarted loop the head start. A deadline still pending is kept, not extended
+    /// (a burst of plays waits once); a running loop, exclusive output
+    /// (<paramref name="suspended"/>, the loop can't run) or warmUpMs 0 arm nothing.
+    /// Pure; internal for tests.
+    /// </summary>
+    internal static long NextWarmUntil(bool parked, bool suspended, int warmUpMs, long nowMs, long warmUntilMs)
+        => parked && !suspended && warmUpMs > 0 && warmUntilMs <= nowMs ? nowMs + warmUpMs : warmUntilMs;
+
+    /// <summary>How long a new stream still holds for <paramref name="warmUntilMs"/>
+    /// (0 = none), capped at <see cref="MaxWarmUpMs"/>. Pure; internal for tests.</summary>
+    internal static int RemainingWarmUpMs(long warmUntilMs, long nowMs)
+        => warmUntilMs <= 0 ? 0 : (int)Math.Clamp(warmUntilMs - nowMs, 0, MaxWarmUpMs);
+
+    /// <summary>UNDERTONE_KEEPALIVE_WARM_MS: the hold in ms (0 = off), default 1000, capped
+    /// at <see cref="MaxWarmUpMs"/>. Pure; internal for tests.</summary>
+    internal static int ParseWarmUpMs(string? env)
+        => int.TryParse(env, out var ms) && ms >= 0 ? Math.Min(ms, MaxWarmUpMs) : DefaultWarmUpMs;
+
+    private VlcSilenceKeepAlive(LibVLC libVlc, Func<bool>? isPaused)
+    {
+        _idleStopMs = int.TryParse(Environment.GetEnvironmentVariable("UNDERTONE_KEEPALIVE_IDLE_MS"), out var ms) && ms >= 0
+            ? ms : DefaultIdleStopMs;
+        // Linux only (GitHub #70, see ShouldRun/NextWarmUntil): macOS (opt-in) keeps the
+        // plain idle park, so a long pause there still releases the output after 10 min
+        // and a play after a park starts at once.
+        _holdWhilePaused = OperatingSystem.IsLinux() ? isPaused : null;
+        _warmUpMs = OperatingSystem.IsLinux()
+            ? ParseWarmUpMs(Environment.GetEnvironmentVariable("UNDERTONE_KEEPALIVE_WARM_MS"))
+            : 0;
+
+        // An endless source, never a looped clip (GitHub #70, see EndlessSilenceInput):
+        // each :input-repeat pass seeks and flushes the output. The worker's watchdog
+        // restarts it if VLC ever stops it anyway.
+        _source = new EndlessSilenceInput();
+        _silence = new Media(libVlc, _source);
+
+        _player = new MediaPlayer(libVlc);
+        Volatile.Write(ref _lastActivityTicks, Environment.TickCount64);
+        StartSilence();
+
+        _thread = new Thread(Run)
+        {
+            IsBackground = true,
+            Name = "UndertoneVlcKeepAlive",
+            Priority = ThreadPriority.BelowNormal, // renders only silence; never timing-critical
+        };
+        _thread.Start();
+        DebugLogger.Info(DebugLogger.Category.Playback, "VlcKeepAlive.Started",
+            $"idleStopMs={_idleStopMs}, warmUpMs={_warmUpMs}");
+    }
+
+    public void NotifyActivity()
+    {
+        if (_disposed) return;
+        Volatile.Write(ref _lastActivityTicks, Environment.TickCount64);
+        if (!_wake.IsSet) _wake.Set();
+    }
+
+    public long WakeForPlayback()
+    {
+        if (_disposed) return 0;
+        var now = Environment.TickCount64;
+        // Read _running before NotifyActivity wakes the worker, which sets it on restart.
+        var warmUntil = NextWarmUntil(!_running, _suspended, _warmUpMs, now, Volatile.Read(ref _warmUntilTicks));
+        Volatile.Write(ref _warmUntilTicks, warmUntil);
+        NotifyActivity();
+        return warmUntil > now ? warmUntil : 0;
+    }
+
+    public void SetSuspended(bool suspended)
+    {
+        if (_disposed) return;
+        _suspended = suspended;
+        if (!suspended) NotifyActivity();
+    }
+
+    private void StartSilence()
+    {
+        // Never set Mute/Volume on this player. The WAV is already silent, and on
+        // PulseAudio/PipeWire the stream shares the app's stream-restore entry with
+        // real playback (same application identity) — a mute/volume-0 write here is
+        // saved by the OS and re-applied to the NEXT playback stream, which is how
+        // Linux ended up starting muted / intermittently silent.
+        _player.Play(_silence);
+        _running = true;
+    }
+
+    private void Run()
+    {
+        while (!_disposed)
+        {
+            try
+            {
+                _wake.Wait(WatchdogIntervalMs);
+                _wake.Reset();
+                if (_disposed) break;
+
+                var shouldRun = ShouldRun(
+                    _suspended,
+                    _holdWhilePaused?.Invoke() == true,
+                    _idleStopMs,
+                    Environment.TickCount64 - Volatile.Read(ref _lastActivityTicks));
+
+                if (shouldRun)
+                {
+                    if (!_running || !_player.IsPlaying)
+                    {
+                        StartSilence();
+                        DebugLogger.Info(DebugLogger.Category.Playback, "VlcKeepAlive.Resumed");
+                    }
+                }
+                else if (_running)
+                {
+                    _player.Stop();
+                    _running = false;
+                    DebugLogger.Info(DebugLogger.Category.Playback, "VlcKeepAlive.Parked");
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLogger.Warn(DebugLogger.Category.Playback, "VlcKeepAlive.Error",
+                    $"{ex.GetType().Name}: {ex.Message}");
+                Thread.Sleep(WatchdogIntervalMs); // never spin on a persistent fault
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        try { _wake.Set(); } catch { }
+        try { _thread.Join(2000); } catch { }
+        try { _player.Stop(); } catch { }
+        try { _player.Dispose(); } catch { }
+        try { _silence.Dispose(); } catch { }
+        try { _source.Dispose(); } catch { } // after the player: its input thread reads it
+        try { _wake.Dispose(); } catch { }
+    }
+}

@@ -1,0 +1,821 @@
+using System;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
+using Avalonia.Input;
+using Avalonia.Interactivity;
+using Avalonia.Media;
+using Avalonia.Platform.Storage;
+using Avalonia.Threading;
+using Avalonia.VisualTree;
+using System.ComponentModel;
+using Undertone.Helpers;
+using System.Collections.Generic;
+using System.Linq;
+using Undertone.ViewModels;
+using Undertone.Services;
+using Microsoft.Extensions.DependencyInjection;
+
+namespace Undertone.Views;
+
+public partial class SettingsView : UserControl
+{
+    private const double PreampThumbSize = 14;
+    private const double PreampDefault = 0.0;
+    private const double CrossfadeDurationDefault = 6.0; // matches the Settings reset value
+
+    private SettingsViewModel? _trackedViewModel;
+    private readonly TranslateTransform _preampThumbTransform = new();
+    private bool _isPreampDragging;
+    private DateTime _lastPreampPressAt = DateTime.MinValue;
+    private Point _lastPreampPressPosition;
+
+    public SettingsView()
+    {
+        InitializeComponent();
+        DeferTabPages();
+
+
+        // Settings search: the card index is built lazily on the first keystroke (all tab
+        // panels exist by then) and applied on every change. Watch the property, not
+        // TextChanged: the latter does not fire for a programmatic/bound Text set.
+        SettingsSearchBox.PropertyChanged += (_, e) =>
+        {
+            if (e.Property == TextBox.TextProperty) ApplySearch();
+        };
+        SettingsSearchBox.KeyDown += OnSearchBoxKeyDown;
+        DataContextChanged += OnSettingsDataContextChanged;
+
+        // Output Device picker: re-enumerate the endpoints as the dropdown opens, so a
+        // just-plugged DAC (or a default-device change) shows up without leaving Settings.
+        OutputDeviceCombo.DropDownOpened += (_, _) =>
+            _trackedViewModel?.RefreshOutputDevicesCommand.Execute(null);
+
+        // Pre-amp pill slider: the visible track/fill/thumb are drawn on a Canvas and
+        // positioned from code-behind. The real Slider is transparent and only handles
+        // pointer input (drag + double-press-to-reset), mirroring the metadata volume slider.
+
+        // Double-clicking a slider's knob snaps it back to the shipped default (the
+        // island width and both opacity sliders). Defaults come from a fresh AppSettings
+        // so this can never drift from what a new install gets.
+        var defaults = new Undertone.Models.AppSettings();
+        AttachThumbDoubleTapReset(IslandWidthSlider, defaults.PlaybackBarWidth);
+        AttachThumbDoubleTapReset(QueueWidthSlider, defaults.QueuePanelWidth);
+        AttachThumbDoubleTapReset(PlayerBarOpacitySlider, defaults.PlaybackBarBackgroundOpacity);
+        AttachThumbDoubleTapReset(BackgroundBlurSlider, defaults.BackgroundBlurAmount);
+        AttachThumbDoubleTapReset(TrackBoxOpacitySlider, defaults.PlaybackBarTrackBoxOpacity);
+        AttachThumbDoubleTapReset(MiniPlayerOpacitySlider, defaults.MiniPlayerBackgroundOpacity);
+
+        // Drop focus from the ListenBrainz token box when the user clicks anywhere
+        // outside it, same behaviour as the top-bar search box. Tunnel so it runs
+        // before inner controls handle the press.
+        AddHandler(PointerPressedEvent, OnSettingsPointerPressed, RoutingStrategies.Tunnel);
+
+        // The EQ preset combo lives inside SettingsScrollViewer; its momentum-scroll
+        // behavior would otherwise consume wheel events routed through it, including
+        // events over the open dropdown. Suspend it while the dropdown is open so the
+        // wheel reaches the popup's own ScrollViewer (same fix as the genre combo).
+        if (this.FindControl<ComboBox>("EqPresetCombo") is { } eqCombo)
+        {
+            eqCombo.DropDownOpened += OnEqPresetDropDownOpened;
+            eqCombo.DropDownClosed += OnEqPresetDropDownClosed;
+        }
+        // A plugin's own view shown here wears the same theme as in its window.
+        PluginViewTheme.Apply(PluginViewHost);
+    }
+
+    /// <summary>Room the search box keeps beside the header's actions before they drop under it.</summary>
+    internal const double PluginSearchMinWidth = 200;
+
+    
+
+    /// <summary>Narrowest a plugin card gets before the grid drops a column, and the gap between cards.</summary>
+    internal const double PluginCardMinWidth = 190;
+    internal const double PluginCardGap = 12;
+    internal const int PluginGridMaxColumns = 4;
+
+    /// <summary>Cards per row for a page <paramref name="width"/> wide: as many as fit at
+    /// <see cref="PluginCardMinWidth"/>, at least one, at most <see cref="PluginGridMaxColumns"/>.</summary>
+    internal static int PluginGridColumnsFor(double width)
+        => Math.Clamp((int)Math.Floor((width + PluginCardGap) / (PluginCardMinWidth + PluginCardGap)), 1, PluginGridMaxColumns);
+
+    private void LayoutPluginGrid(double width)
+    {
+        if (width <= 0 || DataContext is not SettingsViewModel vm) return;
+        var columns = PluginGridColumnsFor(width);
+        if (vm.PluginGridColumns != columns) vm.PluginGridColumns = columns;
+    }
+
+    // ── A plugin's page ──
+
+    private double _pluginGridScrollOffset;
+    private PluginCardItem? _openedPluginCard;
+
+    /// <summary>
+    /// The page opens at the top with the back button focused (keyboard users land on it); going
+    /// back restores where the grid was scrolled and puts focus on the card that opened the page.
+    /// </summary>
+    
+
+    /// <summary>Below this page width a plugin setting's control sits under its label (the slider
+    /// alone is 248 wide).</summary>
+    internal const double PluginRowStackWidth = 520;
+
+    
+
+    // ── A plugin's own view, in place of its page ──
+
+    /// <summary>
+    /// The size this view needs to give an open plugin view the size it asks for (its hint, else
+    /// PluginViewWindow's defaults) with the rail, the header and the margins around it; null once
+    /// the view leaves. MainWindow grows the Settings card to it (SizeSettingsCard).
+    /// </summary>
+    public event Action<Size?>? CardSizeRequested;
+
+    private Undertone.Services.Plugins.PluginViewEntry? _shownPluginView;
+
+    /// <summary>
+    /// The view opens with the Back pill focused and asks for the card size it needs; it leaves
+    /// with the card back to its own size and, on Back, focus on the view's Open button. The page
+    /// it covered comes back from the left (it went out that way).
+    /// </summary>
+    
+
+    /// <summary>What this view needs for <paramref name="view"/>: the view's size plus everything
+    /// around its frame (this view's size minus the frame's, as laid out now).</summary>
+    private Size PluginViewCardSize(Undertone.Services.Plugins.PluginViewEntry view)
+    {
+        var frame = PluginViewFrame.Bounds.Size;
+        var size = PluginViewSize(view.ReadSizeHint(), PluginViewHost.Content as Control);
+        return new Size(size.Width + Bounds.Width - frame.Width, size.Height + Bounds.Height - frame.Height);
+    }
+
+    /// <summary>
+    /// The size a plugin view asks for, as its window would open (PluginViewWindow.Resolve, no
+    /// screen cap: the main window caps the card): the hint per axis, else 1000 x 680, never under
+    /// the minimum; on a size-to-content axis the control's own desired size.
+    /// </summary>
+    internal static Size PluginViewSize(Undertone.Services.Plugins.PluginViewSizeHint hint, Control? content)
+    {
+        var size = PluginViewWindow.Resolve(hint, null);
+        double width = size.Width, height = size.Height;
+        var byWidth = size.SizeToContent.HasFlag(SizeToContent.Width);
+        var byHeight = size.SizeToContent.HasFlag(SizeToContent.Height);
+        if (content is not null && (byWidth || byHeight))
+        {
+            content.Measure(new Size(byWidth ? double.PositiveInfinity : width, byHeight ? double.PositiveInfinity : height));
+            if (byWidth) width = Math.Max(size.MinWidth, content.DesiredSize.Width);
+            if (byHeight) height = Math.Max(size.MinHeight, content.DesiredSize.Height);
+            content.InvalidateMeasure(); // its slot measures it again with the real room
+        }
+        return new Size(width, height);
+    }
+
+    /// <summary>The page header's "..." menu: Visit homepage (its address in the tooltip) and Open
+    /// folder, the two quiet actions that used to be big pills. Rows light up in the accent like
+    /// the Queue Rows drop-downs (owner 10-29).</summary>
+    internal static List<MenuItem> PluginMoreMenuItems(SettingsViewModel vm, PluginCardItem card)
+    {
+        var items = new List<MenuItem>();
+        if (card.HasHomepage)
+        {
+            var homepage = new MenuItem
+            {
+                Name = "PluginPageHomepageItem",
+                Classes = { "accent-rows" },
+                Header = Undertone.Localization.Loc.T("Plugins.Detail.Homepage"),
+                Command = vm.OpenPluginHomepageCommand,
+                CommandParameter = card,
+            };
+            ToolTip.SetTip(homepage, card.Homepage);
+            items.Add(homepage);
+        }
+        if (card.Installed is { } plugin)
+            items.Add(new MenuItem
+            {
+                Name = "PluginPageFolderItem",
+                Classes = { "accent-rows" },
+                Header = Undertone.Localization.Loc.T("Plugins.OpenPluginFolder"),
+                Command = vm.OpenPluginDirectoryCommand,
+                CommandParameter = plugin,
+            });
+        // Uninstall here too (Discord feedback 11-03: "no way to remove plugins"): the red row at
+        // the bottom of the page is easy to miss on a plugin with many settings.
+        if (card.Installed is { } installed)
+            items.Add(new MenuItem
+            {
+                Name = "PluginPageUninstallItem",
+                Classes = { "danger" },
+                Header = Undertone.Localization.Loc.T("Plugins.Remove"),
+                Command = vm.RemovePluginCommand,
+                CommandParameter = installed,
+            });
+        return items;
+    }
+
+    /// <summary>The menu last opened from a plugin page's "..." button (tests).</summary>
+    internal MenuFlyout? PluginMoreMenu { get; private set; }
+
+    private void OnPluginMoreClick(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not Button button || button.DataContext is not PluginCardItem card || DataContext is not SettingsViewModel vm) return;
+        var menu = new MenuFlyout { Placement = PlacementMode.BottomEdgeAlignedRight };
+        // Closes with the pop like every other menu (the style only opens it that way).
+        MenuOpenAnimation.SetEnableFlyoutClose(menu, true);
+        foreach (var item in PluginMoreMenuItems(vm, card)) menu.Items.Add(item);
+        if (menu.Items.Count == 0) return;
+        PluginMoreMenu = menu;
+        menu.ShowAt(button);
+    }
+
+    /// <summary>Below this width the three Make your own plugin steps stack: side by side, each
+    /// column would wrap its one line into four or five.</summary>
+    internal const double MakePluginStepsStackWidth = 560;
+
+    private bool _makePluginStepsStacked;
+
+    
+
+    // ── Settings search ──
+
+    private SettingsSearchIndex? _searchIndex;
+
+    /// <summary>Test hook: the index as built so far (null until the first query).</summary>
+    internal SettingsSearchIndex? SearchIndexForTests => _searchIndex;
+    internal void ApplySearchForTests() => ApplySearch();
+
+    /// <summary>
+    /// Section key → x:Name of its page panel. The index is keyed by the section key so the
+    /// rail badge counts line up (they never did for "Account &amp; Sync", whose panel name
+    /// differed from its key).
+    /// </summary>
+    internal static readonly (string Tab, string PanelName)[] TabPanels =
+    {
+        (SettingsViewModel.TabGeneral, "GeneralTabPanel"),
+        (SettingsViewModel.TabAppearance, "AppearanceTabPanel"),
+        (SettingsViewModel.TabPlayer, "PlayerTabPanel"),
+        (SettingsViewModel.TabLyrics, "LyricsTabPanel"),
+        (SettingsViewModel.TabShortcuts, "ShortcutsTabPanel"),
+        (SettingsViewModel.TabAudio, "AudioTabPanel"),
+        (SettingsViewModel.TabLibrary, "LibraryTabPanel"),
+        (SettingsViewModel.TabAdvanced, "AdvancedTabPanel"),
+        (SettingsViewModel.TabIntegrations, "IntegrationsTabPanel"),
+        (SettingsViewModel.TabPlugins, "PluginsTabPanel"),
+    };
+
+    private SettingsSearchIndex EnsureSearchIndex()
+    {
+        if (_searchIndex is not null) return _searchIndex;
+        // The index reads every card's text and visibility, which needs each page bound.
+        foreach (var (tab, _) in TabPanels)
+            RealizeTabPage(tab, animate: false);
+        var panels = new List<(string Tab, Control Panel)>();
+        foreach (var (tab, name) in TabPanels)
+        {
+            if (this.FindControl<Control>(name) is { } panel)
+                panels.Add((tab, panel));
+        }
+        return _searchIndex = SettingsSearchIndex.Build(panels);
+    }
+
+    // ── Lazy tab pages (GitHub #139) ──
+
+    // All thirteen pages used to join the tree on the first open, though only one shows:
+    // styling ~2,100 controls allocated ~35 MB at once (headless Release harness,
+    // SettingsOpenCostTests), and the gen1/gen2 collections that followed paused every
+    // thread, the audio render thread included — an audible skip on Linux. The pages are
+    // still built here (x:Name fields, the code-behind wiring), but each one stays out of
+    // the tree until its tab is first shown, and then stays in.
+    private Panel? _tabHost;
+    private readonly List<Control> _tabHostOrder = new();
+    private readonly Dictionary<string, Control> _deferredTabPages = new();
+
+    /// <summary>Test hook: the pages still waiting for their first visit.</summary>
+    internal IReadOnlyCollection<string> DeferredTabsForTests => _deferredTabPages.Keys;
+
+    private void DeferTabPages()
+    {
+        foreach (var (tab, name) in TabPanels)
+        {
+            if (this.FindControl<Control>(name) is not { Parent: Panel host } page) continue;
+            if (_tabHost is null)
+            {
+                _tabHost = host;
+                _tabHostOrder.AddRange(host.Children);
+            }
+            if (!ReferenceEquals(host, _tabHost)) continue;
+            host.Children.Remove(page);
+            _deferredTabPages[tab] = page;
+        }
+    }
+
+    /// <summary>
+    /// Puts <paramref name="tab"/>'s page back in its original slot. With
+    /// <paramref name="animate"/> it enters from the tab-page hidden state (faded, 6 px
+    /// down) so the first visit glides in like every later one.
+    /// </summary>
+    private void RealizeTabPage(string tab, bool animate)
+    {
+        if (_tabHost is null || !_deferredTabPages.Remove(tab, out var page)) return;
+
+        var order = _tabHostOrder.IndexOf(page);
+        var index = _tabHost.Children.Count(c => _tabHostOrder.IndexOf(c) < order);
+        if (animate)
+        {
+            page.Opacity = 0;
+            page.RenderTransform = Avalonia.Media.Transformation.TransformOperations.Parse("translateY(6px)");
+        }
+        _tabHost.Children.Insert(index, page);
+        if (animate)
+        {
+            // Released once the tab-page style (and its transitions) is on the page.
+            Dispatcher.UIThread.Post(() =>
+            {
+                page.ClearValue(OpacityProperty);
+                page.ClearValue(RenderTransformProperty);
+            }, DispatcherPriority.Loaded);
+        }
+    }
+
+    /// <summary>Focus the rail's search box (Ctrl+F while the modal is open).</summary>
+    public void FocusSearch()
+    {
+        SettingsSearchBox.Focus();
+        SettingsSearchBox.SelectAll();
+    }
+
+    private void ApplySearch()
+    {
+        var query = SettingsSearchBox.Text ?? string.Empty;
+        // Nothing to restore and nothing to hide: don't walk the tree for an empty box.
+        if (_searchIndex is null && query.Trim().Length == 0) return;
+        var index = EnsureSearchIndex();
+        index.Apply(query);
+
+        if (DataContext is not SettingsViewModel vm) return;
+        var counts = index.CountByTab(query);
+        foreach (var section in vm.Sections)
+            section.MatchCount = counts.TryGetValue(section.Key, out var n) ? n : 0;
+
+        // Typing something the current section doesn't contain jumps to the first section
+        // that does, so the user never stares at an empty page.
+        if (query.Trim().Length > 0 && !counts.ContainsKey(vm.SelectedSettingsTab))
+        {
+            var first = vm.Sections.FirstOrDefault(sct => sct.MatchCount > 0);
+            if (first is not null) vm.SelectedSettingsTab = first.Key;
+        }
+    }
+
+    private void OnSearchBoxKeyDown(object? sender, KeyEventArgs e)
+    {
+        switch (e.Key)
+        {
+            case Key.Escape when !string.IsNullOrEmpty(SettingsSearchBox.Text):
+                // First Escape clears the query; the next one closes Settings as usual.
+                SettingsSearchBox.Text = string.Empty;
+                e.Handled = true;
+                break;
+            case Key.Return when DataContext is SettingsViewModel vm:
+                if (_searchIndex?.FirstMatch(SettingsSearchBox.Text ?? string.Empty, vm.SelectedSettingsTab) is { } hit)
+                {
+                    if (hit.Tab != vm.SelectedSettingsTab) vm.SelectedSettingsTab = hit.Tab;
+                    hit.Card.BringIntoView();
+                }
+                e.Handled = true;
+                break;
+        }
+    }
+
+    // Enter in the ffmpeg path box re-probes the path so the user gets an explicit
+    // "validate now" affordance after pasting. The Text binding already updates the
+    // status live on each edit; this is a deliberate confirmation step.
+    private void OnFfmpegPathKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Key is Key.Enter or Key.Return && DataContext is SettingsViewModel vm)
+        {
+            vm.RefreshFfmpegStatus();
+            e.Handled = true;
+        }
+    }
+
+    // Enter in the profile name box commits the edit and drops focus, so the caret/edit
+    // affordance disappears (same defocus target used when clicking outside the token box).
+    private void OnProfileNameKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Key is Key.Enter or Key.Return)
+        {
+            SettingsScrollViewer?.Focus(NavigationMethod.Pointer);
+            e.Handled = true;
+        }
+    }
+
+    private void OnEqPresetDropDownOpened(object? sender, EventArgs e)
+    {
+        if (SettingsScrollViewer is not null)
+            SmoothScrollBehavior.SetIsEnabled(SettingsScrollViewer, false);
+    }
+
+    private void OnEqPresetDropDownClosed(object? sender, EventArgs e)
+    {
+        if (SettingsScrollViewer is not null)
+            SmoothScrollBehavior.SetIsEnabled(SettingsScrollViewer, true);
+    }
+
+    // ── Save EQ preset flyout (GitHub #95) ──
+
+    // The flyout's content attaches each time it opens: start from a clean state, prefill
+    // the selected user preset's name (so re-saving overwrites it) and focus the box.
+    private void OnEqPresetNameBoxAttached(object? sender, VisualTreeAttachmentEventArgs e)
+    {
+        if (sender is not TextBox box || DataContext is not SettingsViewModel vm) return;
+        vm.EqPresetSaveError = "";
+        if (string.IsNullOrEmpty(vm.NewEqPresetName) && vm.UserEqPresetNames.Contains(vm.SelectedEqPresetName))
+            vm.NewEqPresetName = vm.SelectedEqPresetName;
+        Dispatcher.UIThread.Post(() =>
+        {
+            box.Focus();
+            box.SelectAll();
+        }, DispatcherPriority.Input);
+    }
+
+    private void OnEqPresetNameKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Key is Key.Enter or Key.Return)
+        {
+            // Equalizer controls have been removed.
+            e.Handled = true;
+        }
+    }
+
+    private void OnSettingsPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        var tokenBox = this.FindControl<TextBox>("ListenBrainzTokenBox");
+        if (tokenBox is not { IsFocused: true })
+            tokenBox = this.FindControl<TextBox>("ListenBrainzApiUrlBox");
+        if (tokenBox is not { IsFocused: true })
+            return;
+
+        bool insideBox = false;
+        if (e.Source is Visual clickSource)
+        {
+            Visual? v = clickSource;
+            while (v != null)
+            {
+                if (ReferenceEquals(v, tokenBox)) { insideBox = true; break; }
+                v = v.GetVisualParent();
+            }
+        }
+
+        if (!insideBox)
+            Dispatcher.UIThread.Post(() => SettingsScrollViewer.Focus(NavigationMethod.Pointer),
+                DispatcherPriority.Background);
+    }
+
+    private void OnSettingsDataContextChanged(object? sender, EventArgs e)
+    {
+        if (_trackedViewModel != null)
+            _trackedViewModel.PropertyChanged -= OnSettingsViewModelPropertyChanged;
+
+        _trackedViewModel = DataContext as SettingsViewModel;
+
+        if (_trackedViewModel != null)
+        {
+            _trackedViewModel.PropertyChanged += OnSettingsViewModelPropertyChanged;
+            RealizeTabPage(_trackedViewModel.SelectedSettingsTab, animate: false);
+        }
+    }
+
+    private void OnSettingsViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        switch (e.PropertyName)
+        {
+            // The media-folders card is the first card on the Library tab (the view model
+            // already switched tabs), so landing there is just a scroll to the top.
+            case nameof(SettingsViewModel.MediaFoldersScrollRequest):
+            case nameof(SettingsViewModel.SelectedSettingsTab):
+                if (_trackedViewModel is { } selected)
+                    RealizeTabPage(selected.SelectedSettingsTab, animate: true);
+                ScrollToTop();
+                Dispatcher.UIThread.Post(LogStyleProbe, DispatcherPriority.Background);
+                break;
+
+            // Phone app / Web Remote / Local API turned on: their body glides open below the
+            // fold (Local API is the page's last card), so follow the card down as it grows.
+            case nameof(SettingsViewModel.SelectedPluginCard):
+                if (_trackedViewModel is { } pluginsVm) ;
+                break;
+            case nameof(SettingsViewModel.OpenPluginViewEntry):
+                if (_trackedViewModel is { } viewVm) ;
+                break;
+
+            case nameof(SettingsViewModel.IsPhoneCardOpen):
+                if (_trackedViewModel?.IsPhoneCardOpen == true) ;
+                break;
+            case nameof(SettingsViewModel.IsWebRemoteCardOpen):
+                if (_trackedViewModel?.IsWebRemoteCardOpen == true) ;
+                break;
+            case nameof(SettingsViewModel.LocalApiRunning):
+                if (_trackedViewModel?.LocalApiRunning == true) ;
+                break;
+
+            // Version-manager download started: bring the progress bar + Cancel
+            // button into view (the release list can push them off-screen).
+            case nameof(SettingsViewModel.IsDevDownloading):
+                if (_trackedViewModel?.IsDevDownloading == true)
+                    Dispatcher.UIThread.Post(
+                        () => DevDownloadPanel.BringIntoView(),
+                        DispatcherPriority.Loaded);
+                break;
+        }
+    }
+
+    private EventHandler? _followReveal;
+
+    /// <summary>
+    /// Keeps <paramref name="card"/>'s bottom edge on screen while <paramref name="body"/>
+    /// glides open: after every layout pass the scroller moves down by whatever the card
+    /// has grown past the viewport, so the page scrolls in step with the reveal instead of
+    /// jumping once (a single BringIntoView at the start sees the still-folded height).
+    /// Never scrolls the card's top out of view. Ends when the reveal lands or reverses.
+    /// </summary>
+    private void FollowReveal(Control card, Undertone.Controls.CollapsibleContent body)
+    {
+        var scroller = SettingsScrollViewer;
+        if (scroller is null || !card.IsEffectivelyVisible) return;
+
+        if (_followReveal is not null) scroller.LayoutUpdated -= _followReveal;
+        _followReveal = (_, _) =>
+        {
+            if (!body.IsOpen)
+            {
+                Stop();
+                return;
+            }
+            if (card.TranslatePoint(default, scroller) is { } top)
+            {
+                const double gap = 16;
+                var overflow = top.Y + card.Bounds.Height + gap - scroller.Viewport.Height;
+                overflow = Math.Min(overflow, top.Y - gap); // keep the card's header in view
+                if (overflow > 0.5)
+                {
+                    var max = Math.Max(0, scroller.Extent.Height - scroller.Viewport.Height);
+                    var y = Math.Min(scroller.Offset.Y + overflow, max);
+                    if (y > scroller.Offset.Y) scroller.Offset = new Vector(scroller.Offset.X, y);
+                }
+            }
+            if (body.Reveal >= 0.999) Stop();
+        };
+        scroller.LayoutUpdated += _followReveal;
+
+        void Stop()
+        {
+            if (_followReveal is not null) scroller.LayoutUpdated -= _followReveal;
+            _followReveal = null;
+        }
+    }
+
+    private void ScrollToTop()
+    {
+        Dispatcher.UIThread.Post(
+            () => SettingsScrollViewer.Offset = new Vector(SettingsScrollViewer.Offset.X, 0),
+            DispatcherPriority.Loaded);
+    }
+
+    protected override void OnAttachedToVisualTree(VisualTreeAttachmentEventArgs e)
+    {
+        base.OnAttachedToVisualTree(e);
+        OnSettingsDataContextChanged(this, EventArgs.Empty);
+        Dispatcher.UIThread.Post(LogStyleProbe, DispatcherPriority.Background);
+    }
+
+    internal static readonly HashSet<string> StyleProbeTabs = new(); // internal for tests
+
+    /// <summary>
+    /// The probe is a macOS diagnostic: elsewhere it only walked the whole Settings tree on
+    /// each tab's first open and filled "Copy Logs" with lines nobody reads (owner 11-02).
+    /// </summary>
+    internal static bool StyleProbeEnabled = OperatingSystem.IsMacOS(); // tests turn it on
+
+    /// <summary>
+    /// macOS diagnostics (owner's Mac, 09-26): styled values that came out wrong there —
+    /// square pill buttons and text boxes, invisible section titles, slider tracks gone —
+    /// while cards and locally set values drew fine. One line per session in "Copy Logs"
+    /// with what the styles actually resolved to, so wrong values and right-values-wrong-
+    /// pixels can be told apart. Once per tab per session.
+    /// </summary>
+    private void LogStyleProbe()
+    {
+        if (!StyleProbeEnabled) return;
+        var tab = (DataContext as SettingsViewModel)?.SelectedSettingsTab ?? "?";
+        if (StyleProbeTabs.Contains(tab)) return;
+        try
+        {
+            var all = this.GetVisualDescendants().ToList();
+            var title = all.OfType<TextBlock>().FirstOrDefault(t => t.Classes.Contains("section-title") && t.IsEffectivelyVisible);
+            var pill = all.OfType<Button>().FirstOrDefault(b => b.Classes.Contains("pill-action") && b.IsEffectivelyVisible);
+            var pillPresenter = pill?.GetVisualDescendants().OfType<Avalonia.Controls.Presenters.ContentPresenter>().FirstOrDefault();
+            var box = all.OfType<TextBox>().FirstOrDefault(t => t.IsEffectivelyVisible);
+            var boxBorder = box?.GetVisualDescendants().OfType<Border>().FirstOrDefault(x => x.Name == "PART_BorderElement");
+            var slider = all.OfType<Slider>().FirstOrDefault(s => s.Classes.Contains("accent-slider") && s.IsEffectivelyVisible);
+            var track = slider?.GetVisualDescendants().OfType<RepeatButton>().FirstOrDefault(r => r.Name == "PART_IncreaseButton")
+                ?.GetVisualDescendants().OfType<Border>().FirstOrDefault();
+            if (title == null && pill == null && slider == null) return; // nothing realized yet
+            StyleProbeTabs.Add(tab);
+            DebugLog.Write("SettingsStyle",
+                $"{tab}: title opacity={title?.Opacity:0.##} fg={title?.Foreground} | " +
+                $"pill radius={pillPresenter?.CornerRadius} bg={pillPresenter?.Background} | " +
+                $"textbox radius={box?.CornerRadius} border={boxBorder?.CornerRadius} | " +
+                $"slider track opacity={track?.Opacity:0.##} radius={track?.CornerRadius} h={track?.Bounds.Height:0.#} bg={track?.Background}");
+        }
+        catch (Exception ex)
+        {
+            StyleProbeTabs.Add(tab);
+            DebugLog.Write("SettingsStyle", $"{tab}: probe failed: {ex.Message}");
+        }
+    }
+
+    protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
+    {
+        if (_trackedViewModel != null)
+        {
+            _trackedViewModel.PropertyChanged -= OnSettingsViewModelPropertyChanged;
+            _trackedViewModel = null;
+        }
+        base.OnDetachedFromVisualTree(e);
+    }
+
+    private async void OnPickAvatarClick(object? sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (DataContext is not SettingsViewModel vm) return;
+
+            var topLevel = TopLevel.GetTopLevel(this);
+            if (topLevel == null) return;
+
+            var files = await topLevel.StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
+            {
+                Title = "Choose Profile Picture",
+                AllowMultiple = false,
+                FileTypeFilter = new[]
+                {
+                    new FilePickerFileType("Images")
+                    {
+                        Patterns = new[] { "*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp", "*.gif" }
+                    }
+                }
+            });
+
+            if (files.Count == 0) return;
+
+            var sourcePath = files[0].Path.LocalPath;
+            if (string.IsNullOrWhiteSpace(sourcePath))
+                return;
+
+            // The view model copies the picture into its profile folder under a unique
+            // name (see SetProfileAvatarAsync for why the name must change per pick).
+            await vm.SetProfileAvatarAsync(sourcePath);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[SettingsView] Avatar pick failed: {ex.Message}");
+        }
+    }
+
+    private async void OnModifyLyricsBackgroundClick(object? sender, RoutedEventArgs e)
+    {
+        // async void: an escaped exception would crash the app.
+        try
+        {
+            if (DataContext is not SettingsViewModel vm) return;
+            var library = App.Services?.GetService<ILibraryService>();
+            if (library == null) return;
+
+            var ytDlp = App.Services?.GetService<Services.YouTube.YtDlpTool>();
+            var ffmpeg = App.Services?.GetService<IAudioConverterService>();
+            var dialog = new LyricsBackgroundPickerDialog
+            {
+                DataContext = new LyricsBackgroundPickerViewModel(vm, library, ytDlp, () => ffmpeg?.GetFfmpegPath())
+            };
+            if (TopLevel.GetTopLevel(this) is Window owner)
+            {
+                DialogHelper.SizeToOwner(dialog, owner);
+                await dialog.ShowDialog(owner);
+            }
+            else dialog.Show();
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[SettingsView] Lyrics background picker failed: {ex.Message}");
+        }
+    }
+
+    private void OnPreampSliderDoubleTapped(object? sender, TappedEventArgs e)
+    {
+        if (DataContext is SettingsViewModel vm)
+            vm.ReplayGainPreampDb = PreampDefault;
+    }
+
+    // Double-tapping the crossfade duration slider restores the default duration
+    // (same affordance as the ReplayGain pre-amp slider).
+    private void OnCrossfadeSliderDoubleTapped(object? sender, TappedEventArgs e)
+    {
+        if (DataContext is SettingsViewModel vm)
+        {
+            vm.CrossfadeDuration = CrossfadeDurationDefault;
+            e.Handled = true;
+        }
+    }
+
+    // Double-tapping an EQ gain slider resets that band to 0 dB (same affordance
+    // as the ReplayGain pre-amp slider).
+    private void OnEqGainSliderDoubleTapped(object? sender, TappedEventArgs e)
+    {
+        if (sender is Slider { DataContext: EqBandViewModel band })
+        {
+            band.GainDb = 0;
+            e.Handled = true;
+        }
+    }
+
+    private void OnEqPreampSliderDoubleTapped(object? sender, TappedEventArgs e)
+    {
+        if (DataContext is SettingsViewModel vm)
+        {
+            vm.EqPreampDb = 0;
+            e.Handled = true;
+        }
+    }
+
+    // Double-tapping the lyrics minimum-line-opacity slider restores the fresh-install
+    // value (same affordance as the pre-amp and crossfade sliders).
+    // A plugin's number slider: double-tapping restores the plugin.json default, like the
+    // Settings sliders above.
+    private void OnPluginSliderDoubleTapped(object? sender, TappedEventArgs e)
+    {
+        if (sender is Slider { DataContext: Undertone.Services.Plugins.PluginSettingItem item })
+        {
+            item.ResetToDefault();
+            e.Handled = true;
+        }
+    }
+
+    private void OnLyricsMinLineOpacitySliderDoubleTapped(object? sender, TappedEventArgs e)
+    {
+        if (DataContext is SettingsViewModel vm)
+        {
+            vm.LyricsMinLineOpacity = Models.AppSettings.LyricsMinLineOpacityDefault;
+            e.Handled = true;
+        }
+    }
+
+    // Double-tapping the album page tint-strength slider restores the full cover colour.
+    private void OnAlbumPageTintStrengthSliderDoubleTapped(object? sender, TappedEventArgs e)
+    {
+        if (DataContext is SettingsViewModel vm)
+        {
+            vm.AlbumPageTintStrength = Models.AppSettings.AlbumPageTintStrengthDefault;
+            e.Handled = true;
+        }
+    }
+
+    // Double-tapping a Drift knob (GitHub #111) restores the stock Drift look for that knob.
+    private void OnDriftMovementSliderDoubleTapped(object? sender, TappedEventArgs e)
+    {
+        if (DataContext is SettingsViewModel vm)
+        {
+            vm.LyricsDriftMovement = Models.AppSettings.LyricsDriftKnobDefault;
+            e.Handled = true;
+        }
+    }
+
+    private void OnDriftSaturationSliderDoubleTapped(object? sender, TappedEventArgs e)
+    {
+        if (DataContext is SettingsViewModel vm)
+        {
+            vm.LyricsDriftSaturation = Models.AppSettings.LyricsDriftKnobDefault;
+            e.Handled = true;
+        }
+    }
+
+    private void OnDriftBlurSliderDoubleTapped(object? sender, TappedEventArgs e)
+    {
+        if (DataContext is SettingsViewModel vm)
+        {
+            vm.LyricsDriftBlur = Models.AppSettings.LyricsDriftKnobDefault;
+            e.Handled = true;
+        }
+    }
+
+    private static void AttachThumbDoubleTapReset(Slider slider, double defaultValue)
+    {
+        slider.DoubleTapped += (_, e) =>
+        {
+            if (e.Source is not Visual source) return;
+            if (source.FindAncestorOfType<Thumb>(includeSelf: true) == null) return;
+            slider.Value = defaultValue;
+            e.Handled = true;
+        };
+    }
+
+}

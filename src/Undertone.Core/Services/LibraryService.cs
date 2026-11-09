@@ -1,0 +1,4161 @@
+using System.Collections.Concurrent;
+using Undertone.Helpers;
+using Undertone.Models;
+
+namespace Undertone.Services;
+
+/// <summary>
+/// Scans local folders for audio files, reads metadata via IMetadataService,
+/// and maintains indexed collections of tracks, albums, and artists.
+/// All data is persisted to JSON via IPersistenceService.
+/// </summary>
+public class LibraryService : ILibraryService
+{
+    private const int CurrentMetadataSchemaVersion = 12;
+    // v3: album track order normalized (disc 0 → 1, missing track numbers last)
+    private const int CurrentIndexCacheVersion = 3;
+    // Throttle scan progress so a large library (tens of thousands of files)
+    // doesn't post one UI update per file. Emit on the first file then every
+    // Nth, which is frequent enough to read as "live" without flooding.
+    private const int ProgressReportInterval = 32;
+    // How often (ms) to surface scan-in-progress tracks to the library views so
+    // they populate live instead of staying empty until the whole scan finishes.
+    private const int ProgressivePublishMs = 1500;
+
+    private readonly IMetadataService _metadata;
+    private readonly IPersistenceService _persistence;
+    private readonly ISqliteLibraryIndexService _sqliteIndex;
+    private readonly IAuditTrailService _auditTrail;
+
+    // The whole scanned set — persisted, rescanned and journaled as before. Hidden folders
+    // only narrow what Tracks/Albums/Artists/GetTrackById publish (VisibleTracks).
+    private List<Track> _tracks = new();
+    private List<Album> _albums = new();
+
+    // AppSettings.HiddenLibraryFolders, loaded in LoadAsync and replaced (never mutated) by
+    // SetFolderHiddenAsync, so a reader always sees one consistent array.
+    private string[] _hiddenFolders = Array.Empty<string>();
+
+    // AppSettings.InboxEnabled as LoadAsync read it: off releases any marked songs on load.
+    private bool _inboxEnabledAtLoad;
+
+    // Last VisibleTracks result, keyed by the exact _tracks list and hidden array it came
+    // from (both are swapped, never edited in place), so Tracks costs one filter per change.
+    // The Inbox split rides along: every change to a track's IsInInbox swaps _tracks too.
+    private sealed record VisibleSnapshot(List<Track> Source, string[] Hidden, List<Track> Visible,
+        List<Track> Inbox, Dictionary<Guid, Track>? InboxIndex);
+    private volatile VisibleSnapshot? _visible;
+    private List<Artist> _artists = new();
+
+    // Lookup tables for fast ID resolution
+    private Dictionary<Guid, Track> _trackIndex = new();
+    private Dictionary<Guid, Album> _albumIndex = new();
+
+    // Lazy-built lookup from artist name → that artist's albums. Avoids an O(N)
+    // LINQ scan in GetAlbumsByArtist (hot on AlbumDetail open and ArtistDetail).
+    // Invalidated to null whenever _albums is reassigned; the next reader rebuilds.
+    private volatile Dictionary<string, List<Album>>? _albumsByArtistIndex;
+    private readonly object _albumsByArtistLock = new();
+
+    // Active-scan handle for graceful-shutdown checkpointing. When _checkpointRequested
+    // is set, a cancelled scan persists its partial progress (merged with the existing
+    // library) instead of rolling back, so the next launch resumes where it left off.
+    private CancellationTokenSource? _activeScanCts;
+    private TaskCompletionSource? _scanFinished;
+    private volatile bool _checkpointRequested;
+
+    /// <summary>See <see cref="ILibraryService.IsPublishingPartial"/>: set for the lifetime of
+    /// a scan's progressive publisher, cleared before the authoritative publish.</summary>
+    private volatile bool _publishingPartial;
+    public bool IsPublishingPartial => _publishingPartial;
+
+    /// <summary>See <see cref="ILibraryService.IsScanning"/>: set while <see cref="ScanAsync"/>
+    /// holds the scan gate (the partial flag alone clears before the scan's last publish).</summary>
+    private volatile bool _scanning;
+    public bool IsScanning => _scanning || _publishingPartial;
+
+    // Serializes scans. Two overlapping scans both drive _tracks, both Clear+Upsert the
+    // SQLite index, and the second clobbers the first's _activeScanCts — so shutdown could
+    // only cancel one of them. The startup auto-scan runs on a detached Task.Run, so
+    // overlap with a user-triggered scan was reachable even though the settings VM
+    // serializes its own calls. Imports (ImportFilesAsync) take it too.
+    private readonly SemaphoreSlim _scanGate = new(1, 1);
+
+    public IReadOnlyList<Track> Tracks => VisibleTracks(_tracks);
+    public IReadOnlyList<Track> AllTracks => _tracks;
+    public IReadOnlyList<string> HiddenFolders => _hiddenFolders;
+    public IReadOnlyList<Track> InboxTracks => Snapshot(_tracks).Inbox;
+    public IReadOnlyList<Album> Albums => _albums;
+    public IReadOnlyList<Artist> Artists => _artists;
+
+    public event EventHandler? LibraryUpdated;
+    public event EventHandler<int>? ScanProgress;
+    public event EventHandler? FavoritesChanged;
+    public event EventHandler<List<string>>? MusicFoldersChanged;
+
+    /// <summary>
+    /// Raised when a scan was abandoned because one or more configured music folders were
+    /// unavailable (offline drive / unreachable share). Carries the missing root paths.
+    /// The existing library is left untouched (with <see cref="ScanPastUnavailableFolders"/>:
+    /// only those folders' songs are, and the scan applies the rest).
+    /// </summary>
+    public event EventHandler<string[]>? ScanAborted;
+    /// <inheritdoc />
+    public event EventHandler<IReadOnlyList<Track>>? TracksAdded;
+
+    public LibraryService(
+        IMetadataService metadata,
+        IPersistenceService persistence,
+        ISqliteLibraryIndexService sqliteIndex,
+        IAuditTrailService auditTrail,
+        IDeferredTagWriter? tagWriter = null,
+        Sync.ITrackStateRecorder? syncRecorder = null,
+        IFileSystemSource? fileSystem = null)
+    {
+        _metadata = metadata;
+        _persistence = persistence;
+        _sqliteIndex = sqliteIndex;
+        _auditTrail = auditTrail;
+        _tagWriter = tagWriter;
+        _syncRecorder = syncRecorder;
+        _fileSystem = fileSystem ?? new LocalFileSystemSource();
+    }
+
+    /// <summary>Batches rating/lyrics tag writes until the user is idle (null = write immediately).</summary>
+    private readonly IDeferredTagWriter? _tagWriter;
+
+    /// <summary>Mirrors user-state saves into the sync ledger (null = sync not wired).</summary>
+    private readonly Sync.ITrackStateRecorder? _syncRecorder;
+
+    /// <summary>Where scans enumerate and open files (desktop: directory walk; Android: SAF).</summary>
+    private readonly IFileSystemSource _fileSystem;
+
+    /// <summary>
+    /// A scan that finds a music folder unavailable carries that folder's known songs forward
+    /// unchanged and applies the rest (the phone: a card taken out must not freeze the library).
+    /// Off, the scan is abandoned and the library kept as it was (the desktop's rule). Either way
+    /// <see cref="ScanAborted"/> names the unavailable folders.
+    /// </summary>
+    public bool ScanPastUnavailableFolders { get; init; }
+
+    public async Task ScanAsync(IEnumerable<string> folders, CancellationToken ct = default)
+    {
+        // Register this scan so a graceful shutdown can cancel it and flush a
+        // checkpoint (see PauseActiveScanForShutdownAsync). The linked source lets
+        // shutdown cancel independently of the caller's own token.
+        await _scanGate.WaitAsync(ct).ConfigureAwait(false);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var finished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _checkpointRequested = false;
+        _activeScanCts = linkedCts;
+        _scanFinished = finished;
+        _scanning = true;
+        try
+        {
+            await ScanCoreAsync(folders, linkedCts.Token);
+        }
+        finally
+        {
+            _scanning = false;
+            finished.TrySetResult();
+            if (ReferenceEquals(_scanFinished, finished))
+            {
+                _scanFinished = null;
+                _activeScanCts = null;
+            }
+            _scanGate.Release();
+        }
+    }
+
+    private async Task ScanCoreAsync(IEnumerable<string> folders, CancellationToken ct)
+    {
+        var scanStarted = Environment.TickCount64;
+        var settings = await _persistence.LoadSettingsAsync();
+        // Refresh the artwork-toggle mirror from the persisted settings so even a
+        // scan that starts before SettingsViewModel finishes loading honors it.
+        MetadataService.UseEmbeddedArtwork = settings.UseEmbeddedArtwork;
+        var includeRoots = BuildIncludeRoots(folders, settings).ToList();
+        // Mirror the roots so folder-derived metadata (untagged files) never
+        // credits a library root folder itself as an artist or album.
+        MetadataService.MusicRootFolders = includeRoots.ToArray();
+        var excludedRoots = settings.FolderRules
+            .Where(r => r.Enabled && !r.Include && !string.IsNullOrWhiteSpace(r.Path))
+            .Select(r => TryNormalizePath(r.Path))
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Select(p => p!)
+            .Distinct(PathComparison.Comparer)
+            .ToArray();
+        var ignoredNames = new HashSet<string>(
+            settings.IgnoredFolderNames
+                .Where(n => !string.IsNullOrWhiteSpace(n))
+                .Select(n => n.Trim().ToLowerInvariant()),
+            StringComparer.OrdinalIgnoreCase);
+        var excludedFiles = new HashSet<string>(
+            settings.ExcludedFilePaths
+                .Where(p => !string.IsNullOrWhiteSpace(p)),
+            PathComparison.Comparer);
+        // What the root walks produced, without the tracks added on their own (GitHub #108):
+        // the "never publish nothing" guard below judges the walk, which those tracks alone
+        // must not mask.
+        var walkedTrackCount = 0;
+
+        var newTracks = new ConcurrentBag<Track>();
+        // Roots that were configured but not present on disk this pass (unplugged external
+        // drive, unreachable NAS, changed drive letter). Collected so the publish below can
+        // refuse to treat "root is gone" as "root is empty" — see the guard after the scan.
+        var unavailableRoots = new List<string>();
+        // Directories whose listing failed mid-walk (permissions, transient I/O, a cloud
+        // sync provider that isn't running yet). "Couldn't list" is not "empty": known
+        // tracks under these are carried forward after the scan instead of being dropped.
+        var failedDirs = new ConcurrentBag<string>();
+        // Tracks which albums have already had a cover cached during this scan, so we
+        // save each album's art exactly once (first track wins).
+        var albumArtClaimed = new ConcurrentDictionary<Guid, bool>();
+        // Tracks re-read this scan: their embedded cover may have changed, so the
+        // per-track cover pass after the scan re-decides their albums.
+        var freshlyRead = new ConcurrentDictionary<Guid, byte>();
+        // Files the library did not know before this scan (TracksAdded, GitHub #148).
+        var firstSeen = new ConcurrentBag<Track>();
+        var fileCount = 0;
+        var unchangedCount = 0;
+        var changedCount = 0;
+        var skippedCount = 0;
+        // Developer Mode: names each new/changed file right before TagLib opens it (#97).
+        var tagOpen = new CappedBreadcrumb("Scan", "tags: open");
+        // Always on: a file the tag read refused left only a count behind ("skipped=N", and not
+        // even that on a scan that changed nothing), so a song missing after a scan could not be
+        // traced. Names the first few per scan.
+        var skippedNote = new CappedBreadcrumb("Scan", "skipped, unreadable:", cap: 10, isEnabled: () => true);
+
+        // Snapshot the current track index for read-only access during parallel scan.
+        // Hidden folders included: matched against the visible index only, their files
+        // came back as new tracks with no favorite or play count.
+        var trackIndexSnapshot = AllTrackIndex();
+
+        await _auditTrail.AppendAsync(new AuditEvent
+        {
+            EventType = "scan.started",
+            EntityType = "library",
+            EntityId = "local",
+            Reason = "Library scan started",
+            Details = new Dictionary<string, string>
+            {
+                ["includeRoots"] = includeRoots.Count.ToString(),
+                ["excludedRoots"] = excludedRoots.Length.ToString()
+            }
+        }, ct);
+
+        // Capture the pre-scan library so a cancelled scan can roll back the
+        // progressive partial publishes below and honour "cancel = no change".
+        var originalTracks = _tracks;
+        var originalAlbums = _albums;
+        var originalArtists = _artists;
+        var originalTrackIndex = _trackIndex;
+        var originalAlbumIndex = _albumIndex;
+        // The phone's desktop songs are not files under any folder: a scan must carry them
+        // over untouched (every publish below adds them back) and must not count them when
+        // deciding whether the scan changed anything. _scanGate keeps ReplaceRemoteTracksAsync
+        // from swapping this set mid-scan. Always empty on the desktop.
+        var carriedRemote = originalTracks.Where(IsServerTrack).ToList();
+        var originalTrackCount = originalTracks.Count - carriedRemote.Count;
+        var didPublishPartial = false;
+        // Inbox (opt-in): a file first found under a music folder that already held songs is
+        // a new arrival. A new folder's songs and a fresh library's first scan are an import.
+        var inboxRoots = settings.InboxEnabled ? RootsHoldingTracks(includeRoots, originalTracks) : Array.Empty<string>();
+
+        void RestoreOriginalLibrary()
+        {
+            if (!didPublishPartial) return;
+            _tracks = originalTracks;
+            _albums = originalAlbums;
+            _artists = originalArtists;
+            _trackIndex = originalTrackIndex;
+            _albumIndex = originalAlbumIndex;
+            lock (_albumsByArtistLock) { _albumsByArtistIndex = null; }
+            LibraryUpdated?.Invoke(this, EventArgs.Empty);
+        }
+
+        // Progressive publish: while the scan runs, periodically surface the
+        // tracks found so far so the library views fill in live (Apple Music
+        // style) instead of staying empty until the entire scan completes.
+        // In-memory only — persistence happens once, in the final rebuild below.
+        async Task RunProgressivePublishAsync(CancellationToken pubCt)
+        {
+            var lastCount = 0;
+            try
+            {
+                while (!pubCt.IsCancellationRequested)
+                {
+                    await Task.Delay(ProgressivePublishMs, pubCt).ConfigureAwait(false);
+
+                    var snapshot = newTracks.ToArray();
+                    if (snapshot.Length == 0 || snapshot.Length == lastCount) continue;
+                    lastCount = snapshot.Length;
+
+                    // On a rescan the known tracks the walk has not reached yet stay in (the
+                    // snapshot alone made the library shrink to the walked part and grow back,
+                    // seen as songs and albums vanishing after launch with Scan on Startup); a
+                    // file that is gone leaves at the final publish. Snapshot first: a re-read
+                    // file's fresh tags win over the original.
+                    _tracks = snapshot.Concat(originalTracks).Concat(carriedRemote)
+                        .GroupBy(t => t.Id).Select(g => g.First())
+                        .OrderBy(t => t.Artist).ThenBy(t => t.Album)
+                        .ThenBy(t => t.DiscNumber).ThenBy(t => t.TrackNumber).ToList();
+                    await RebuildIndexesAsync(persistCache: false).ConfigureAwait(false);
+                    didPublishPartial = true;
+                    LibraryUpdated?.Invoke(this, EventArgs.Empty);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch { /* best-effort; the final rebuild is authoritative */ }
+        }
+
+        using var publishCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        _publishingPartial = true;
+        var publishTask = RunProgressivePublishAsync(publishCts.Token);
+
+        try
+        {
+        await Task.Run(() =>
+        {
+            var options = new ParallelOptions
+            {
+                MaxDegreeOfParallelism = GetScanParallelism(),
+                CancellationToken = ct
+            };
+
+            void ReportProgress(int processed)
+            {
+                if (processed == 1 || processed % ProgressReportInterval == 0)
+                    ScanProgress?.Invoke(this, processed);
+            }
+
+            // One audio file, found by a root walk or added on its own (GitHub #108): the
+            // unchanged fast path, else a tag read that keeps a known track's user state.
+            void ProcessEntry(ScanEntry entry)
+            {
+                if (ct.IsCancellationRequested) return;
+                var filePath = entry.Path;
+
+                // Declared outside the try so the failure paths below can tell a
+                // known-but-unreadable file apart from an unreadable new file.
+                Track? existing = null;
+
+                try
+                {
+                    // Skip files we already have that haven't changed
+                    if (trackIndexSnapshot.TryGetValue(ComputeFileId(filePath), out existing))
+                    {
+                        if (entry.LastWriteTimeUtc == existing.LastModified && entry.Length == existing.FileSize
+                            && !IsStaleCaseSpelling(existing.FilePath, filePath)
+                            && !(NeedsWavInfoReread(existing)
+                                 && MetadataService.RiffInfoWouldFill(filePath, existing.Year, existing.Album))
+                            && !NeedsAlacDepthReread(existing, entry))
+                        {
+                            newTracks.Add(existing);
+                            Interlocked.Increment(ref unchangedCount);
+                            ReportProgress(Interlocked.Increment(ref fileCount));
+                            return;
+                        }
+                    }
+
+                    // Read metadata (and the embedded cover, already in memory) for new/changed files
+                    tagOpen.Note(filePath);
+                    var track = _metadata.ReadTrackMetadata(entry, out var embeddedArt);
+                    if (track != null)
+                    {
+                        // Use file path hash as stable ID so rescans don't create duplicates
+                        track.Id = ComputeFileId(filePath);
+
+                        // Preserve user data (favorites, play count, etc.) from the
+                        // old track when a file's metadata/size has changed on disk.
+                        if (existing != null)
+                            CopyMutableTrackState(existing, track);
+                        else
+                        {
+                            track.SourceType = SourceType.Local;
+                            // Before the add below: a progressive publish must never show it
+                            // in Songs first.
+                            track.IsInInbox = IsUnderAnyRoot(filePath, inboxRoots);
+                            firstSeen.Add(track);
+                        }
+                        track.ArtworkHash = TrackArtwork.Fingerprint(embeddedArt);
+                        freshlyRead.TryAdd(track.Id, 0);
+                        newTracks.Add(track);
+                        Interlocked.Increment(ref changedCount);
+
+                        // Cache this album's cover live the first time we see it (zero extra
+                        // I/O — the picture was already read above), so covers fill in with
+                        // tracks during the scan. Folder-art fallback runs after the scan.
+                        if (embeddedArt != null && albumArtClaimed.TryAdd(track.AlbumId, true))
+                        {
+                            if (existing != null)
+                            {
+                                // A file we already knew was re-tagged: its embedded cover is
+                                // the freshest truth for the album. Every writer used to
+                                // short-circuit on File.Exists, so a changed cover never
+                                // reached the cache until the user wiped it.
+                                RefreshAlbumArtworkIfChanged(track.AlbumId, embeddedArt);
+                            }
+                            else if (!File.Exists(_persistence.GetArtworkPath(track.AlbumId)))
+                            {
+                                _persistence.SaveArtwork(track.AlbumId, embeddedArt);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // The file is on disk (it was just enumerated) but couldn't be
+                        // parsed — locked, corrupt, or a cloud placeholder whose
+                        // provider isn't running (ReadTrackMetadata swallows I/O errors
+                        // and returns null). Dropping a KNOWN track here removed it
+                        // from the library, and the save below made that permanent —
+                        // keep the existing entry and let a later scan that can read
+                        // the file refresh it.
+                        if (existing != null)
+                            newTracks.Add(existing);
+                        Interlocked.Increment(ref skippedCount);
+                        skippedNote.Note(existing != null ? filePath + " (known, kept)" : filePath);
+                    }
+
+                    ReportProgress(Interlocked.Increment(ref fileCount));
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // Skip files that can't be read (locked, permissions, I/O error) —
+                    // but keep the existing entry for a known file (see above).
+                    if (existing != null)
+                        newTracks.Add(existing);
+                    Interlocked.Increment(ref skippedCount);
+                    skippedNote.Note($"{filePath}{(existing != null ? " (known, kept)" : "")}: {ex.GetType().Name}: {ex.Message}");
+                    ReportProgress(Interlocked.Increment(ref fileCount));
+                }
+            }
+
+            foreach (var folder in includeRoots)
+            {
+                if (!_fileSystem.RootExists(folder))
+                {
+                    unavailableRoots.Add(folder);
+                    continue;
+                }
+
+                // Enumerate recursively with folder rules, excluding removed files.
+                // Stream files into processing as they're discovered (no up-front
+                // ToList): on slow disks and network shares this overlaps directory
+                // enumeration with metadata reads and starts reporting progress
+                // immediately instead of after a long silent listing phase.
+                // NoBuffering dispatches one file at a time so the count moves right away.
+                var files = _fileSystem.EnumerateAudioFiles(folder, excludedRoots, ignoredNames, failedDirs.Add)
+                    .Where(e => !excludedFiles.Contains(e.Path));
+                var partitioner = Partitioner.Create(files, EnumerablePartitionerOptions.NoBuffering);
+
+                Parallel.ForEach(partitioner, options, ProcessEntry);
+            }
+
+            walkedTrackCount = newTracks.Count;
+
+            // GitHub #108: the tracks added on their own from outside every music folder. No
+            // root walk reaches their files, so each is visited by path — unless a walk just
+            // covered it (its folder became a music folder) or it was excluded since.
+            var covered = new HashSet<Guid>(newTracks.Select(t => t.Id));
+            var addedTracks = originalTracks
+                .Where(t => t.AddedIndividually && !excludedFiles.Contains(t.FilePath) && covered.Add(t.Id))
+                .ToList();
+
+            Parallel.ForEach(addedTracks, options, known =>
+            {
+                if (ct.IsCancellationRequested) return;
+                switch (ProbeAddedFile(known.FilePath, out var entry))
+                {
+                    case AddedFileState.Present:
+                        ProcessEntry(entry!);
+                        break;
+                    case AddedFileState.Unreachable:
+                        // Its folder or drive isn't reachable: "unavailable", not "deleted" —
+                        // keep the track as it is, the same rule as a missing root.
+                        newTracks.Add(known);
+                        Interlocked.Increment(ref unchangedCount);
+                        break;
+                    // Gone: its folder lists fine without it — it drops out like a deleted file.
+                }
+            });
+        }, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancellation is handled gracefully by the rollback below.
+        }
+        finally
+        {
+            publishCts.Cancel();
+            try { await publishTask.ConfigureAwait(false); } catch { /* publisher already stopping */ }
+            _publishingPartial = false;
+        }
+
+        // If scan was cancelled, either checkpoint the partial work (graceful
+        // shutdown) or roll back to the pre-scan library ("cancel = no change").
+        if (ct.IsCancellationRequested)
+        {
+            if (_checkpointRequested)
+            {
+                // Interrupted mid-enumeration: keep every already-known track and
+                // overlay the freshly scanned ones so nothing is dropped. The next
+                // scan resumes the remainder via the unchanged-file fast path.
+                var merged = new Dictionary<Guid, Track>();
+                foreach (var t in originalTracks) merged[t.Id] = t;
+                foreach (var t in newTracks) merged[t.Id] = t;
+                await PersistScanCheckpointAsync(merged.Values.ToList());
+            }
+            else
+            {
+                RestoreOriginalLibrary();
+            }
+            return;
+        }
+
+        // A configured root that isn't on disk right now is "unavailable", not "empty".
+        // Without this guard the scan happily produced zero tracks for that root and the
+        // publish below replaced the library with the remainder, then SaveAsync() wrote it
+        // through — destroying every rating, favorite, play count and DateAdded for the
+        // tracks that lived there. Unplugging an external drive was enough to trigger it,
+        // and ScanOnStartup made it automatic. There is no backup to recover from, so the
+        // only safe response is to abort the scan and keep what we already have.
+        if (unavailableRoots.Count > 0)
+        {
+            var strandedTracks = originalTracks.Count(t => unavailableRoots.Any(root => PathIsUnder(t.FilePath, root)));
+
+            if (strandedTracks > 0 && ScanPastUnavailableFolders)
+            {
+                // The phone: a removed or added folder elsewhere used to wait for the card to come
+                // back (the abort below restored the old library). The unreachable folder's songs
+                // stay as they were (user state and all) and the reachable folders' changes apply.
+                var scannedIds = new HashSet<Guid>(newTracks.Select(t => t.Id));
+                var carried = originalTracks
+                    .Where(t => !IsServerTrack(t) && !scannedIds.Contains(t.Id)
+                                && unavailableRoots.Any(root => PathIsUnder(t.FilePath, root)))
+                    .ToList();
+                foreach (var t in carried) newTracks.Add(t);
+                walkedTrackCount += carried.Count;
+                unchangedCount += carried.Count;
+                var rootList = string.Join(", ", unavailableRoots);
+                DebugLog.Write("Library",
+                    $"Scan: {unavailableRoots.Count} music folder(s) unavailable ({rootList}); keeping their " +
+                    $"{carried.Count} track(s) as they were and applying the other folders.");
+                await _auditTrail.AppendAsync(new AuditEvent
+                {
+                    EventType = "scan.rootsUnavailable",
+                    EntityType = "library",
+                    EntityId = "local",
+                    Reason = "One or more music folders were unavailable; their tracks were kept",
+                    Details = new Dictionary<string, string>
+                    {
+                        ["unavailableRoots"] = rootList,
+                        ["tracksCarriedForward"] = carried.Count.ToString()
+                    }
+                }, ct);
+                ScanAborted?.Invoke(this, unavailableRoots.ToArray());
+            }
+            else if (strandedTracks > 0)
+            {
+                RestoreOriginalLibrary();
+                var rootList = string.Join(", ", unavailableRoots);
+                DebugLog.Write("Library",
+                    $"Scan aborted: {unavailableRoots.Count} music folder(s) unavailable ({rootList}); " +
+                    $"{strandedTracks} track(s) live there. Keeping the existing library rather than " +
+                    "publishing a partial one.");
+                await _auditTrail.AppendAsync(new AuditEvent
+                {
+                    EventType = "scan.aborted",
+                    EntityType = "library",
+                    EntityId = "local",
+                    Reason = "One or more music folders were unavailable",
+                    Details = new Dictionary<string, string>
+                    {
+                        ["unavailableRoots"] = rootList,
+                        ["tracksUnderUnavailableRoots"] = strandedTracks.ToString(),
+                        ["existingTrackCount"] = originalTrackCount.ToString()
+                    }
+                }, ct);
+                ScanAborted?.Invoke(this, unavailableRoots.ToArray());
+                return;
+            }
+        }
+
+        // A directory that could not be LISTED is "unavailable", not "empty" — the same
+        // principle as the missing-roots guard above, one level down. Losing a listing
+        // (access denied, transient I/O, a cloud provider such as OneDrive that hasn't
+        // started yet when the startup scan runs) made every track under that subtree
+        // fall out of newTracks, and the publish + SaveAsync below removed those folders
+        // from the library permanently while the files were still on disk. Carry the
+        // known tracks under failed directories forward unchanged; a later scan that can
+        // list them again reconciles normally, and a genuinely deleted folder (parent
+        // listed fine, entry simply gone) still drops out exactly as before.
+        if (!failedDirs.IsEmpty)
+        {
+            var scannedIds = new HashSet<Guid>(newTracks.Select(t => t.Id));
+            var carried = SelectTracksUnderFailedDirectories(originalTracks, scannedIds, failedDirs);
+            if (carried.Count > 0)
+            {
+                foreach (var t in carried)
+                    newTracks.Add(t);
+                walkedTrackCount += carried.Count;
+
+                var dirList = string.Join(", ", failedDirs.Distinct(StringComparer.OrdinalIgnoreCase));
+                DebugLog.Write("Library",
+                    $"Scan could not list {failedDirs.Count} folder(s) ({dirList}); keeping " +
+                    $"{carried.Count} known track(s) under them rather than treating them as deleted.");
+                await _auditTrail.AppendAsync(new AuditEvent
+                {
+                    EventType = "scan.subtreeUnavailable",
+                    EntityType = "library",
+                    EntityId = "local",
+                    Reason = "One or more folders could not be enumerated; their tracks were kept",
+                    Details = new Dictionary<string, string>
+                    {
+                        ["unlistableDirectories"] = dirList,
+                        ["tracksCarriedForward"] = carried.Count.ToString()
+                    }
+                }, ct);
+            }
+        }
+
+        // Belt-and-braces: never let a scan replace a populated library with nothing.
+        // Any path that gets here with zero results and a non-empty library is a bug in
+        // enumeration, not a user deleting their entire collection mid-scan.
+        // The one legitimate "nothing" is having no folders at all: removing the last media
+        // folder must empty the library, or its albums stay forever (the scan reported
+        // "N tracks found" for folders that were no longer configured). Confirmed against
+        // the persisted settings too, so an empty folder list handed in by a caller whose
+        // settings haven't loaded yet can never wipe the library.
+        var noFoldersConfigured = includeRoots.Count == 0
+                                  && settings.MusicFolders.All(string.IsNullOrWhiteSpace);
+        // Judged on the walk alone (GitHub #108): the tracks added on their own survive any
+        // scan, so they must not turn "the walk found nothing" into "publish just those".
+        var originalWalkedCount = originalTracks.Count(t => !t.AddedIndividually);
+        if (walkedTrackCount == 0 && originalWalkedCount > 0 && !noFoldersConfigured)
+        {
+            RestoreOriginalLibrary();
+            DebugLog.Write("Library",
+                $"Scan produced no tracks while {originalTrackCount} are already in the library — " +
+                "keeping the existing library.");
+            return;
+        }
+
+        // Fast path: every existing track was found and unchanged, and no new or
+        // modified files were detected. Skip the destructive rebuild/persist path —
+        // previously we always wiped the SQLite index and rewrote library.json on
+        // every launch, which the user saw as re-indexing even when nothing changed.
+        if (changedCount == 0 && unchangedCount == originalTrackCount)
+        {
+            // The progressive publisher may have left _tracks on a partial snapshot taken
+            // before the last files were verified. Every other early exit rolls that back;
+            // this one didn't — so the truncated set stayed live for the whole session, and
+            // any later SaveAsync (a rating change, the per-play debounce, the shutdown
+            // flush) wrote it through to library.json, silently deleting whichever folders
+            // happened to be walked last. No-op when nothing was partially published.
+            RestoreOriginalLibrary();
+            await _auditTrail.AppendAsync(new AuditEvent
+            {
+                EventType = "scan.noop",
+                EntityType = "library",
+                EntityId = "local",
+                Reason = "Library scan completed (no changes)",
+                Details = new Dictionary<string, string>
+                {
+                    ["totalFilesProcessed"] = fileCount.ToString(),
+                    ["unchanged"] = unchangedCount.ToString(),
+                    ["skipped"] = skippedCount.ToString(),
+                    ["finalTrackCount"] = originalTrackCount.ToString()
+                }
+            }, ct);
+
+            // A no-change scan used to return without ever looking at artwork, so an
+            // album whose cover was never cached (interrupted first scan, a file or
+            // network mount that was unreadable during extraction) kept its
+            // placeholder forever — unchanged files are skipped by mtime above, and
+            // this fast path skipped the post-scan extraction pass entirely. Heal
+            // those albums here; it costs one existence probe per album when there
+            // is nothing to do.
+            await BackfillMissingArtworkAsync(ct);
+            // A rescan with no audio changes is exactly when a swapped cover.jpg goes
+            // unnoticed: no file was re-read, so nothing touched the cached cover.
+            if (!ct.IsCancellationRequested)
+            {
+                var refreshed = await RefreshStaleFolderArtworkAsync(_tracks, ct);
+                if (refreshed > 0 && !ct.IsCancellationRequested)
+                {
+                    await RebuildIndexesAsync();
+                    LibraryUpdated?.Invoke(this, EventArgs.Empty);
+                }
+            }
+            return;
+        }
+
+        // Authoritative track set. Publish it now (cache write deferred to the final
+        // rebuild) so every scanned track is on screen while album art is extracted
+        // progressively below.
+        // DistinctBy(Id) prevents duplicates from overlapping music folders
+        // (e.g., user adds /Music and /Music/Rock — files in the overlap get scanned twice).
+        _tracks = newTracks.Concat(carriedRemote)
+            .GroupBy(t => t.Id).Select(g => g.First()) // deduplicate by track ID
+            .OrderBy(t => t.Artist).ThenBy(t => t.Album)
+            .ThenBy(t => t.DiscNumber).ThenBy(t => t.TrackNumber).ToList();
+        await RebuildIndexesAsync(persistCache: false);
+        LibraryUpdated?.Invoke(this, EventArgs.Empty);
+        // #97: a startup scan that found new albums ended the process after this publish
+        // with no managed exception logged. Only a scan that found changes runs the steps
+        // below, so each one is bracketed in the session log; the disk mirror flushes
+        // every line, so the last line left names the step that was running.
+        DebugLog.Write("Scan", $"published {_tracks.Count} tracks (changed={changedCount}, " +
+            $"unchanged={unchangedCount}, skipped={skippedCount}, t={Environment.TickCount64 - scanStarted}ms)");
+
+        // Deterministic album-art extraction, published progressively so covers fill
+        // into the views live instead of all at once at the end. Groups are complete
+        // here (post-scan), and each cover comes from the album's lowest disc/track
+        // representative — stable across scans.
+        DebugLog.Write("Scan", "artwork extract: start");
+        var extractedCovers = await ExtractArtworkProgressivelyAsync(newTracks, ct);
+        DebugLog.Write("Scan", $"artwork extract: done ({extractedCovers} cached)");
+        if (!ct.IsCancellationRequested)
+        {
+            DebugLog.Write("Scan", "stale folder art: start");
+            var staleCovers = await RefreshStaleFolderArtworkAsync(newTracks, ct);
+            DebugLog.Write("Scan", $"stale folder art: done ({staleCovers} replaced)");
+        }
+        // Per-track covers for the albums a re-read file belongs to (before the final
+        // rebuild below, which points each odd track at its own cover).
+        if (!ct.IsCancellationRequested && !freshlyRead.IsEmpty)
+        {
+            var fresh = new HashSet<Guid>(freshlyRead.Keys);
+            var albums = _tracks.Where(t => fresh.Contains(t.Id)).Select(t => t.AlbumId).ToList();
+            DebugLog.Write("Scan", $"per-track covers: {albums.Distinct().Count()} album(s)");
+            var trackCovers = await Task.Run(() => ResolveTrackArtwork(_tracks, albums, fresh, ct));
+            DebugLog.Write("Scan", $"per-track covers: done ({trackCovers} changed)");
+        }
+        if (ct.IsCancellationRequested)
+        {
+            DebugLog.Write("Scan", $"cancelled after publish (checkpoint={_checkpointRequested})");
+            if (_checkpointRequested)
+                // Enumeration already completed (only artwork was interrupted), so
+                // _tracks is the authoritative scanned set — persist it as the checkpoint.
+                await PersistScanCheckpointAsync(_tracks.ToList());
+            else
+                RestoreOriginalLibrary();
+            return;
+        }
+
+        // Final authoritative rebuild (persists the index cache and attaches all
+        // extracted covers), then write through to disk.
+        DebugLog.Write("Scan", "rebuild: start");
+        await RebuildIndexesAsync();
+        DebugLog.Write("Scan", "rebuild: done");
+
+        // Persist to disk
+        DebugLog.Write("Scan", "save: start");
+        await SaveAsync();
+        DebugLog.Write("Scan", "save: done");
+        // The SQLite tracks mirror is deliberately not rewritten here: nothing reads
+        // it yet (startup loads library.json), and a full DELETE+reinsert of every
+        // row after each scan was pure write amplification at 50k+ tracks. The manual
+        // RebuildIndexAsync path still refreshes the mirror in full.
+
+        await _auditTrail.AppendAsync(new AuditEvent
+        {
+            EventType = "scan.completed",
+            EntityType = "library",
+            EntityId = "local",
+            Reason = "Library scan completed",
+            Details = new Dictionary<string, string>
+            {
+                ["totalFilesProcessed"] = fileCount.ToString(),
+                ["unchanged"] = unchangedCount.ToString(),
+                ["changedOrNew"] = changedCount.ToString(),
+                ["skipped"] = skippedCount.ToString(),
+                ["finalTrackCount"] = _tracks.Count.ToString()
+            }
+        }, ct);
+
+        DebugLog.Write("Scan", $"done ({_tracks.Count} tracks, t={Environment.TickCount64 - scanStarted}ms)");
+        LibraryUpdated?.Invoke(this, EventArgs.Empty);
+        RaiseTracksAdded(firstSeen);
+        // Tag reads and artwork extraction above leave large dead arrays behind;
+        // every caller (startup, Settings rescan, folder watcher) gets the trim.
+        MemoryTrim.RequestAfterIdle("scan");
+    }
+
+    /// <summary>
+    /// Cancels the in-flight scan and waits for it to flush a checkpoint of its
+    /// partial progress, so quitting mid-scan doesn't waste the work (or, for a
+    /// first scan of a new folder, lose all of it) — the next scan resumes.
+    /// </summary>
+    /// <summary>
+    /// Cancelled when the app is shutting down. The startup metadata backfills take no
+    /// token at all, so they kept hammering the disk (re-opening essentially every
+    /// AAC/ALAC file with Parallel.ForEach) after the user had asked the app to quit.
+    /// </summary>
+    private readonly CancellationTokenSource _shutdownCts = new();
+
+    /// <summary>
+    /// Cancelled (and replaced) by <see cref="ClearAsync"/>: the startup artwork heal and the tag
+    /// backfills walk a snapshot of the old library, so after Reset Everything they kept writing
+    /// covers into the emptied artwork folder and appending to a .progress file being deleted.
+    /// </summary>
+    private CancellationTokenSource _backfillStop = new();
+
+    // Serializes "Merge Featured Artists" toggle passes: a newer flip cancels the
+    // in-flight pass so rapid on/off flips can't interleave writes.
+    private readonly object _mergeFeatApplyLock = new();
+    private CancellationTokenSource? _mergeFeatApplyCts;
+
+    // Serializes artist-join re-read passes (startup + each separator edit): a queued pass
+    // starts from the join the previous one recorded, so none re-reads against a stale one.
+    private readonly SemaphoreSlim _artistJoinGate = new(1, 1);
+
+    public async Task PauseActiveScanForShutdownAsync(TimeSpan timeout)
+    {
+        // Stop the background backfills too, not just the scan.
+        try { _shutdownCts.Cancel(); } catch { }
+
+        var cts = _activeScanCts;
+        var finished = _scanFinished;
+        if (cts == null || finished == null) return;
+
+        _checkpointRequested = true;
+        try { cts.Cancel(); }
+        catch (ObjectDisposedException) { return; /* scan already finished */ }
+
+        try { await finished.Task.WaitAsync(timeout); }
+        catch (TimeoutException) { /* shutdown can't block forever; remainder re-scans next launch */ }
+        catch { /* scan already completing */ }
+    }
+
+    /// <summary>
+    /// Persists the given track set + indexes to disk, ignoring cancellation. Used to
+    /// checkpoint scan progress on shutdown so a re-scan resumes incrementally
+    /// instead of starting over. The SQLite tracks mirror is deliberately not
+    /// rewritten here — see the scan-completion note above SaveAsync.
+    /// </summary>
+    private async Task PersistScanCheckpointAsync(List<Track> tracks)
+    {
+        _tracks = tracks
+            .OrderBy(t => t.Artist).ThenBy(t => t.Album)
+            .ThenBy(t => t.DiscNumber).ThenBy(t => t.TrackNumber).ToList();
+        await RebuildIndexesAsync();
+        await SaveAsync();
+        LibraryUpdated?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>
+    /// Extracts album art for albums that don't yet have a cached cover, publishing
+    /// in the background while it runs so covers fill into the views live during a
+    /// scan rather than appearing all at once at the end. Deterministic: album
+    /// groups are complete here (post-scan) and the cover is taken from each album's
+    /// lowest disc/track representative. Static art and user-attached animated
+    /// covers both surface through the LibraryUpdated notifications below.
+    /// Albums that already have a cached cover cost one existence probe and no file
+    /// reads. Returns the number of albums whose cover was extracted and cached.
+    /// </summary>
+    private async Task<int> ExtractArtworkProgressivelyAsync(IReadOnlyCollection<Track> scanned, CancellationToken ct)
+    {
+        var artGroups = scanned
+            .Where(t => t.SourceType == SourceType.Local)
+            .GroupBy(t => t.AlbumId)
+            // SaveArtwork refuses the shared "Unknown Album" bucket, so probing its
+            // representative would re-read the same file on every pass for nothing.
+            .Where(g => g.Key != Track.UnknownAlbumBucketId)
+            .Where(g => !File.Exists(_persistence.GetArtworkPath(g.Key)))
+            .ToList();
+        if (artGroups.Count == 0) return 0;
+
+        // Publish loop: while art is extracted, periodically rebuild the indexes
+        // (so newly saved covers attach to their albums) and notify the views.
+        // Throttled by time so cover-heavy libraries don't flood the UI.
+        using var pubCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        async Task PublishLoopAsync()
+        {
+            try
+            {
+                while (!pubCts.Token.IsCancellationRequested)
+                {
+                    await Task.Delay(ProgressivePublishMs, pubCts.Token).ConfigureAwait(false);
+                    await RebuildIndexesAsync(persistCache: false).ConfigureAwait(false);
+                    LibraryUpdated?.Invoke(this, EventArgs.Empty);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch { /* best-effort; the final rebuild is authoritative */ }
+        }
+        var publish = PublishLoopAsync();
+
+        var extracted = 0;
+        // Albums whose representative file carries no picture and whose folder has no
+        // cover image: they show the grid's note placeholder, and this line in the
+        // session log is how a "some covers don't load" report can be told apart from a
+        // decode problem without the reporter's files.
+        var noArt = new ConcurrentBag<string>();
+        // Developer Mode: names each file right before TagLib re-opens it (#97).
+        var artOpen = new CappedBreadcrumb("Scan", "art: open");
+        try
+        {
+            await Task.Run(() =>
+            {
+                Parallel.ForEach(artGroups,
+                    new ParallelOptions { MaxDegreeOfParallelism = GetScanParallelism(), CancellationToken = ct },
+                    g =>
+                    {
+                        if (ct.IsCancellationRequested) return;
+                        var rep = Album.SelectArtworkRepresentative(g.ToList());
+                        if (rep == null) return;
+                        artOpen.Note(rep.FilePath);
+                        var artBytes = _metadata.ExtractAlbumArt(rep.FilePath);
+                        if (artBytes is { Length: > 0 })
+                        {
+                            _persistence.SaveArtwork(g.Key, artBytes);
+                            Interlocked.Increment(ref extracted);
+                        }
+                        else
+                        {
+                            noArt.Add($"{rep.Album} — {(string.IsNullOrWhiteSpace(rep.AlbumArtist) ? rep.Artist : rep.AlbumArtist)}");
+                        }
+                    });
+            }, ct);
+        }
+        finally
+        {
+            pubCts.Cancel();
+            try { await publish.ConfigureAwait(false); } catch { /* publisher already stopping */ }
+        }
+        if (!noArt.IsEmpty)
+        {
+            var names = noArt.OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList();
+            DebugLog.Write("Library", $"artwork: {names.Count} album(s) have no embedded picture and no folder cover image: "
+                + string.Join("; ", names.Take(20)) + (names.Count > 20 ? $"; +{names.Count - 20} more" : ""));
+        }
+        return extracted;
+    }
+
+    /// <summary>
+    /// Replaces the cached cover for <paramref name="albumId"/> when <paramref name="freshBytes"/>
+    /// differ from what is on disk, and drops the in-memory bitmap so every
+    /// <c>CachedImage</c> showing that path reloads. Returns true when the cover changed.
+    /// The cache path is stable (keyed by AlbumId), which is why an overwrite plus an
+    /// invalidate — not a new path — is what makes the UI pick the new picture up.
+    /// </summary>
+    private bool RefreshAlbumArtworkIfChanged(Guid albumId, byte[]? freshBytes)
+    {
+        if (albumId == Track.UnknownAlbumBucketId) return false;
+        if (freshBytes is not { Length: > 0 }) return false;
+
+        var artPath = _persistence.GetArtworkPath(albumId);
+        try
+        {
+            if (File.Exists(artPath))
+            {
+                var cached = File.ReadAllBytes(artPath);
+                if (cached.AsSpan().SequenceEqual(freshBytes)) return false;
+            }
+        }
+        catch
+        {
+            // Unreadable cache file — rewrite it below.
+        }
+
+        _persistence.SaveArtwork(albumId, freshBytes);
+        ArtworkFileReplaced?.Invoke(artPath);
+        return true;
+    }
+
+    /// <summary>
+    /// Re-extracts covers for albums whose folder image (cover.jpg etc.) is newer than the
+    /// cached cover. Unchanged audio files are skipped by mtime during a scan, so this is
+    /// the only path that notices a swapped folder cover. One directory probe per album;
+    /// albums without a cached cover are left to <see cref="BackfillMissingArtworkAsync"/>.
+    /// Returns the number of covers replaced.
+    /// </summary>
+    private async Task<int> RefreshStaleFolderArtworkAsync(IReadOnlyCollection<Track> tracks, CancellationToken ct)
+    {
+        var groups = tracks
+            .Where(t => t.SourceType == SourceType.Local)
+            .GroupBy(t => t.AlbumId)
+            .Where(g => g.Key != Track.UnknownAlbumBucketId)
+            .ToList();
+        if (groups.Count == 0) return 0;
+
+        var refreshed = 0;
+        // Developer Mode: names each file right before TagLib re-opens it (#97).
+        var artOpen = new CappedBreadcrumb("Scan", "folder art: open");
+        try
+        {
+            await Task.Run(() =>
+            {
+                Parallel.ForEach(groups,
+                    new ParallelOptions { MaxDegreeOfParallelism = GetScanParallelism(), CancellationToken = ct },
+                    g =>
+                    {
+                        if (ct.IsCancellationRequested) return;
+                        var artPath = _persistence.GetArtworkPath(g.Key);
+                        DateTime cachedStamp;
+                        try
+                        {
+                            if (!File.Exists(artPath)) return;
+                            cachedStamp = File.GetLastWriteTimeUtc(artPath);
+                        }
+                        catch { return; }
+
+                        var rep = Album.SelectArtworkRepresentative(g.ToList());
+                        if (rep == null) return;
+                        var folderArt = MetadataService.TryGetFolderArtFile(Path.GetDirectoryName(rep.FilePath));
+                        if (folderArt == null || folderArt.LastWriteTimeUtc <= cachedStamp) return;
+
+                        // ExtractAlbumArt keeps the embedded-first precedence and the
+                        // loose-file attribution rules; a newer cover.jpg only wins when
+                        // that is what extraction would have picked in the first place.
+                        artOpen.Note(rep.FilePath);
+                        var fresh = _metadata.ExtractAlbumArt(rep.FilePath);
+                        if (RefreshAlbumArtworkIfChanged(g.Key, fresh))
+                        {
+                            Interlocked.Increment(ref refreshed);
+                        }
+                        else
+                        {
+                            // Same picture (or embedded art still wins): stamp the cache so
+                            // the next scan doesn't re-read this folder image again.
+                            try { File.SetLastWriteTimeUtc(artPath, DateTime.UtcNow); } catch { }
+                        }
+                    });
+            }, ct);
+        }
+        catch (OperationCanceledException) { }
+        return refreshed;
+    }
+
+    /// <summary>
+    /// Per-track covers (<see cref="TrackArtwork"/>): re-decides the given albums from their
+    /// tracks' <see cref="Track.ArtworkHash"/>es. An album whose tracks all carry the same
+    /// embedded cover (the usual case) costs nothing but a lookup; in a mixed album the
+    /// most common cover is the album's (fixing the scan's first-track-wins cache when the
+    /// odd track happened to be read first) and every other track gets its own cover file.
+    /// A track that no longer differs loses its file. Blocking file I/O: run off the UI
+    /// thread. Returns how many cover files changed.
+    /// </summary>
+    internal int ResolveTrackArtwork(IReadOnlyCollection<Track> tracks, IEnumerable<Guid> albumIds,
+        IReadOnlySet<Guid> freshlyRead, CancellationToken ct)
+    {
+        if (!MetadataService.UseEmbeddedArtwork) return 0;
+        var wanted = new HashSet<Guid>(albumIds);
+        wanted.Remove(Track.UnknownAlbumBucketId);
+        if (wanted.Count == 0) return 0;
+
+        var ownDir = Path.GetDirectoryName(_persistence.GetTrackArtworkPath(Guid.Empty));
+        var ownFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            if (ownDir != null && Directory.Exists(ownDir))
+                foreach (var f in Directory.EnumerateFiles(ownDir, "*.jpg")) ownFiles.Add(f);
+        }
+        catch { /* unreadable folder: treat as empty */ }
+
+        var changed = 0;
+        // Developer Mode: names each file right before TagLib re-opens it (#97).
+        var artOpen = new CappedBreadcrumb("Scan", "track art: open");
+        foreach (var album in tracks.Where(t => wanted.Contains(t.AlbumId)).GroupBy(t => t.AlbumId))
+        {
+            if (ct.IsCancellationRequested) break;
+            var albumTracks = album.ToList();
+            var mixed = albumTracks.Select(t => t.ArtworkHash).Where(h => h != null).Distinct().Skip(1).Any();
+
+            HashSet<Guid> odd = new();
+            if (mixed)
+            {
+                var albumPath = _persistence.GetArtworkPath(album.Key);
+                string? current = null;
+                try { if (File.Exists(albumPath)) current = TrackArtwork.Fingerprint(File.ReadAllBytes(albumPath)); }
+                catch { /* unreadable cache: let the majority decide */ }
+
+                var (albumHash, oddTracks) = TrackArtwork.Resolve(albumTracks.Select(t => (t.Id, t.ArtworkHash)), current);
+                odd = oddTracks.ToHashSet();
+
+                if (albumHash != null && albumHash != current)
+                {
+                    var rep = albumTracks.FirstOrDefault(t => t.ArtworkHash == albumHash);
+                    if (rep != null) artOpen.Note(rep.FilePath);
+                    var bytes = rep == null ? null : _metadata.ExtractEmbeddedArt(rep.FilePath);
+                    if (bytes != null && TrackArtwork.Fingerprint(bytes) == albumHash)
+                    {
+                        _persistence.SaveArtwork(album.Key, bytes);
+                        changed++;
+                    }
+                }
+            }
+
+            foreach (var t in albumTracks)
+            {
+                var own = _persistence.GetTrackArtworkPath(t.Id);
+                var hasOwn = ownFiles.Contains(own);
+                if (odd.Contains(t.Id))
+                {
+                    // An unchanged odd track keeps the file it already has.
+                    if (hasOwn && !freshlyRead.Contains(t.Id)) continue;
+                    artOpen.Note(t.FilePath);
+                    var bytes = _metadata.ExtractEmbeddedArt(t.FilePath);
+                    if (bytes == null) continue;
+                    _persistence.SaveTrackArtwork(t.Id, bytes);
+                    changed++;
+                }
+                else if (hasOwn)
+                {
+                    _persistence.DeleteTrackArtwork(t.Id);
+                    changed++;
+                }
+            }
+        }
+        return changed;
+    }
+
+    /// <summary>
+    /// Points every track that has its own cover file (<see cref="ResolveTrackArtwork"/>)
+    /// at it, over the album cover the index build just assigned. One directory listing,
+    /// no per-track probes. Off with embedded artwork: every track shows its album's.
+    /// </summary>
+    private static void ApplyOwnTrackArtwork(IPersistenceService persistence, IEnumerable<Track> tracks)
+    {
+        if (!MetadataService.UseEmbeddedArtwork) return;
+        var dir = Path.GetDirectoryName(persistence.GetTrackArtworkPath(Guid.Empty));
+        var own = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            if (dir == null || !Directory.Exists(dir)) return;
+            foreach (var f in Directory.EnumerateFiles(dir, "*.jpg")) own.Add(f);
+        }
+        catch { return; }
+        if (own.Count == 0) return;
+
+        foreach (var t in tracks)
+        {
+            var path = persistence.GetTrackArtworkPath(t.Id);
+            if (own.Contains(path)) t.AlbumArtworkPath = path;
+        }
+    }
+
+    /// <summary>
+    /// Schema v10: fingerprints every local file's embedded cover once (libraries indexed
+    /// before per-track covers never recorded one), then gives the odd tracks of mixed
+    /// albums their own covers. Returns true when anything changed.
+    /// </summary>
+    private async Task<bool> BackfillTrackArtworkAsync(List<Track> tracks)
+    {
+        if (!MetadataService.UseEmbeddedArtwork) return false;
+        var candidates = tracks
+            .Where(t => t.SourceType == SourceType.Local && !string.IsNullOrWhiteSpace(t.FilePath)
+                        && t.AlbumId != Track.UnknownAlbumBucketId && File.Exists(t.FilePath))
+            .ToList();
+        if (candidates.Count == 0) return false;
+
+        var hashed = 0;
+        var files = 0;
+        await Task.Run(() =>
+        {
+            try
+            {
+                Parallel.ForEach(
+                    candidates,
+                    new ParallelOptions
+                    {
+                        MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2),
+                        CancellationToken = _shutdownCts.Token
+                    },
+                    track =>
+                    {
+                        var hash = TrackArtwork.Fingerprint(_metadata.ExtractEmbeddedArt(track.FilePath));
+                        if (hash != track.ArtworkHash)
+                        {
+                            track.ArtworkHash = hash;
+                            Interlocked.Increment(ref hashed);
+                        }
+                    });
+            }
+            catch (OperationCanceledException) { /* shutdown: the schema stamp is skipped */ }
+
+            if (!_shutdownCts.IsCancellationRequested)
+                files = ResolveTrackArtwork(tracks, candidates.Select(t => t.AlbumId).Distinct().ToList(),
+                    new HashSet<Guid>(), _shutdownCts.Token);
+        });
+
+        return hashed > 0 || files > 0;
+    }
+
+    // Single-flight guard for BackfillMissingArtworkAsync: the startup heal, a
+    // no-change scan and a settings-toggle flip can all request one concurrently,
+    // and two passes at once would just read the same files twice.
+    private int _artworkBackfillActive;
+
+    /// <inheritdoc />
+    public async Task<int> BackfillMissingArtworkAsync(CancellationToken ct = default)
+    {
+        if (Interlocked.CompareExchange(ref _artworkBackfillActive, 1, 0) != 0)
+            return 0;
+        try
+        {
+            var tracks = _tracks;
+            if (tracks.Count == 0) return 0;
+
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(_shutdownCts.Token, ct);
+            var extracted = await ExtractArtworkProgressivelyAsync(tracks, linked.Token);
+            if (extracted > 0 && !linked.Token.IsCancellationRequested)
+            {
+                // Persist the rebuilt indexes: the launch fast path restores each
+                // album's ArtworkPath straight from the index cache without checking
+                // disk, so an unpersisted heal would look lost again on next start.
+                await RebuildIndexesAsync();
+                LibraryUpdated?.Invoke(this, EventArgs.Empty);
+            }
+            return extracted;
+        }
+        catch (OperationCanceledException)
+        {
+            return 0;
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _artworkBackfillActive, 0);
+        }
+    }
+
+    public async Task ImportFilesAsync(IEnumerable<string> filePaths, CancellationToken ct = default, IProgress<int>? progress = null)
+    {
+        // Waits for a running scan. The scan ends by publishing the list it walked, so an
+        // import that landed meanwhile (a drop, a watcher batch, a finished download) was
+        // overwritten and its track vanished until the next scan — and an import during
+        // the scan's progressive fill saved that partial list to library.json.
+        // No ConfigureAwait(false): callers on the UI thread keep getting LibraryUpdated there.
+        await _scanGate.WaitAsync(ct);
+        try
+        {
+            await ImportFilesCoreAsync(filePaths, ct, progress, discovered: false);
+        }
+        finally
+        {
+            _scanGate.Release();
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task ImportDiscoveredFilesAsync(IEnumerable<string> filePaths, CancellationToken ct = default)
+    {
+        await _scanGate.WaitAsync(ct);
+        try
+        {
+            await ImportFilesCoreAsync(filePaths, ct, progress: null, discovered: true);
+        }
+        finally
+        {
+            _scanGate.Release();
+        }
+    }
+
+    private async Task ImportFilesCoreAsync(IEnumerable<string> filePaths, CancellationToken ct, IProgress<int>? progress,
+        bool discovered)
+    {
+        var files = (filePaths ?? Array.Empty<string>())
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Select(TryNormalizePath)
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Select(p => p!)
+            .Where(File.Exists)
+            .Where(p => MetadataService.SupportedExtensions.Contains(Path.GetExtension(p)))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (files.Count == 0) return;
+
+        // Clear exclusions for files being explicitly re-imported
+        var settings = await _persistence.LoadSettingsAsync();
+        var excludedSet = new HashSet<string>(settings.ExcludedFilePaths, PathComparison.Comparer);
+        if (excludedSet.Overlaps(files))
+        {
+            excludedSet.ExceptWith(files);
+            settings.ExcludedFilePaths = excludedSet.ToList();
+            await _persistence.SaveSettingsAsync(settings);
+        }
+
+        var trackById = _tracks.ToDictionary(t => t.Id);
+        var changed = false;
+        // Inbox: only a file the folder watcher found, under a music folder that already held
+        // songs (the same rule as a scan). A drop, download or conversion is the user's own add.
+        var inboxRoots = discovered && settings.InboxEnabled
+            ? RootsHoldingTracks(BuildIncludeRoots(settings.MusicFolders, settings), _tracks)
+            : Array.Empty<string>();
+
+        // Capture the pre-import library so a cancelled import can roll back the
+        // progressive partial publishes below and honour "cancel = no change".
+        var originalTracks = _tracks;
+        var originalAlbums = _albums;
+        var originalArtists = _artists;
+        var originalTrackIndex = _trackIndex;
+        var originalAlbumIndex = _albumIndex;
+        var didPublishPartial = false;
+        var imported = new ConcurrentBag<Track>();
+        // Files the library did not know before this import (TracksAdded, GitHub #148).
+        var firstSeen = new ConcurrentBag<Track>();
+        var unchangedKnown = new ConcurrentBag<Track>();
+        // Same as the scan's: a file the tag read refused is named, not just left out.
+        var skippedNote = new CappedBreadcrumb("Library", "import skipped, unreadable:", cap: 10, isEnabled: () => true);
+
+        void RestoreOriginalLibrary()
+        {
+            if (!didPublishPartial) return;
+            _tracks = originalTracks;
+            _albums = originalAlbums;
+            _artists = originalArtists;
+            _trackIndex = originalTrackIndex;
+            _albumIndex = originalAlbumIndex;
+            lock (_albumsByArtistLock) { _albumsByArtistIndex = null; }
+            LibraryUpdated?.Invoke(this, EventArgs.Empty);
+        }
+
+        // Progressive publish: while the import runs, periodically surface the
+        // tracks imported so far so large drops fill into the views live instead
+        // of appearing all at once at the end (same pattern as ScanAsync).
+        // In-memory only — persistence happens once, in the final rebuild below.
+        async Task RunProgressivePublishAsync(CancellationToken pubCt)
+        {
+            var lastCount = 0;
+            try
+            {
+                while (!pubCt.IsCancellationRequested)
+                {
+                    await Task.Delay(ProgressivePublishMs, pubCt).ConfigureAwait(false);
+
+                    var snapshot = imported.ToArray();
+                    if (snapshot.Length == 0 || snapshot.Length == lastCount) continue;
+                    lastCount = snapshot.Length;
+
+                    var merged = new Dictionary<Guid, Track>(originalTracks.Count + snapshot.Length);
+                    foreach (var t in originalTracks) merged[t.Id] = t;
+                    foreach (var t in snapshot) merged[t.Id] = t;
+                    _tracks = merged.Values
+                        .OrderBy(t => t.Artist).ThenBy(t => t.Album)
+                        .ThenBy(t => t.DiscNumber).ThenBy(t => t.TrackNumber).ToList();
+                    await RebuildIndexesAsync(persistCache: false).ConfigureAwait(false);
+                    didPublishPartial = true;
+                    LibraryUpdated?.Invoke(this, EventArgs.Empty);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch { /* best-effort; the final rebuild is authoritative */ }
+        }
+
+        using var publishCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        _publishingPartial = true;
+        var publishTask = RunProgressivePublishAsync(publishCts.Token);
+
+        try
+        {
+        // Metadata/artwork reads are heavy file I/O; keep them off the caller's
+        // (UI) thread so large drops don't freeze the window.
+        await Task.Run(() =>
+        {
+        var processed = 0;
+        foreach (var filePath in files)
+        {
+            ct.ThrowIfCancellationRequested();
+            progress?.Report(++processed);
+
+            var trackId = ComputeFileId(filePath);
+            trackById.TryGetValue(trackId, out var existing);
+
+            FileInfo fi;
+            try
+            {
+                fi = new FileInfo(filePath);
+            }
+            catch
+            {
+                continue;
+            }
+
+            if (existing != null &&
+                fi.LastWriteTimeUtc == existing.LastModified &&
+                fi.Length == existing.FileSize &&
+                !IsStaleCaseSpelling(existing.FilePath, filePath))
+            {
+                // The audio didn't change, but the watcher also routes a replaced
+                // cover.jpg here via a sibling audio file — check that album's folder art.
+                unchangedKnown.Add(existing);
+                if (!discovered && existing.IsInInbox)
+                {
+                    // The user's own add of a file the folder watcher reached first (a
+                    // conversion or download saved into a music folder): into the library.
+                    existing.IsInInbox = false;
+                    existing.DateAdded = DateTime.UtcNow;
+                    changed = true;
+                }
+                continue;
+            }
+
+            var track = _metadata.ReadTrackMetadata(filePath, out var embeddedArt);
+            if (track == null)
+            {
+                skippedNote.Note(filePath);
+                continue;
+            }
+
+            track.Id = trackId;
+            if (existing != null)
+            {
+                CopyMutableTrackState(existing, track);
+                if (!discovered && track.IsInInbox)
+                {
+                    track.IsInInbox = false;
+                    track.DateAdded = DateTime.UtcNow;
+                }
+            }
+            else
+            {
+                track.SourceType = SourceType.Local;
+                track.IsInInbox = IsUnderAnyRoot(filePath, inboxRoots);
+                firstSeen.Add(track);
+            }
+            track.ArtworkHash = TrackArtwork.Fingerprint(embeddedArt);
+
+            var artPath = _persistence.GetArtworkPath(track.AlbumId);
+            if (!File.Exists(artPath))
+            {
+                var artBytes = _metadata.ExtractAlbumArt(filePath);
+                if (artBytes != null)
+                    _persistence.SaveArtwork(track.AlbumId, artBytes);
+            }
+            else if (existing != null)
+            {
+                // Known file changed on disk (watcher / drop-import): re-read its art
+                // and replace the cached cover when it differs.
+                RefreshAlbumArtworkIfChanged(track.AlbumId, _metadata.ExtractAlbumArt(filePath));
+            }
+
+            track.IsRecentImport = true;
+            trackById[track.Id] = track;
+            imported.Add(track);
+            changed = true;
+        }
+        }, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancellation is handled gracefully by the rollback below.
+        }
+        finally
+        {
+            publishCts.Cancel();
+            try { await publishTask.ConfigureAwait(false); } catch { /* publisher already stopping */ }
+            _publishingPartial = false;
+        }
+
+        if (ct.IsCancellationRequested)
+        {
+            RestoreOriginalLibrary();
+            ct.ThrowIfCancellationRequested();
+        }
+
+        // GitHub #108: a file no folder walk reaches is in the library only because it was
+        // added on its own. Mark its track, or the next full scan drops it (and it leaves
+        // every playlist) — drops with "Import dropped files" off, downloads and
+        // conversions saved outside the music folders all land here.
+        var newlyMarked = MarkAddedIndividually(imported.Concat(unchangedKnown), settings);
+
+        // Folder-cover refresh for albums whose audio was untouched (a replaced
+        // cover.jpg reaches here through a sibling audio file the watcher records).
+        if (!unchangedKnown.IsEmpty)
+        {
+            var refreshedCovers = await RefreshStaleFolderArtworkAsync(unchangedKnown.ToArray(), ct);
+            if (refreshedCovers > 0 && !changed)
+            {
+                await RebuildIndexesAsync();
+                LibraryUpdated?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
+        if (!changed)
+        {
+            // Nothing re-read, but a known track may have just been marked (#108).
+            if (newlyMarked > 0) await SaveAsync();
+            return;
+        }
+
+        _tracks = trackById.Values
+            .OrderBy(t => t.Artist).ThenBy(t => t.Album)
+            .ThenBy(t => t.DiscNumber).ThenBy(t => t.TrackNumber)
+            .ToList();
+
+        // Per-track covers for the albums the imported / re-tagged files belong to.
+        var importedIds = new HashSet<Guid>(imported.Select(t => t.Id));
+        var allTracks = _tracks;
+        await Task.Run(() => ResolveTrackArtwork(allTracks, imported.Select(t => t.AlbumId).ToList(), importedIds, ct));
+
+        await RebuildIndexesAsync();
+        await SaveAsync();
+        // Only the imported rows, not the whole library. This ran on every watcher batch,
+        // so a single file appearing in a watched folder rewrote all ~100k rows.
+        await _sqliteIndex.UpsertTracksAsync(imported, ct);
+        LibraryUpdated?.Invoke(this, EventArgs.Empty);
+        RaiseTracksAdded(firstSeen);
+    }
+
+    /// <summary>Raises <see cref="TracksAdded"/> for the new files that made it into the
+    /// published library. A subscriber's fault must not fail the scan or import.</summary>
+    private void RaiseTracksAdded(IEnumerable<Track> firstSeen)
+    {
+        var handler = TracksAdded;
+        if (handler == null) return;
+        var index = AllTrackIndex();
+        var added = firstSeen.Where(t => index.TryGetValue(t.Id, out var live) && ReferenceEquals(live, t))
+            .DistinctBy(t => t.Id).ToList();
+        if (added.Count == 0) return;
+        try { handler(this, added); }
+        catch (Exception ex) { DebugLog.Write("Library", $"TracksAdded handler failed: {ex.Message}"); }
+    }
+
+    /// <summary>
+    /// <paramref name="all"/> minus the tracks under a hidden folder and those in the Inbox;
+    /// the same list when neither applies. Cached per (list, hidden set) — see <see cref="_visible"/>.
+    /// </summary>
+    private List<Track> VisibleTracks(List<Track> all) => Snapshot(all).Visible;
+
+    /// <summary>The visible / Inbox split of <paramref name="all"/>, cached per (list, hidden set).
+    /// A hidden folder wins over the Inbox: its songs are in neither.</summary>
+    private VisibleSnapshot Snapshot(List<Track> all)
+    {
+        var hidden = _hiddenFolders;
+        var cached = _visible;
+        if (cached != null && ReferenceEquals(cached.Source, all) && ReferenceEquals(cached.Hidden, hidden))
+            return cached;
+
+        VisibleSnapshot snapshot;
+        if (hidden.Length == 0 && !all.Any(t => t.IsInInbox))
+        {
+            snapshot = new VisibleSnapshot(all, hidden, all, new List<Track>(), null);
+        }
+        else
+        {
+            var visible = new List<Track>(all.Count);
+            var inbox = new List<Track>();
+            foreach (var t in all)
+            {
+                if (hidden.Length > 0 && FolderPathMatch.IsInOrSameAsAny(t.FilePath, hidden)) continue;
+                if (t.IsInInbox) inbox.Add(t);
+                else visible.Add(t);
+            }
+            Dictionary<Guid, Track>? inboxIndex = null;
+            if (inbox.Count > 0)
+            {
+                inboxIndex = new Dictionary<Guid, Track>(inbox.Count);
+                foreach (var t in inbox) inboxIndex.TryAdd(t.Id, t);
+            }
+            snapshot = new VisibleSnapshot(all, hidden, visible, inbox, inboxIndex);
+        }
+        _visible = snapshot;
+        return snapshot;
+    }
+
+    public async Task SetFolderHiddenAsync(string folderPath, bool hidden)
+    {
+        if (string.IsNullOrWhiteSpace(folderPath)) return;
+
+        var current = _hiddenFolders;
+        var isHidden = current.Any(f => FolderPathMatch.IsSame(f, folderPath));
+        if (isHidden == hidden) return;
+
+        var updated = hidden
+            ? current.Append(folderPath).ToArray()
+            : current.Where(f => !FolderPathMatch.IsSame(f, folderPath)).ToArray();
+        _hiddenFolders = updated;
+        DebugLog.Write("Library", $"folder {(hidden ? "hidden" : "shown")}: {folderPath} ({updated.Length} hidden)");
+
+        // Load-modify-save like ExcludeFilePathsAndCleanFoldersAsync: SettingsViewModel
+        // re-bases on the file before each save and never writes this key, so it survives.
+        try
+        {
+            await _persistence.UpdateSettingsAsync(s => s.HiddenLibraryFolders = updated.ToList());
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Write("Library", $"Saving hidden folders failed: {ex.Message}");
+        }
+
+        await RebuildIndexesAsync();
+        LibraryUpdated?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <inheritdoc />
+    public async Task AcceptInboxTracksAsync(IEnumerable<Guid> ids)
+    {
+        var idSet = new HashSet<Guid>(ids ?? Array.Empty<Guid>());
+        if (idSet.Count == 0) return;
+        var current = _tracks;
+        // _tracks, not InboxTracks: an Inbox song under a hidden folder is released too.
+        var accepted = current.Where(t => t.IsInInbox && idSet.Contains(t.Id)).ToList();
+        if (accepted.Count == 0) return;
+
+        var now = DateTime.UtcNow;
+        foreach (var t in accepted)
+        {
+            t.IsInInbox = false;
+            // It joins the library now, so Recently Added shows it with today's arrivals.
+            t.DateAdded = now;
+        }
+        // Copy-and-swap: the visible / Inbox split is cached per list instance.
+        _tracks = current.ToList();
+        DebugLog.Write("Library", $"inbox: {accepted.Count} track(s) added to the library");
+
+        await RebuildIndexesAsync();
+        await SaveAsync();
+        LibraryUpdated?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>
+    /// Every known track by id, hidden folders and the Inbox included — what a scan or a file
+    /// move must match against. <see cref="_trackIndex"/> covers the visible tracks only, so it
+    /// IS the full index whenever nothing is hidden or in the Inbox (an Inbox song missing here
+    /// came back from the next scan as a brand-new track, its plays and rating gone).
+    /// </summary>
+    private Dictionary<Guid, Track> AllTrackIndex()
+    {
+        if (ReferenceEquals(VisibleTracks(_tracks), _tracks)) return _trackIndex;
+        var all = new Dictionary<Guid, Track>(_tracks.Count);
+        foreach (var t in _tracks) all.TryAdd(t.Id, t);
+        return all;
+    }
+
+    public Track? GetTrackById(Guid id)
+    {
+        if (_trackIndex.TryGetValue(id, out var track)) return track;
+        // Inbox songs play, queue and restore like any other: the player drops a queued
+        // track this misses as "deleted".
+        var inboxIndex = Snapshot(_tracks).InboxIndex;
+        return inboxIndex != null && inboxIndex.TryGetValue(id, out track) ? track : null;
+    }
+
+    public Album? GetAlbumById(Guid id)
+    {
+        _albumIndex.TryGetValue(id, out var album);
+        return album;
+    }
+
+    public IReadOnlyList<Album> GetAlbumsByArtist(string artistName)
+    {
+        if (string.IsNullOrWhiteSpace(artistName))
+            return Array.Empty<Album>();
+
+        var index = _albumsByArtistIndex;
+        if (index == null)
+        {
+            lock (_albumsByArtistLock)
+            {
+                index = _albumsByArtistIndex;
+                if (index == null)
+                {
+                    var built = new Dictionary<string, List<Album>>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var a in _albums)
+                    {
+                        if (!built.TryGetValue(a.Artist, out var list))
+                        {
+                            list = new List<Album>();
+                            built[a.Artist] = list;
+                        }
+                        list.Add(a);
+                    }
+                    _albumsByArtistIndex = built;
+                    index = built;
+                }
+            }
+        }
+
+        // Return a copy: the cached list is shared per-artist state and must not be
+        // mutated (or aliased into mutation) by callers.
+        return index.TryGetValue(artistName, out var albums) ? albums.ToArray() : Array.Empty<Album>();
+    }
+
+    public async Task RemoveTrackAsync(Guid id)
+    {
+        var track = GetTrackById(id);
+        if (track == null) return;
+
+        // Copy-and-swap, never mutate in place: Tracks is enumerated concurrently on
+        // background threads (Home refresh, duplicate finder, watcher batches), so an
+        // in-place Remove can throw "Collection was modified" under their feet.
+        var updated = new List<Track>(_tracks);
+        updated.Remove(track);
+        _tracks = updated;
+        DeleteOrphanedArtwork(new[] { track });
+        await ExcludeFilePathsAndCleanFoldersAsync(new[] { track.FilePath });
+        await RebuildIndexesAsync();
+        await SaveAsync();
+        await _sqliteIndex.DeleteTracksAsync(new[] { id });
+        LibraryUpdated?.Invoke(this, EventArgs.Empty);
+    }
+
+    public async Task RemoveTracksAsync(IEnumerable<Guid> ids)
+    {
+        var idSet = new HashSet<Guid>(ids);
+        // Copy-and-swap (see RemoveTrackAsync) — concurrent readers keep the old list.
+        var current = _tracks;
+        var removedTracks = current.Where(t => idSet.Contains(t.Id)).ToList();
+        if (removedTracks.Count == 0) return;
+        _tracks = current.Where(t => !idSet.Contains(t.Id)).ToList();
+
+        DeleteOrphanedArtwork(removedTracks);
+        await ExcludeFilePathsAndCleanFoldersAsync(removedTracks.Select(t => t.FilePath));
+        await RebuildIndexesAsync();
+        await SaveAsync();
+        await _sqliteIndex.DeleteTracksAsync(idSet);
+        LibraryUpdated?.Invoke(this, EventArgs.Empty);
+    }
+
+    private static bool IsServerTrack(Track t) => t.SourceType == SourceType.UndertoneServer;
+
+    /// <inheritdoc />
+    public async Task ReplaceRemoteTracksAsync(IReadOnlyCollection<Track> tracks, CancellationToken ct = default)
+    {
+        // Serialized with scans: a scan carries the remote set it saw at its start through to
+        // its final publish, so a replacement landing mid-scan would be undone by it.
+        await _scanGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var current = _tracks;
+            var known = new Dictionary<Guid, Track>();
+            foreach (var t in current)
+                if (IsServerTrack(t)) known.TryAdd(t.Id, t);
+
+            var merged = new List<Track>(current.Count + tracks.Count);
+            merged.AddRange(current.Where(t => !IsServerTrack(t)));
+            var added = new List<Track>();
+            var seen = new HashSet<Guid>();
+            var kept = 0;
+            foreach (var incoming in tracks)
+            {
+                if (incoming is null || !seen.Add(incoming.Id)) continue;
+                incoming.SourceType = SourceType.UndertoneServer;
+                if (known.TryGetValue(incoming.Id, out var existing))
+                {
+                    // Same rule as a rescan: an unchanged song keeps its instance (the queue and
+                    // open pages hold it), a changed one gets the new metadata and keeps the
+                    // phone's user state. State changes reach known songs through the sync
+                    // ledger, never through this call.
+                    if (SameRemoteMetadata(existing, incoming))
+                    {
+                        merged.Add(existing);
+                        kept++;
+                    }
+                    else
+                    {
+                        CopyMutableTrackState(existing, incoming);
+                        merged.Add(incoming);
+                    }
+                }
+                else
+                {
+                    merged.Add(incoming);
+                    added.Add(incoming);
+                }
+            }
+
+            // Every sync hands in the whole catalog; when nothing changed, skip the rebuild, the
+            // library.json rewrite and the page refreshes (the scan's no-change fast path).
+            if (added.Count == 0 && kept == known.Count && kept == seen.Count) return;
+
+            _tracks = merged
+                .OrderBy(t => t.Artist).ThenBy(t => t.Album)
+                .ThenBy(t => t.DiscNumber).ThenBy(t => t.TrackNumber).ToList();
+            await RebuildIndexesAsync().ConfigureAwait(false);
+            await SaveAsync().ConfigureAwait(false);
+
+            // New songs arrive with the server's state. A journal row left from an earlier
+            // sign-in would overlay stale values on the next load, so write theirs now.
+            if (added.Count > 0 && _userStateJournalHealthy)
+            {
+                try { await _sqliteIndex.UpsertUserStateAsync(added, CancellationToken.None).ConfigureAwait(false); }
+                catch (Exception ex)
+                {
+                    _userStateJournalHealthy = false;
+                    DebugLog.Write("Library", $"User-state journal write failed for remote songs: {ex.Message}");
+                }
+            }
+            LibraryUpdated?.Invoke(this, EventArgs.Empty);
+        }
+        finally
+        {
+            _scanGate.Release();
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task RemoveRemoteTracksAsync()
+    {
+        await _scanGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var current = _tracks;
+            var removed = current.Where(IsServerTrack).ToList();
+            if (removed.Count == 0) return;
+            _tracks = current.Where(t => !IsServerTrack(t)).ToList();
+            // Covers fetched for the desktop's albums go with them (a phone album sharing the
+            // AlbumId keeps its cover). No exclusion list: these were never files.
+            DeleteOrphanedArtwork(removed);
+            await RebuildIndexesAsync().ConfigureAwait(false);
+            await SaveAsync().ConfigureAwait(false);
+            LibraryUpdated?.Invoke(this, EventArgs.Empty);
+        }
+        finally
+        {
+            _scanGate.Release();
+        }
+    }
+
+    /// <summary>The catalog fields a desktop song can change between syncs.</summary>
+    private static bool SameRemoteMetadata(Track a, Track b) =>
+        a.Title == b.Title && a.Artist == b.Artist && a.AlbumArtist == b.AlbumArtist && a.Album == b.Album
+        && a.AlbumId == b.AlbumId && a.Duration == b.Duration && a.TrackNumber == b.TrackNumber
+        && a.DiscNumber == b.DiscNumber && a.Year == b.Year && a.Genre == b.Genre && a.Bitrate == b.Bitrate
+        && a.SampleRate == b.SampleRate && a.FileSize == b.FileSize && a.Codec == b.Codec
+        && a.FilePath == b.FilePath;
+
+    /// <summary>
+    /// Deletes cached covers for albums that no longer have any tracks after a
+    /// removal. Cached art is never overwritten (every writer short-circuits on
+    /// File.Exists) and was never invalidated either — so a wrong cover, once
+    /// stamped, survived remove + re-import forever. With the orphan gone, the next
+    /// import of that album re-extracts art from its actual files.
+    /// </summary>
+    private void DeleteOrphanedArtwork(IReadOnlyList<Track> removedTracks)
+    {
+        foreach (var albumId in SelectOrphanedAlbumIds(removedTracks, _tracks))
+        {
+            try
+            {
+                var artPath = _persistence.GetArtworkPath(albumId);
+                if (File.Exists(artPath)) File.Delete(artPath);
+            }
+            catch { /* cache only — worst case the stale cover lingers as before */ }
+        }
+    }
+
+    /// <summary>Album ids present in <paramref name="removedTracks"/> that no
+    /// remaining track references.</summary>
+    /// <remarks>Internal for tests (InternalsVisibleTo Undertone.Tests).</remarks>
+    internal static IEnumerable<Guid> SelectOrphanedAlbumIds(
+        IReadOnlyList<Track> removedTracks, IReadOnlyList<Track> remainingTracks)
+    {
+        var live = new HashSet<Guid>(remainingTracks.Select(t => t.AlbumId));
+        return removedTracks.Select(t => t.AlbumId).Distinct().Where(id => !live.Contains(id));
+    }
+
+    public async Task<IReadOnlyDictionary<Guid, Guid>> RelocateTracksAsync(
+        IReadOnlyList<(string oldPath, string newPath)> moves, CancellationToken ct = default)
+    {
+        var remap = new Dictionary<Guid, Guid>();
+        if (moves == null || moves.Count == 0) return remap;
+
+        var changed = false;
+        var relocated = new List<Track>();
+        var known = AllTrackIndex(); // a move inside a hidden folder is still a move
+        Dictionary<string, Track>? byPath = null;
+        foreach (var (oldPath, newPath) in moves)
+        {
+            if (string.IsNullOrWhiteSpace(oldPath) || string.IsNullOrWhiteSpace(newPath)) continue;
+
+            // By the path's id first. A track whose stored id isn't its path's hash (a foreign
+            // or hand-edited library.json) missed here, and the file moved while the library
+            // kept the old path (GitHub #121, 2026-10-10): then find it by its path.
+            if (!known.TryGetValue(ComputeFileId(oldPath), out var track))
+            {
+                byPath ??= BuildPathIndex();
+                if (!byPath.TryGetValue(oldPath, out track)) continue;
+            }
+            // Remapped from the id playlists and the play log actually hold.
+            var oldId = track.Id;
+
+            track.FilePath = newPath;
+            try
+            {
+                var fi = new FileInfo(newPath);
+                if (fi.Exists)
+                {
+                    track.LastModified = fi.LastWriteTimeUtc;
+                    track.FileSize = fi.Length;
+                }
+            }
+            catch { /* keep prior size/timestamp if the new file isn't readable yet */ }
+
+            var newId = ComputeFileId(newPath);
+            // Store-backed lyrics are keyed by track id; lift them into pending
+            // values before the id changes so the save below re-files them
+            // under the new id instead of orphaning them under the old one.
+            track.PrepareLyricsForIdChange();
+            track.Id = newId;
+            if (oldId != newId) remap[oldId] = newId;
+            relocated.Add(track);
+            changed = true;
+        }
+
+        if (!changed) return remap;
+
+        // GitHub #121 (2026-10-10): a track moved out of every music folder (Send to Folder ›
+        // Move to a USB stick, Organize Files to another root) is reached by no folder walk
+        // now; unmarked, the next full scan dropped it with its plays and playlist places.
+        // Marked like a file added on its own (GitHub #108).
+        try { MarkAddedIndividually(relocated, await _persistence.LoadSettingsAsync()); }
+        catch { /* settings unreadable: the move itself still stands */ }
+
+        await RebuildIndexesAsync();
+        await SaveAsync();
+        await _sqliteIndex.ReplaceAllAsync(_tracks, ct);
+        LibraryUpdated?.Invoke(this, EventArgs.Empty);
+        return remap;
+
+        Dictionary<string, Track> BuildPathIndex()
+        {
+            var index = new Dictionary<string, Track>(PathComparison.Comparer);
+            foreach (var t in _tracks)
+                if (!string.IsNullOrEmpty(t.FilePath)) index.TryAdd(t.FilePath, t);
+            return index;
+        }
+    }
+
+    /// <summary>
+    /// Adds removed file paths to the exclusion list and removes any MusicFolders
+    /// entries that no longer contribute any tracks to the library.
+    /// </summary>
+    private async Task ExcludeFilePathsAndCleanFoldersAsync(IEnumerable<string> removedPaths)
+    {
+        var settings = await _persistence.LoadSettingsAsync();
+
+        // Add to exclusion list
+        var excluded = new HashSet<string>(settings.ExcludedFilePaths, PathComparison.Comparer);
+        foreach (var path in removedPaths)
+        {
+            if (!string.IsNullOrWhiteSpace(path))
+                excluded.Add(path);
+        }
+
+        // Prune stale exclusions. Nothing ever cleaned this list, so removing a large
+        // folder left tens of thousands of absolute paths in settings.json permanently —
+        // re-read and re-hashed on every scan and every subsequent removal. An entry is
+        // only meaningful while its file exists and still sits under a configured root;
+        // otherwise a plain rescan would never have re-imported it anyway.
+        var configuredRoots = settings.MusicFolders
+            .Select(TryNormalizePath)
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Select(p => p!)
+            .ToArray();
+
+        static bool UnderAnyRoot(string path, string[] roots)
+        {
+            var normalized = TryNormalizePath(path);
+            return normalized != null && roots.Any(r => IsUnderRoot(normalized, r));
+        }
+
+        settings.ExcludedFilePaths = excluded
+            .Where(p => UnderAnyRoot(p, configuredRoots) && File.Exists(p))
+            .ToList();
+
+        // Auto-remove folder locations that have zero remaining library tracks.
+        // Normalize each remaining track path exactly once instead of calling
+        // Path.GetFullPath per track per folder — that was 300k syscall-backed
+        // normalizations for a 100k library with three roots, on every removal
+        // (including every watcher batch that deletes a file).
+        var normalizedRemaining = _tracks
+            .Select(t => TryNormalizePath(t.FilePath))
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Select(p => p!)
+            .ToArray();
+
+        var removedFolders = settings.MusicFolders.RemoveAll(folder =>
+        {
+            if (string.IsNullOrWhiteSpace(folder)) return true;
+            var normalized = TryNormalizePath(folder);
+            if (string.IsNullOrWhiteSpace(normalized)) return true;
+
+            // Only drop a root the user configured if it is genuinely gone from disk.
+            // Removing the last tracks under a still-present folder used to silently
+            // delete it from Settings and stop the watcher for it, with no message.
+            if (Directory.Exists(normalized)) return false;
+
+            return !normalizedRemaining.Any(fp => IsUnderRoot(fp, normalized!));
+        });
+
+        await _persistence.SaveSettingsAsync(settings);
+
+        // This is the only place the library rewrites the user's folder list. Announcing
+        // it directly means Settings no longer has to re-read and re-parse settings.json
+        // (plus a DPAPI unprotect) on every LibraryUpdated — an event that also fires on
+        // every scan, drop-import, removal and metadata write.
+        if (removedFolders > 0)
+            MusicFoldersChanged?.Invoke(this, settings.MusicFolders.ToList());
+    }
+
+    /// <summary>
+    /// GitHub #108: marks <see cref="Track.AddedIndividually"/> on the imported tracks whose
+    /// file no folder walk reaches (outside every music folder and include rule, or under an
+    /// exclude rule). The mark lives with the track in library.json — it follows the track
+    /// through renames and leaves with it on removal. Returns how many were newly marked.
+    /// </summary>
+    /// <summary>The <paramref name="roots"/> at least one known local track lives under: where a
+    /// file found for the first time is a new arrival (Inbox) rather than part of an import.
+    /// Internal for tests.</summary>
+    internal static string[] RootsHoldingTracks(IEnumerable<string> roots, IReadOnlyList<Track> knownTracks)
+        => roots.Where(root => knownTracks.Any(t => !IsServerTrack(t) && PathIsUnder(t.FilePath, root))).ToArray();
+
+    private static bool IsUnderAnyRoot(string path, string[] roots)
+    {
+        foreach (var root in roots)
+            if (PathIsUnder(path, root)) return true;
+        return false;
+    }
+
+    private static int MarkAddedIndividually(IEnumerable<Track> importedTracks, AppSettings settings)
+    {
+        var roots = BuildIncludeRoots(settings.MusicFolders, settings).ToList();
+        var excludedRoots = settings.FolderRules
+            .Where(r => r.Enabled && !r.Include && !string.IsNullOrWhiteSpace(r.Path))
+            .Select(r => r.Path)
+            .ToList();
+        var marked = 0;
+        foreach (var track in importedTracks)
+        {
+            if (track.AddedIndividually) continue;
+            var path = track.FilePath;
+            if (roots.Any(r => PathIsUnder(path, r)) && !excludedRoots.Any(x => PathIsUnder(path, x)))
+                continue;
+            track.AddedIndividually = true;
+            marked++;
+        }
+        return marked;
+    }
+
+    /// <summary>
+    /// Raised with the artwork file path after a cached cover is rewritten on disk.
+    /// The desktop app drops its decoded bitmaps for that path (ArtworkCache); a
+    /// headless host has nothing to drop. Static so the core stays free of the UI's
+    /// bitmap cache and the app can subscribe once at startup.
+    /// </summary>
+    public static event Action<string>? ArtworkFileReplaced;
+
+    /// <summary>The slow part of <see cref="LoadAsync"/> (SQLite, schema migration, cover
+    /// heal) that runs after it returns. It re-applies static metadata toggles from the
+    /// persisted settings, so tests await it before restoring them. Internal for tests.</summary>
+    internal Task BackgroundInit { get; private set; } = Task.CompletedTask;
+
+    /// <summary>The v11 label pass, the v12 genre pass and the ReplayGain pass (<see cref="RunTagBackfillsAsync"/>), started at the end of
+    /// <see cref="BackgroundInit"/> when it is pending. Internal for tests.</summary>
+    internal Task LabelBackfill { get; private set; } = Task.CompletedTask;
+
+    public async Task LoadAsync()
+    {
+        // Startup calls this from the UI thread. The persistence layer awaits without
+        // ConfigureAwait(false), so a plain await here resumed the streaming JSON
+        // deserialize on the dispatcher after every 64 KB read: a 10 MB library.json
+        // parsed ~7,000 tracks on the UI thread before the first page could paint.
+        // Task.Run drops the synchronization context for the whole load, so the file
+        // read, parse, journal overlay and index-cache parse all run on the pool and
+        // only the LibraryUpdated fan-out below returns to the UI thread.
+        var tracks = await Task.Run(() => _persistence.LoadLibraryAsync());
+
+        // Before any index is built or restored: they cover the visible tracks only.
+        await Task.Run(LoadHiddenFoldersAsync);
+
+        if (tracks != null && tracks.Count > 0)
+        {
+            // The Inbox is off but songs still carry its mark (switched off while the app
+            // was closed, an older settings.json): nothing stays hidden. The next save
+            // writes them out unmarked.
+            if (!_inboxEnabledAtLoad)
+                foreach (var t in tracks)
+                    t.IsInInbox = false;
+            _tracks = tracks;
+
+            // Overlay journaled user state (ratings, favorites, play counts, ...)
+            // on top of the JSON values before anything publishes or saves them.
+            await Task.Run(OverlayUserStateFromJournalAsync);
+
+            // Fast path: try restoring pre-computed indexes from cache
+            var restored = await Task.Run(TryRestoreFromCacheAsync);
+            if (!restored)
+            {
+                // Cache miss — full rebuild (LINQ grouping, File.Exists, sorting)
+                await RebuildIndexesAsync();
+            }
+
+            LibraryUpdated?.Invoke(this, EventArgs.Empty);
+
+            // Run slow tasks (SQLite, schema migration) in background to not block UI
+            BackgroundInit = Task.Run(async () =>
+            {
+                try
+                {
+                    await _sqliteIndex.InitializeAsync();
+                    var didBackfillMetadata = await EnsureMetadataSchemaUpToDateAsync();
+                    await _sqliteIndex.MigrateFromJsonIfEmptyAsync(_tracks);
+                    if (didBackfillMetadata)
+                    {
+                        await RebuildIndexesAsync();
+                        await _sqliteIndex.UpsertTracksAsync(_tracks);
+                        LibraryUpdated?.Invoke(this, EventArgs.Empty);
+                    }
+
+                    // GitHub #117: credits stored with a join the separators no longer
+                    // split (", " with "," removed) are re-read once. A no-op while the
+                    // recorded join matches the active one.
+                    await ApplyArtistCreditJoinAsync();
+
+                    // Heal albums whose cover was never cached. Scans only extract
+                    // art for new/changed files plus a one-shot post-scan pass, so
+                    // any interruption or unreadable file left an album artless for
+                    // good — rescans skip unchanged files by mtime and never retry.
+                    // Cheap when every album already has art (one probe per album).
+                    using (var heal = CancellationTokenSource.CreateLinkedTokenSource(_shutdownCts.Token, _backfillStop.Token))
+                        await BackfillMissingArtworkAsync(heal.Token);
+
+                    // Last and on its own task: the v11 label and v12 genre passes can take many minutes on a
+                    // hard disk and nothing above should wait for it.
+                    if (_labelBackfillPending || _genreBackfillPending || _tracks.Any(NeedsReplayGainRead))
+                        LabelBackfill = Task.Run(RunTagBackfillsAsync);
+                }
+                catch (Exception ex)
+                {
+                    DebugLog.Write("Library", $"Background init failed: {ex.Message}");
+                    System.Diagnostics.Debug.WriteLine($"[LibraryService] Background init failed: {ex.Message}");
+                }
+                finally
+                {
+                    // The backfill reads whole embedded covers (tens of MB each) that die
+                    // as soon as it moves on; hand that garbage back once it is over.
+                    MemoryTrim.RequestAfterIdle("library background init");
+                }
+            });
+        }
+        else
+        {
+            // Unguarded, this was the one await on the startup critical path that could
+            // throw straight out of MainWindow's async-void Loaded handler: a corrupt or
+            // locked library.db (a WAL left by a killed process, a read-only profile)
+            // raised SqliteException and killed the process behind an already-visible
+            // empty window. The index is a rebuildable cache — never fatal.
+            try
+            {
+                await _sqliteIndex.InitializeAsync();
+            }
+            catch (Exception ex)
+            {
+                DebugLog.Write("Library", $"SQLite index init failed: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"[LibraryService] SQLite index init failed: {ex.Message}");
+            }
+        }
+    }
+
+    private async Task LoadHiddenFoldersAsync()
+    {
+        try
+        {
+            var settings = await _persistence.LoadSettingsAsync();
+            _hiddenFolders = settings.HiddenLibraryFolders
+                .Where(f => !string.IsNullOrWhiteSpace(f))
+                .ToArray();
+            _inboxEnabledAtLoad = settings.InboxEnabled;
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Write("Library", $"Loading hidden folders failed: {ex.Message}");
+        }
+    }
+
+    public async Task SaveAsync()
+    {
+        try
+        {
+            await _persistence.SaveLibraryAsync(_tracks);
+        }
+        catch (Exception ex)
+        {
+            // Log the error but don't crash the app for a failed library save.
+            // Library data remains in memory and will be retried on next save/shutdown.
+            DebugLog.Write("Library", $"Failed to save library: {ex.Message}");
+            System.Diagnostics.Debug.WriteLine($"[LibraryService] Failed to save library: {ex.Message}");
+        }
+    }
+
+    // False once the user-state journal in library.db proved unusable this session
+    // (locked/corrupt file). Mutations then fall back to the pre-journal behavior —
+    // a full library.json save — so nothing the user changes is ever lost.
+    private bool _userStateJournalHealthy = true;
+
+    /// <inheritdoc />
+    public async Task SaveTrackUserStateAsync(IReadOnlyCollection<Track> tracks)
+    {
+        if (tracks.Count == 0) return;
+
+        // Sync ledger first (cheap, off the persistence path): the recorder decides
+        // whether sync is on and skips unchanged payloads itself.
+        if (_syncRecorder is { } recorder)
+        {
+            var snapshot = tracks.ToArray();
+            _ = Task.Run(() =>
+            {
+                try { recorder.RecordTrackStates(snapshot); }
+                catch (Exception ex) { DebugLog.Write("Sync", $"record failed: {ex.Message}"); }
+            });
+        }
+
+        if (_userStateJournalHealthy)
+        {
+            try
+            {
+                // Journal the library's own instance where one exists: queue/history
+                // can hold pre-reload Track objects whose *other* user-state fields
+                // are stale, and a full-row upsert from such an instance would
+                // silently revert them (SaveAsync has always persisted library
+                // instances only — same rule here).
+                var trackIndex = _trackIndex;
+                var resolved = tracks
+                    .Select(t => trackIndex.TryGetValue(t.Id, out var lib) ? lib : t);
+                await _sqliteIndex.UpsertUserStateAsync(resolved);
+                return;
+            }
+            catch (Exception ex)
+            {
+                _userStateJournalHealthy = false;
+                DebugLog.Write("Library",
+                    $"User-state journal write failed — falling back to full library saves: {ex.Message}");
+            }
+        }
+
+        await SaveAsync();
+    }
+
+    /// <summary>
+    /// Applies the library.db user-state journal on top of the JSON-loaded tracks
+    /// (journal wins when a row exists), seeding the journal from the JSON values
+    /// on first run. Journal rows whose Id is not currently in the library are
+    /// deliberately left in place: a removed track that returns with the same Id
+    /// gets its play counts and ratings back on the next load.
+    /// </summary>
+    private async Task OverlayUserStateFromJournalAsync()
+    {
+        try
+        {
+            await _sqliteIndex.InitializeAsync();
+            var state = await _sqliteIndex.LoadUserStateAsync();
+            if (state.Count == 0)
+            {
+                // First run after upgrade (or the user deleted library.db): the JSON
+                // values are authoritative — copy them in so later journal-only
+                // writes merge against a complete baseline.
+                await _sqliteIndex.SeedUserStateIfEmptyAsync(_tracks);
+                return;
+            }
+
+            foreach (var track in _tracks)
+            {
+                if (!state.TryGetValue(track.Id, out var s)) continue;
+                track.PlayCount = s.PlayCount;
+                track.LastPlayed = s.LastPlayed;
+                track.Rating = s.Rating;
+                track.IsDisliked = s.IsDisliked;
+                track.SnoozedUntil = s.SnoozedUntil;
+                track.SavedPositionMs = s.SavedPositionMs;
+                track.Badge = s.Badge;
+                track.IsFavorite = s.IsFavorite;
+                // After IsFavorite: its setter stamps/clears FavoritedAt, and the
+                // journaled timestamp must win over a fresh stamp.
+                track.FavoritedAt = s.FavoritedAt;
+            }
+        }
+        catch (Exception ex)
+        {
+            // Journal unusable (locked/corrupt library.db). The JSON values stay
+            // live and every user-state save falls back to a full library.json
+            // write for this session, so no rating or play count is ever lost.
+            _userStateJournalHealthy = false;
+            DebugLog.Write("Library",
+                $"User-state journal unavailable — using library.json values: {ex.Message}");
+        }
+    }
+
+    public void NotifyFavoritesChanged() => NotifyFavoritesChanged(null);
+
+    /// <summary>
+    /// Re-raises album favorite state for the albums containing <paramref name="changed"/>,
+    /// or for every album when null.
+    ///
+    /// Album favorite state (heart overlay, context-menu items) is computed from tracks,
+    /// so the owning albums must re-raise their derived properties. Doing it for *every*
+    /// album meant two PropertyChanged raises per album on a single heart click — 20,000
+    /// on a 10,000-album library, each causing realized tiles to re-evaluate
+    /// Tracks.Any(t => t.IsFavorite).
+    /// </summary>
+    public void NotifyFavoritesChanged(IReadOnlyCollection<Track>? changed)
+    {
+        if (changed is { Count: > 0 })
+        {
+            var albumIds = new HashSet<Guid>(changed.Select(t => t.AlbumId));
+            foreach (var album in _albums)
+                if (albumIds.Contains(album.Id))
+                    album.NotifyFavoriteStateChanged();
+        }
+        else
+        {
+            foreach (var album in _albums)
+                album.NotifyFavoriteStateChanged();
+        }
+
+        FavoritesChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    public async Task SetTracksRatingAsync(IReadOnlyList<Track> tracks, int rating)
+    {
+        rating = Math.Clamp(rating, 0, 5);
+        var changed = tracks.Where(t => t.Rating != rating).ToList();
+        if (changed.Count == 0) return;
+
+        foreach (var track in changed)
+            track.Rating = rating;
+        await SaveTrackUserStateAsync(changed);
+        QueueRatingTagWrites(changed);
+    }
+
+    /// <summary>GitHub #74: set (or clear with null/blank) the user badge on the tracks.</summary>
+    public async Task SetTracksBadgeAsync(IReadOnlyList<Track> tracks, string? badge)
+    {
+        badge = string.IsNullOrWhiteSpace(badge) ? null : badge.Trim();
+        var changed = tracks.Where(t => !string.Equals(t.Badge, badge, StringComparison.Ordinal)).ToList();
+        if (changed.Count == 0) return;
+
+        foreach (var track in changed)
+            track.Badge = badge;
+        await SaveTrackUserStateAsync(changed);
+    }
+
+    /// <summary>Every badge name in use, case-insensitively de-duplicated, sorted.</summary>
+    public IReadOnlyList<string> GetBadgeNames()
+        => _tracks.Select(t => t.Badge).Where(b => !string.IsNullOrWhiteSpace(b))
+                  .Select(b => b!.Trim())
+                  .Distinct(StringComparer.OrdinalIgnoreCase)
+                  .OrderBy(b => b, StringComparer.OrdinalIgnoreCase).ToList();
+
+    public async Task SetTracksDislikedAsync(IReadOnlyList<Track> tracks, bool isDisliked)
+    {
+        var changed = tracks.Where(t => t.IsDisliked != isDisliked).ToList();
+        if (changed.Count == 0) return;
+
+        foreach (var track in changed)
+            track.IsDisliked = isDisliked;
+        await SaveTrackUserStateAsync(changed);
+        QueueRatingTagWrites(changed);
+    }
+
+    public async Task SetTracksSnoozedAsync(IReadOnlyList<Track> tracks, DateTime? until)
+    {
+        var changed = tracks.Where(t => t.SnoozedUntil != until).ToList();
+        if (changed.Count == 0) return;
+
+        foreach (var track in changed)
+            track.SnoozedUntil = until;
+        // Snooze is app-only state — no file tag write (unlike rating/dislike).
+        await SaveTrackUserStateAsync(changed);
+    }
+
+    /// <summary>
+    /// Persists rating tags to the audio files on a worker thread (best effort —
+    /// the library JSON saved above is the source of truth if a file is locked/read-only).
+    /// </summary>
+    private void QueueRatingTagWrites(IReadOnlyList<Track> tracks)
+    {
+        var targets = tracks
+            .Where(t => t.SourceType == SourceType.Local)
+            .Select(t => (t.FilePath, t.Rating, t.IsDisliked))
+            .ToList();
+        if (targets.Count == 0) return;
+
+        // Deferred: a run of star clicks becomes one write per file once the user is
+        // quiet, and the playing file waits until it is no longer in use.
+        if (_tagWriter is { } writer)
+        {
+            foreach (var (path, rating, disliked) in targets)
+                writer.Enqueue(path, "rating", () => _metadata.WriteRating(path, rating, disliked));
+            return;
+        }
+
+        _ = Task.Run(() =>
+        {
+            foreach (var (path, rating, disliked) in targets)
+                _metadata.WriteRating(path, rating, disliked);
+        });
+    }
+
+    public void NotifyMetadataChanged()
+    {
+        _ = Task.Run(async () =>
+        {
+            await RebuildIndexesAsync();
+            LibraryUpdated?.Invoke(this, EventArgs.Empty);
+        });
+    }
+
+    public async Task ClearAsync()
+    {
+        // Reset Everything: stop the passes over the old library first, so none writes after this.
+        Interlocked.Exchange(ref _backfillStop, new CancellationTokenSource()).Cancel();
+        try { await LabelBackfill.ConfigureAwait(false); } catch { /* it logs its own failure */ }
+
+        // Copy-and-swap (see RemoveTrackAsync) — concurrent readers keep the old lists.
+        _tracks = new List<Track>();
+        _albums = new List<Album>();
+        _artists = new List<Artist>();
+        _trackIndex = new Dictionary<Guid, Track>();
+        _albumIndex = new Dictionary<Guid, Album>();
+        lock (_albumsByArtistLock) { _albumsByArtistIndex = null; }
+        await _persistence.SaveLibraryAsync(_tracks);
+        await _sqliteIndex.ClearAsync();
+        // The ratings / favorites / play counts journal too: it outlives scans on purpose (a
+        // returning file gets its state back), so a rescan after the reset restored all of it.
+        await _sqliteIndex.ClearUserStateAsync();
+        // A stopped backfill's resume log (replaygain-, label-, genre-backfill.progress).
+        await Task.Run(() =>
+        {
+            try
+            {
+                foreach (var file in Directory.EnumerateFiles(_persistence.DataDirectory, "*-backfill.progress"))
+                    File.Delete(file);
+            }
+            catch (Exception ex) { DebugLog.Write("Library", $"Clear: backfill progress not deleted: {ex.Message}"); }
+        });
+        LibraryUpdated?.Invoke(this, EventArgs.Empty);
+    }
+
+    public async Task RebuildIndexAsync(CancellationToken ct = default)
+    {
+        var persisted = await _persistence.LoadLibraryAsync();
+        _tracks = persisted ?? new List<Track>();
+        await RebuildIndexesAsync();
+
+        await _sqliteIndex.ReplaceAllAsync(_tracks, ct);
+
+        await _auditTrail.AppendAsync(new AuditEvent
+        {
+            EventType = "index.rebuild",
+            EntityType = "library",
+            EntityId = "local",
+            Reason = "Manual index rebuild requested",
+            Details = new Dictionary<string, string>
+            {
+                ["trackCount"] = _tracks.Count.ToString()
+            }
+        }, ct);
+
+        LibraryUpdated?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>
+    /// Rebuilds album, artist, and track-ID indexes from the current track list.
+    /// Heavy work (grouping, sorting, File.Exists) runs on a background thread.
+    /// </summary>
+    // Serializes index rebuilds. The four index fields are published as separate
+    // assignments, and rebuilds are triggered concurrently from unrelated paths — the
+    // scan's progressive publisher, the artwork publisher, and NotifyMetadataChanged's
+    // unawaited Task.Run. Two overlapping runs that observed different _tracks could
+    // interleave so _albums came from one and _albumIndex from the other, leaving
+    // GetAlbumById returning an Album that is not in Albums. SaveIndexCacheAsync had the
+    // same problem, and its output survives restarts because the cache validates.
+    private readonly SemaphoreSlim _rebuildGate = new(1, 1);
+
+    private async Task RebuildIndexesAsync(bool persistCache = true)
+    {
+        await _rebuildGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            await RebuildIndexesCoreAsync(persistCache).ConfigureAwait(false);
+        }
+        finally
+        {
+            _rebuildGate.Release();
+        }
+    }
+
+    private async Task RebuildIndexesCoreAsync(bool persistCache)
+    {
+        // Albums, artists and the id lookup are built from the visible tracks only, so a
+        // hidden folder's songs vanish from every view that reads them.
+        var tracks = VisibleTracks(_tracks);
+        var persistence = _persistence;
+
+        var (albums, artists, trackIndex, albumIndex, artistGroupingSignature) = await Task.Run(() =>
+        {
+            // Build track lookup dictionary
+            var ti = new Dictionary<Guid, Track>(tracks.Count);
+            foreach (var t in tracks)
+                ti[t.Id] = t;
+
+            // Pre-collect unique album IDs and batch-check artwork existence
+            // using a directory listing instead of N individual File.Exists calls
+            var albumIds = tracks.Select(t => t.AlbumId).Distinct().ToList();
+            var artworkDir = Path.GetDirectoryName(persistence.GetArtworkPath(Guid.Empty));
+            var existingArtFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (artworkDir != null && Directory.Exists(artworkDir))
+            {
+                foreach (var file in Directory.EnumerateFiles(artworkDir, "*.jpg"))
+                    existingArtFiles.Add(file);
+            }
+
+            var artworkExists = new HashSet<Guid>();
+            var artworkPaths = new Dictionary<Guid, string>(albumIds.Count);
+            foreach (var albumId in albumIds)
+            {
+                var artPath = persistence.GetArtworkPath(albumId);
+                artworkPaths[albumId] = artPath;
+                if (existingArtFiles.Contains(artPath))
+                    artworkExists.Add(albumId);
+            }
+
+            // Group tracks into albums
+            var albs = tracks
+                .GroupBy(t => t.AlbumId)
+                .Select(g =>
+                {
+                    // Same normalization as the play-order sort (AlbumDetailViewModel.InAlbumOrder):
+                    // disc 0 counts as disc 1 and missing track numbers sink to the end,
+                    // so the displayed album order always matches the playback order.
+                    var albumTracks = g
+                        .OrderBy(t => t.DiscNumber <= 0 ? 1 : t.DiscNumber)
+                        .ThenBy(t => t.TrackNumber <= 0 ? int.MaxValue : t.TrackNumber)
+                        .ThenBy(t => t.Title, StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+                    var first = albumTracks[0];
+                    var hasArt = artworkExists.Contains(first.AlbumId);
+
+                    return new Album
+                    {
+                        Id = first.AlbumId,
+                        Name = first.Album,
+                        Artist = !string.IsNullOrWhiteSpace(first.AlbumArtist) ? first.AlbumArtist : first.Artist,
+                        Year = Album.ResolveYear(albumTracks),
+                        Genre = Album.ResolveGenre(albumTracks),
+                        TrackCount = albumTracks.Count,
+                        TotalDuration = TimeSpan.FromTicks(albumTracks.Sum(t => t.Duration.Ticks)),
+                        ArtworkPath = hasArt ? artworkPaths[first.AlbumId] : null,
+                        Tracks = albumTracks
+                    };
+                })
+                .OrderBy(a => GetPrimaryArtist(a.Artist), StringComparer.OrdinalIgnoreCase)
+                .ThenBy(a => a.Year)
+                .ThenBy(a => a.Name, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            // Build album lookup dictionary
+            var ai = new Dictionary<Guid, Album>(albs.Count);
+            foreach (var a in albs)
+                ai[a.Id] = a;
+
+            // Aggregate artists by their grouping name only (GitHub #51: the primary
+            // track artist, or the primary album artist when Settings says so).
+            // Collaboration credits remain on Track.Artist for rows/tags, but feature
+            // combinations do not become separate top-level artists. The mode and the
+            // separators are read once here so every bucket in this rebuild agrees.
+            var artistBuckets = new Dictionary<string, (string Name, HashSet<Guid> TrackIds, HashSet<Guid> AlbumIds)>(
+                StringComparer.OrdinalIgnoreCase);
+            var groupMode = ArtistCredit.GroupMode;
+            var groupingSignature = ArtistCredit.Signature;
+
+            foreach (var track in tracks)
+            {
+                var primaryArtist = track.GetGroupingArtist(groupMode);
+
+                if (!artistBuckets.TryGetValue(primaryArtist, out var bucket))
+                {
+                    bucket = (primaryArtist, new HashSet<Guid>(), new HashSet<Guid>());
+                    artistBuckets[primaryArtist] = bucket;
+                }
+                bucket.TrackIds.Add(track.Id);
+                bucket.AlbumIds.Add(track.AlbumId);
+            }
+
+            var arts = artistBuckets.Values
+                .Select(b => new Artist
+                {
+                    Id = ComputeArtistId(b.Name),
+                    Name = b.Name,
+                    TrackCount = b.TrackIds.Count,
+                    AlbumCount = b.AlbumIds.Count
+                })
+                .OrderBy(a => a.Name, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            // Populate track artwork paths from their parent albums, then each
+            // odd-one-out track's own cover over its album's.
+            foreach (var a in albs)
+                foreach (var t in a.Tracks)
+                    t.AlbumArtworkPath = a.ArtworkPath;
+            ApplyOwnTrackArtwork(persistence, tracks);
+
+            return (albs, arts, ti, ai, groupingSignature);
+        });
+
+        _albums = albums;
+        _artists = artists;
+        _trackIndex = trackIndex;
+        _albumIndex = albumIndex;
+        // Invalidate under the lock so it can't race a concurrent rebuild in
+        // GetAlbumsByArtist and leave a stale index behind; next reader rebuilds.
+        lock (_albumsByArtistLock) { _albumsByArtistIndex = null; }
+
+        // Persist the computed indexes so next startup can skip this rebuild.
+        // Skipped during progressive scan publishes to avoid rewriting the cache
+        // on every partial update; the final rebuild persists the authoritative set.
+        //
+        // Built from the snapshot this rebuild just produced rather than re-reading the
+        // fields: re-reading let it persist an indexes.json whose track hash validated
+        // against one track set while its album grouping came from another, and the
+        // stale grouping then survived restarts because TryRestoreFromCacheAsync
+        // accepted it.
+        if (persistCache)
+            _ = SaveIndexCacheAsync(tracks, albums, artists, artistGroupingSignature);
+    }
+
+    /// <summary>
+    /// Preserves user-managed state when metadata for a known file is refreshed.
+    /// </summary>
+    private static void CopyMutableTrackState(Track source, Track target)
+    {
+        target.IsFavorite = source.IsFavorite;
+        // After IsFavorite: its setter stamps a fresh FavoritedAt, and the original
+        // timestamp must win — without this, a rescan of a changed file reset the
+        // favorite date (scattering the Favorites grid) and dropped any snooze, and
+        // the next user-state journal write then persisted those wrong values over
+        // the journal's correct ones.
+        target.FavoritedAt = source.FavoritedAt;
+        target.SnoozedUntil = source.SnoozedUntil;
+        target.PlayCount = source.PlayCount;
+        target.LastPlayed = source.LastPlayed;
+        target.Rating = source.Rating;
+        target.IsDisliked = source.IsDisliked;
+        target.Badge = source.Badge;
+        target.SourceType = source.SourceType;
+        target.SourceTrackId = source.SourceTrackId;
+        target.SourceConnectionId = source.SourceConnectionId;
+        target.SkipWhenShuffling = source.SkipWhenShuffling;
+        target.RememberPlaybackPosition = source.RememberPlaybackPosition;
+        target.MediaKind = source.MediaKind;
+        target.StartTimeMs = source.StartTimeMs;
+        target.StopTimeMs = source.StopTimeMs;
+        target.VolumeAdjust = source.VolumeAdjust;
+        target.EqPreset = source.EqPreset;
+        target.LyricsOffsetMs = source.LyricsOffsetMs;
+        target.NoLyrics = source.NoLyrics;
+        target.SavedPositionMs = source.SavedPositionMs;
+        target.DateAdded = source.DateAdded;
+        target.AddedIndividually = source.AddedIndividually;
+        // A song re-tagged while it waits in the Inbox stays there.
+        target.IsInInbox = source.IsInInbox;
+
+        // Analysis results are expensive to produce (a full ffmpeg decode per track) and
+        // are not always round-trippable through file tags, so carry them across a
+        // re-import rather than dropping them. Without this, writing the detected key back
+        // to the file changed its mtime, the watcher re-imported it, the fresh tag read
+        // returned nothing, and the backfill re-analyzed and rewrote the same file — for
+        // every track, forever. Only inherit when the freshly-read tags didn't supply a
+        // value, so a real tag edit still wins.
+        if (target.Bpm <= 0 && source.Bpm > 0)
+            target.Bpm = source.Bpm;
+        if (string.IsNullOrWhiteSpace(target.MusicalKey) && !string.IsNullOrWhiteSpace(source.MusicalKey))
+            target.MusicalKey = source.MusicalKey;
+    }
+
+    private static IEnumerable<string> BuildIncludeRoots(IEnumerable<string> folders, AppSettings settings)
+    {
+        var input = folders
+            .Where(f => !string.IsNullOrWhiteSpace(f))
+            .Select(f => IsUriRoot(f) ? f : TryNormalizePath(f))
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Select(p => p!);
+
+        var explicitIncludes = settings.FolderRules
+            .Where(r => r.Enabled && r.Include && !string.IsNullOrWhiteSpace(r.Path))
+            .Select(r => TryNormalizePath(r.Path))
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Select(p => p!);
+
+        var merged = explicitIncludes.Concat(input)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return merged.Count > 0 ? merged : input;
+    }
+
+    private async Task<bool> EnsureMetadataSchemaUpToDateAsync()
+    {
+        AppSettings settings;
+        try
+        {
+            settings = await _persistence.LoadSettingsAsync();
+        }
+        catch
+        {
+            return false;
+        }
+
+        // Runs once per startup before any scan or migration touches metadata, so the
+        // static enrichment toggle reflects the persisted setting from the first read.
+        MetadataService.MergeFeaturedFromTitles = settings.MergeFeaturedFromTitles;
+        MetadataService.UseEmbeddedArtwork = settings.UseEmbeddedArtwork;
+        ArtistCredit.Configure(ArtistGroupModes.Parse(settings.ArtistGroupMode), settings.ArtistTagSeparators,
+            settings.ArtistProtectedNames ?? ArtistCredit.DefaultProtectedNames.ToList());
+        MetadataService.MusicRootFolders = settings.MusicFolders
+            .Where(f => !string.IsNullOrWhiteSpace(f)).ToArray();
+
+        if (settings.MetadataSchemaVersion >= CurrentMetadataSchemaVersion)
+            return false;
+
+        // The backfills below re-open a large fraction of the library. Report progress
+        // through the existing channel so a multi-minute pass on a big library isn't a
+        // silent stall with no explanation.
+        ScanProgress?.Invoke(this, 0);
+
+        var didBackfillMetadata = false;
+        if (settings.MetadataSchemaVersion < 2)
+            didBackfillMetadata = await BackfillTrackMetadataAsync(_tracks);
+
+        if (settings.MetadataSchemaVersion < 3)
+            didBackfillMetadata |= await BackfillReleaseDateAndCopyrightAsync(_tracks);
+
+        if (settings.MetadataSchemaVersion < 4)
+            didBackfillMetadata |= BackfillArtistFromTitle(_tracks);
+
+        // Re-run artist enrichment for tracks that were indexed before
+        // the Navidrome connector started merging featured artists.
+        if (settings.MetadataSchemaVersion < 5)
+            didBackfillMetadata |= BackfillArtistFromTitle(_tracks);
+
+        // v6: populate ReleaseType from tags + album-name heuristic for existing libraries.
+        if (settings.MetadataSchemaVersion < 6)
+            didBackfillMetadata |= await BackfillReleaseTypeAsync(_tracks);
+
+        // v7: re-read ratings of 1/2/4 stars — earlier reads mistook the iTunes
+        // advisory flag in Apple Music downloads for a star rating.
+        if (settings.MetadataSchemaVersion < 7)
+            didBackfillMetadata |= await BackfillAdvisoryMisreadRatingsAsync(_tracks);
+
+        // v8: untagged files (iTunes WAV rips) all merged into the shared
+        // Unknown-Album bucket; derive artist/album from the folder structure and
+        // track numbers from filenames, matching what ReadTrackMetadata now does
+        // for new imports. Pure string work against stored paths — no file reads.
+        if (settings.MetadataSchemaVersion < 8)
+            didBackfillMetadata |= BackfillFolderMetadata(_tracks, settings);
+
+        // v9: featured artists merged in from titles were joined with " & ", which no
+        // longer splits since "&" left the default separators (1.5.1) — re-join them with
+        // an active separator. Pure string work against the indexed artist/title.
+        if (settings.MetadataSchemaVersion < 9)
+            didBackfillMetadata |= BackfillRejoinMergedFeatured(_tracks);
+
+        // v10: per-track covers — record every file's embedded-cover fingerprint and give
+        // the odd tracks of mixed albums their own cover (Discord, veil 2026-09-22).
+        if (settings.MetadataSchemaVersion < 10)
+            didBackfillMetadata |= await BackfillTrackArtworkAsync(_tracks);
+
+        // v11 (the record label) is not run here: it opens most of the library, so it runs
+        // last, on its own, resumably — see RunTagBackfillAsync. Owner 10-08: inline, it
+        // held the cover heal and the artist-join pass behind a pass that never finished.
+        _labelBackfillPending = settings.MetadataSchemaVersion < LabelSchemaVersion;
+        // v12 (every genre of multi-genre files) runs after it, the same way.
+        _genreBackfillPending = settings.MetadataSchemaVersion < GenreSchemaVersion;
+
+        // Only advance the recorded schema version when the pass actually completed.
+        // Cancelling at shutdown mid-backfill and still stamping it done would leave the
+        // remaining tracks permanently un-backfilled.
+        if (_shutdownCts.IsCancellationRequested)
+            return didBackfillMetadata;
+
+        // Everything up to the label pass is done; that pass stamps v11 itself once it ends,
+        // the genre pass v12.
+        var stamp = _labelBackfillPending ? LabelSchemaVersion - 1
+            : _genreBackfillPending ? GenreSchemaVersion - 1
+            : CurrentMetadataSchemaVersion;
+        if (settings.MetadataSchemaVersion < stamp)
+        {
+            try
+            {
+                // Re-load rather than save the snapshot taken before the backfills: they can
+                // run for minutes, and writing that snapshot back reverted every setting saved
+                // meanwhile (a removed track's exclusion — the next scan re-imported it).
+                await _persistence.UpdateSettingsAsync(s => s.MetadataSchemaVersion = Math.Max(s.MetadataSchemaVersion, stamp));
+            }
+            catch
+            {
+                // Non-fatal: explicit backfill still applies for this session.
+            }
+        }
+
+        if (didBackfillMetadata)
+            await SaveAsync();
+
+        return didBackfillMetadata;
+    }
+
+    private async Task<bool> BackfillTrackMetadataAsync(List<Track> tracks)
+    {
+        var changedCount = 0;
+
+        // Fast path: estimate missing bitrate from file size and duration
+        // so we don't reopen every file just to fill this one field.
+        foreach (var track in tracks)
+        {
+            if (track.Bitrate > 0)
+                continue;
+
+            var estimatedBitrate = EstimateBitrateKbps(track.FileSize, track.Duration);
+            if (estimatedBitrate <= 0)
+                continue;
+
+            track.Bitrate = estimatedBitrate;
+            changedCount++;
+        }
+
+        var candidates = tracks
+            .Where(NeedsTrackMetadataBackfill)
+            .ToList();
+
+        if (candidates.Count == 0)
+            return changedCount > 0;
+
+        await Task.Run(() =>
+        {
+            Parallel.ForEach(
+                candidates,
+                new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2),
+                    // Stop on shutdown instead of hammering the disk after the user quit.
+                    CancellationToken = _shutdownCts.Token
+                },
+                track =>
+                {
+                    Track? refreshed = null;
+                    var changed = false;
+                    try
+                    {
+                        refreshed = _metadata.ReadTrackMetadata(track.FilePath);
+                    }
+                    catch
+                    {
+                        // Keep existing metadata if a file can't be read during migration.
+                    }
+
+                    if (refreshed?.IsExplicit == true)
+                    {
+                        if (!track.IsExplicit)
+                        {
+                            track.IsExplicit = true;
+                            changed = true;
+                        }
+                    }
+
+                    if (refreshed != null)
+                    {
+                        if (refreshed.SampleRate >= 8000 && track.SampleRate != refreshed.SampleRate)
+                        {
+                            track.SampleRate = refreshed.SampleRate;
+                            changed = true;
+                        }
+
+                        if (refreshed.BitsPerSample > 0 && track.BitsPerSample != refreshed.BitsPerSample)
+                        {
+                            track.BitsPerSample = refreshed.BitsPerSample;
+                            changed = true;
+                        }
+
+                        if (refreshed.Bitrate > 0 && track.Bitrate != refreshed.Bitrate)
+                        {
+                            track.Bitrate = refreshed.Bitrate;
+                            changed = true;
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(refreshed.Codec) &&
+                            !string.Equals(track.Codec, refreshed.Codec, StringComparison.Ordinal))
+                        {
+                            track.Codec = refreshed.Codec;
+                            changed = true;
+                        }
+                    }
+
+                    if (track.Bitrate <= 0)
+                    {
+                        var estimatedBitrate = EstimateBitrateKbps(track.FileSize, track.Duration);
+                        if (estimatedBitrate > 0)
+                        {
+                            track.Bitrate = estimatedBitrate;
+                            changed = true;
+                        }
+                    }
+
+                    if (changed)
+                        Interlocked.Increment(ref changedCount);
+                });
+        });
+
+        return changedCount > 0;
+    }
+
+    private static bool NeedsTrackMetadataBackfill(Track track)
+    {
+        if (string.IsNullOrWhiteSpace(track.FilePath) || !File.Exists(track.FilePath))
+            return false;
+
+        if (track.SampleRate < 8000 || track.BitsPerSample <= 0)
+            return true;
+
+        if (string.IsNullOrWhiteSpace(track.Codec))
+            return true;
+
+        if (!track.IsExplicit)
+        {
+            var ext = Path.GetExtension(track.FilePath).ToLowerInvariant();
+            if (ext is ".m4a" or ".mp4" or ".aac" or ".alac")
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Populates ReleaseType + ReleaseTypeFromTag for tracks indexed before v6,
+    /// by re-reading just the relevant tags. Skips already-overridden tracks
+    /// and tracks whose file is no longer accessible.
+    /// </summary>
+    private async Task<bool> BackfillReleaseTypeAsync(List<Track> tracks)
+    {
+        var candidates = tracks
+            .Where(t => !string.IsNullOrWhiteSpace(t.FilePath) && File.Exists(t.FilePath)
+                        && !t.IsReleaseTypeOverridden
+                        && !t.ReleaseTypeFromTag)
+            .ToList();
+
+        if (candidates.Count == 0)
+            return false;
+
+        var changedCount = 0;
+
+        await Task.Run(() =>
+        {
+            Parallel.ForEach(
+                candidates,
+                new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2),
+                    // Stop on shutdown instead of hammering the disk after the user quit.
+                    CancellationToken = _shutdownCts.Token
+                },
+                track =>
+                {
+                    try
+                    {
+                        var refreshed = _metadata.ReadTrackMetadata(track.FilePath);
+                        if (refreshed == null) return;
+                        if (refreshed.ReleaseTypeFromTag || refreshed.IsReleaseTypeOverridden)
+                        {
+                            track.ReleaseType = refreshed.ReleaseType;
+                            track.IsReleaseTypeOverridden = refreshed.IsReleaseTypeOverridden;
+                            track.ReleaseTypeFromTag = refreshed.ReleaseTypeFromTag;
+                            Interlocked.Increment(ref changedCount);
+                        }
+                    }
+                    catch
+                    {
+                        // Non-fatal — backfill is best-effort.
+                    }
+                });
+        });
+
+        return changedCount > 0;
+    }
+
+    private async Task<bool> BackfillAdvisoryMisreadRatingsAsync(List<Track> tracks)
+    {
+        // Only 1/2/4 stars can be phantom advisory codes (1=explicit, 2=clean,
+        // 4=legacy explicit). Genuine ratings set in Undertone were written to the
+        // file tags on the 0-100 scale, so re-reading keeps them intact.
+        var candidates = tracks
+            .Where(t => t.Rating is 1 or 2 or 4
+                        && !string.IsNullOrWhiteSpace(t.FilePath) && File.Exists(t.FilePath))
+            .ToList();
+
+        if (candidates.Count == 0)
+            return false;
+
+        var changedTracks = new ConcurrentBag<Track>();
+
+        await Task.Run(() =>
+        {
+            Parallel.ForEach(
+                candidates,
+                new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2),
+                    // Stop on shutdown instead of hammering the disk after the user quit.
+                    CancellationToken = _shutdownCts.Token
+                },
+                track =>
+                {
+                    try
+                    {
+                        var refreshed = _metadata.ReadTrackMetadata(track.FilePath);
+                        if (refreshed == null) return;
+                        if (refreshed.Rating != track.Rating)
+                        {
+                            track.Rating = refreshed.Rating;
+                            changedTracks.Add(track);
+                        }
+                    }
+                    catch
+                    {
+                        // Non-fatal — backfill is best-effort.
+                    }
+                });
+        });
+
+        if (changedTracks.IsEmpty)
+            return false;
+
+        // Keep the user-state journal in step: it wins over library.json on load,
+        // so leaving the phantom ratings journaled would resurrect them every launch.
+        await SaveTrackUserStateAsync(changedTracks.ToList());
+        return true;
+    }
+
+    private async Task<bool> BackfillReleaseDateAndCopyrightAsync(List<Track> tracks)
+    {
+        var candidates = tracks
+            .Where(t => !string.IsNullOrWhiteSpace(t.FilePath) && File.Exists(t.FilePath) &&
+                        (string.IsNullOrWhiteSpace(t.ReleaseDate) || string.IsNullOrWhiteSpace(t.Copyright)))
+            .ToList();
+
+        if (candidates.Count == 0)
+            return false;
+
+        var changedCount = 0;
+
+        await Task.Run(() =>
+        {
+            Parallel.ForEach(
+                candidates,
+                new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2),
+                    // Stop on shutdown instead of hammering the disk after the user quit.
+                    CancellationToken = _shutdownCts.Token
+                },
+                track =>
+                {
+                    try
+                    {
+                        var refreshed = _metadata.ReadTrackMetadata(track.FilePath);
+                        if (refreshed == null) return;
+
+                        var changed = false;
+
+                        if (string.IsNullOrWhiteSpace(track.ReleaseDate) &&
+                            !string.IsNullOrWhiteSpace(refreshed.ReleaseDate))
+                        {
+                            track.ReleaseDate = refreshed.ReleaseDate;
+                            changed = true;
+                        }
+
+                        if (string.IsNullOrWhiteSpace(track.Copyright) &&
+                            !string.IsNullOrWhiteSpace(refreshed.Copyright))
+                        {
+                            track.Copyright = refreshed.Copyright;
+                            changed = true;
+                        }
+
+                        if (changed)
+                            Interlocked.Increment(ref changedCount);
+                    }
+                    catch
+                    {
+                        // Non-fatal: skip tracks that can't be read.
+                    }
+                });
+        });
+
+        return changedCount > 0;
+    }
+
+    // The schema version the label pass stamps once it has checked every file.
+    private const int LabelSchemaVersion = 11;
+    // The schema version the genre pass stamps (GitHub #123 follow-up, 2026-10-10).
+    private const int GenreSchemaVersion = 12;
+    // Set by EnsureMetadataSchemaUpToDateAsync; BackgroundInit then starts the passes last.
+    private bool _labelBackfillPending;
+    private bool _genreBackfillPending;
+    // A progress line in the session log every this many files.
+    private const int LabelBackfillLogInterval = 250;
+
+    /// <summary>
+    /// Pause between files in the label and genre passes, so a foreground read queued behind
+    /// them (playback, the metadata window, lyrics) gets the disk instead of waiting out a long
+    /// run of reads. Internal for tests.
+    /// </summary>
+    internal static TimeSpan LabelBackfillPause = TimeSpan.FromMilliseconds(10);
+
+    /// <summary>
+    /// One resumable tag pass (<see cref="RunTagBackfillAsync"/>): which tracks still need the
+    /// field, how to read it from a file (empty = nothing to apply) and how to apply it.
+    /// <paramref name="MarkPhoneTracks"/>: tracks behind Android's document tree are marked for
+    /// the next scan instead (they can't be opened by path here).
+    /// <paramref name="SchemaVersion"/>: stamped once every file is checked; null for a pass that
+    /// tracks its progress on the tracks themselves (ReplayGain: <see cref="Track.ReplayGainChecked"/>)
+    /// and simply runs again next launch for whatever is still unread.
+    /// </summary>
+    private sealed record TagBackfill(
+        string Name, int? SchemaVersion, string ProgressFileName,
+        Func<Track, bool> Needs, Func<string, string> Read, Action<Track, string> Apply,
+        bool MarkPhoneTracks, bool Reindex);
+
+    /// <summary>The ReplayGain pass, then the v11 label pass, then the v12 genre pass, each only
+    /// when pending. The genre pass waits for the label pass to finish: it stamps a later version.</summary>
+    private async Task RunTagBackfillsAsync()
+    {
+        // GitHub #151: the Songs list's ReplayGain column. Tracks indexed before the field
+        // existed are read once for their REPLAYGAIN_* tags alone; a file without any is
+        // marked checked too ("|||"), so it is never re-read. Missing or offline files stay
+        // unchecked and are tried again next launch.
+        // GitHub #158: first, not last. Behind the label and genre passes (each a read of most
+        // of the library) the column stayed blank for most songs until both were done.
+        if (_tracks.Any(NeedsReplayGainRead))
+        {
+            var replayGain = new TagBackfill("replaygain", null, "replaygain-backfill.progress",
+                NeedsReplayGainRead,
+                path => _metadata.ReadReplayGain(path) is { } rg ? EncodeReplayGain(rg) : string.Empty,
+                (t, v) => t.ApplyReplayGain(DecodeReplayGain(v)),
+                MarkPhoneTracks: false, Reindex: false);
+            // Cancelled at shutdown: the passes below would stop at once anyway.
+            if (!await RunTagBackfillAsync(replayGain)) return;
+        }
+
+        if (_labelBackfillPending)
+        {
+            var label = new TagBackfill("label", LabelSchemaVersion, "label-backfill.progress",
+                t => string.IsNullOrWhiteSpace(t.Label), _metadata.ReadLabel, (t, v) => t.Label = v,
+                MarkPhoneTracks: true, Reindex: false);
+            if (!await RunTagBackfillAsync(label)) return;
+        }
+
+        // GitHub #123 follow-up, 2026-10-10: tracks read before multi-genre support hold only
+        // their file's first genre ("Rock" for Rock + Pop) and a rescan skips unchanged files by
+        // mtime. Only rows with exactly one genre can be affected; only files with several
+        // genres change the row. Phone tracks are left to their next re-read.
+        if (_genreBackfillPending)
+        {
+            var genre = new TagBackfill("genre", GenreSchemaVersion, "genre-backfill.progress",
+                t => Track.SplitGenres(t.Genre).Length == 1,
+                path => _metadata.ReadGenres(path) is var g && Track.SplitGenres(g).Length > 1 ? g : string.Empty,
+                // Only over the stale row it was read for: a genre typed meanwhile wins.
+                (t, v) => { if (Track.SplitGenres(v)[0].Equals(t.Genre.Trim(), StringComparison.OrdinalIgnoreCase)) t.Genre = v; },
+                MarkPhoneTracks: false, Reindex: true);
+            await RunTagBackfillAsync(genre);
+        }
+    }
+
+    /// <summary>A local file whose ReplayGain tags were never read (indexed before #151's column).</summary>
+    private static bool NeedsReplayGainRead(Track t) => !t.ReplayGainChecked && Track.IsFilesystemPath(t.FilePath);
+
+    // GitHub #158: songs on screen in the Songs list whose ReplayGain was never read, read now
+    // instead of whenever the background pass reaches their path. One reader at a time.
+    private readonly ConcurrentQueue<Track> _replayGainSoon = new();
+    private int _replayGainSoonRunning;
+
+    /// <inheritdoc />
+    public void ReadReplayGainSoon(IEnumerable<Track> tracks)
+    {
+        var queued = false;
+        foreach (var t in tracks)
+        {
+            if (!NeedsReplayGainRead(t)) continue;
+            _replayGainSoon.Enqueue(t);
+            queued = true;
+        }
+        if (queued && Interlocked.CompareExchange(ref _replayGainSoonRunning, 1, 0) == 0)
+            ReplayGainSoonTask = Task.Run(DrainReplayGainSoon);
+    }
+
+    /// <summary>The latest <see cref="ReadReplayGainSoon"/> reader. Internal for tests.</summary>
+    internal Task ReplayGainSoonTask { get; private set; } = Task.CompletedTask;
+
+    private void DrainReplayGainSoon()
+    {
+        while (true)
+        {
+            while (_replayGainSoon.TryDequeue(out var t))
+            {
+                // A row scrolled past twice is queued twice; the second finds it read.
+                if (_shutdownCts.IsCancellationRequested || !NeedsReplayGainRead(t)) continue;
+                // Null: unreadable now (offline, locked); the background pass retries it.
+                // The value lands in library.json with the next save (the pass saves when done).
+                if (_metadata.ReadReplayGain(t.FilePath) is { } rg)
+                    t.ApplyReplayGain(rg);
+            }
+            Volatile.Write(ref _replayGainSoonRunning, 0);
+            // A request queued after the last dequeue but before the flag dropped found the
+            // reader still running: pick it up here rather than leave it waiting.
+            if (_replayGainSoon.IsEmpty || Interlocked.CompareExchange(ref _replayGainSoonRunning, 1, 0) != 0)
+                return;
+        }
+    }
+
+    // The ReplayGain pass's progress-log value: "track|peak|album" (invariant, round-trip;
+    // empty = none). Never blank, so a file with no ReplayGain is logged as checked too.
+    internal static string EncodeReplayGain(ReplayGainValues v)
+    {
+        static string F(double? d) => d?.ToString("R", System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+        return $"{F(v.TrackGainDb)}|{F(v.TrackPeak)}|{F(v.AlbumGainDb)}|";
+    }
+
+    internal static ReplayGainValues DecodeReplayGain(string value)
+    {
+        var parts = value.Split('|');
+        double? P(int i) => i < parts.Length && double.TryParse(parts[i], System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : null;
+        return new ReplayGainValues(P(0), P(1), P(2));
+    }
+
+    /// <summary>
+    /// One-time tag migration (v11: the record label for tracks indexed before it was read;
+    /// v12: every genre of multi-genre files). Local files are re-read in place, but only for
+    /// the one field (<see cref="IMetadataService.ReadLabel"/> / <see cref="IMetadataService.ReadGenres"/>),
+    /// one file at a time with a pause between them, on its own background task after the rest
+    /// of startup. Owner 10-08: v11 label backfill kept the music HDD busy at 50–75 MB/s every
+    /// launch and never finished — a full tag + cover read of nearly every file (most files
+    /// simply have no label) in parallel, which seek-thrashed the disk and queued every other
+    /// read behind it, and was all-or-nothing, so quitting started it over from zero next
+    /// launch. Progress now survives a restart (the pass's progress file in the data folder,
+    /// append-only so a checkpoint is one short write and a hard kill loses at most the line
+    /// being written: <c>L\t{track id}\t{value}\t$</c> for each value found, <c>C\t{path}\t$</c>
+    /// for the last file checked, files walked in ordinal path order; text fields URI-escaped,
+    /// which also escapes '\t' and '$'; a line without its closing '$' was torn and is ignored;
+    /// deleted once the pass completes). A file that turned out to have nothing to apply counts
+    /// as checked too and is never read again.
+    /// The phone's files live behind Android's document tree (content://), which only a scan
+    /// through its file source can open, so for the label those are marked instead: clearing
+    /// the stored modification stamp makes the next scan treat them as changed and re-read them
+    /// once, keeping their user state like any re-tagged file. Streamed desktop songs and tracks
+    /// that no longer need the field are left alone. Stamps the pass's version only once every
+    /// file is checked; returns whether it did.
+    /// </summary>
+    private async Task<bool> RunTagBackfillAsync(TagBackfill pass)
+    {
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(_shutdownCts.Token, _backfillStop.Token);
+        var token = stop.Token;
+        var progressPath = Path.Combine(_persistence.DataDirectory, pass.ProgressFileName);
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var snapshot = _tracks;
+        StreamWriter? progress = null;
+        // A disconnected drive or share: one probe per root rather than a (possibly slow)
+        // File.Exists per file. Its files are skipped like any missing file.
+        var rootOnline = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            var byId = new Dictionary<Guid, Track>(snapshot.Count);
+            foreach (var t in snapshot) byId.TryAdd(t.Id, t);
+
+            // Values found by an interrupted pass, and where it stopped.
+            var found = new Dictionary<Guid, string>();
+            string? resumeAfter = null;
+            try
+            {
+                if (File.Exists(progressPath))
+                {
+                    foreach (var line in File.ReadLines(progressPath))
+                    {
+                        var parts = line.Split('\t');
+                        if (parts[^1] != "$") continue;
+                        if (parts.Length == 3 && parts[0] == "C")
+                            resumeAfter = Uri.UnescapeDataString(parts[1]);
+                        else if (parts.Length == 4 && parts[0] == "L" && Guid.TryParse(parts[1], out var id))
+                            found[id] = Uri.UnescapeDataString(parts[2]);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // Unreadable log: start over — a re-read is only slower, never wrong.
+                DebugLog.Write("Library", $"{pass.Name} backfill: progress file unreadable, starting over: {ex.Message}");
+                found.Clear();
+                resumeAfter = null;
+            }
+
+            var resumed = 0;
+            foreach (var (id, value) in found)
+            {
+                if (byId.TryGetValue(id, out var t) && pass.Needs(t))
+                {
+                    pass.Apply(t, value);
+                    resumed++;
+                }
+            }
+
+            var pending = snapshot
+                .Where(t => pass.Needs(t) && !string.IsNullOrWhiteSpace(t.FilePath)
+                            && !t.FilePath.StartsWith("content://", StringComparison.OrdinalIgnoreCase)
+                            && (resumeAfter == null || string.CompareOrdinal(t.FilePath, resumeAfter) > 0))
+                .OrderBy(t => t.FilePath, StringComparer.Ordinal)
+                .ToList();
+
+            DebugLog.Write("Library",
+                $"{pass.Name} backfill: start — {pending.Count:N0} file(s) to check" +
+                (resumeAfter != null ? $", resumed ({found.Count:N0} value(s) from the last run, {resumed:N0} applied)" : ""));
+
+            try
+            {
+                progress = new StreamWriter(new FileStream(progressPath, FileMode.Append, FileAccess.Write, FileShare.Read))
+                { AutoFlush = true, NewLine = "\n" };
+            }
+            catch (Exception ex)
+            {
+                // No resume log (read-only profile): the pass still runs, it just can't resume.
+                DebugLog.Write("Library", $"{pass.Name} backfill: progress file unavailable: {ex.Message}");
+            }
+
+            var checkedCount = 0;
+            var applied = 0;
+            string? lastChecked = null;
+            try
+            {
+                foreach (var track in pending)
+                {
+                    if (token.IsCancellationRequested) break;
+
+                    // Read meanwhile (GitHub #158: a Songs list row on screen) or edited: no
+                    // second open. Still counts as checked, so the cursor moves past it.
+                    var stillNeeded = pass.Needs(track);
+                    if (stillNeeded && RootOnline(track.FilePath) && File.Exists(track.FilePath))
+                    {
+                        var value = pass.Read(track.FilePath);
+                        if (!string.IsNullOrWhiteSpace(value))
+                        {
+                            pass.Apply(track, value);
+                            found[track.Id] = value;
+                            applied++;
+                            WriteProgress("L", track.Id.ToString(), value);
+                        }
+                    }
+
+                    checkedCount++;
+                    lastChecked = track.FilePath;
+                    if (checkedCount % LabelBackfillLogInterval == 0)
+                    {
+                        WriteProgress("C", lastChecked);
+                        DebugLog.Write("Library",
+                            $"{pass.Name} backfill: {checkedCount:N0}/{pending.Count:N0} checked, {applied:N0} found");
+                    }
+
+                    if (!stillNeeded) continue; // nothing opened: no pause owed
+                    try { await Task.Delay(LabelBackfillPause, token); }
+                    catch (OperationCanceledException) { break; }
+                }
+
+                if (token.IsCancellationRequested)
+                {
+                    // Values already found are in the log (written as found); the next launch
+                    // re-applies them and continues after the last file checked.
+                    if (lastChecked != null)
+                        WriteProgress("C", lastChecked);
+                    DebugLog.Write("Library",
+                        $"{pass.Name} backfill: cancelled at shutdown after {checkedCount:N0}/{pending.Count:N0} " +
+                        $"({applied:N0} found); resumes next launch");
+                    return false;
+                }
+            }
+            finally
+            {
+                progress?.Dispose();
+            }
+
+            // A scan during the pass may have swapped in fresh Track instances; put every value
+            // found on the live ones before saving.
+            var changed = new List<Track>();
+            foreach (var t in _tracks)
+            {
+                if (pass.Needs(t) && found.TryGetValue(t.Id, out var value))
+                    pass.Apply(t, value);
+                if (found.ContainsKey(t.Id)) changed.Add(t);
+            }
+
+            var phone = pass.MarkPhoneTracks
+                ? _tracks.Where(t => pass.Needs(t) && !string.IsNullOrWhiteSpace(t.FilePath)
+                                     && t.FilePath.StartsWith("content://", StringComparison.OrdinalIgnoreCase))
+                    .ToList()
+                : new List<Track>();
+            foreach (var t in phone) t.LastModified = default;
+
+            if (found.Count > 0 || phone.Count > 0)
+            {
+                await SaveAsync();
+                if (pass.Reindex && changed.Count > 0)
+                    await RebuildIndexesAsync();
+                var upserts = pass.Reindex ? phone.Concat(changed).ToList() : phone;
+                if (upserts.Count > 0)
+                {
+                    try { await _sqliteIndex.UpsertTracksAsync(upserts); }
+                    catch { /* JSON save above is authoritative; SQLite catches up on the next full sync */ }
+                }
+                LibraryUpdated?.Invoke(this, EventArgs.Empty);
+            }
+
+            var stamped = false;
+            try
+            {
+                if (pass.SchemaVersion is { } version)
+                    await _persistence.UpdateSettingsAsync(s => s.MetadataSchemaVersion = Math.Max(s.MetadataSchemaVersion, version));
+                stamped = true;
+                File.Delete(progressPath);
+            }
+            catch (Exception ex)
+            {
+                // Next launch repeats the pass from the log; tracks already done are skipped.
+                DebugLog.Write("Library", $"{pass.Name} backfill: could not record completion: {ex.Message}");
+            }
+
+            DebugLog.Write("Library",
+                $"{pass.Name} backfill: done — {checkedCount:N0} file(s) checked, {applied:N0} found" +
+                (resumed > 0 ? $" (+{resumed:N0} from the last run)" : "") +
+                (phone.Count > 0 ? $", {phone.Count:N0} phone track(s) marked for re-scan" : "") +
+                $", {System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalSeconds:0.0} s");
+            return stamped;
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Write("Library", $"{pass.Name} backfill failed: {ex.Message}");
+            return false;
+        }
+
+        bool RootOnline(string path)
+        {
+            string? root;
+            try { root = Path.GetPathRoot(path); }
+            catch { return true; }
+            if (string.IsNullOrEmpty(root)) return true;
+            if (!rootOnline.TryGetValue(root, out var online))
+            {
+                try { online = Directory.Exists(root); }
+                catch { online = false; }
+                rootOnline[root] = online;
+            }
+            return online;
+        }
+
+        // Appends one log line. After a failed write nothing more is logged: a later cursor
+        // line must never skip past a value that didn't make it to the file.
+        void WriteProgress(string kind, string field, string? value = null)
+        {
+            if (progress == null) return;
+            try
+            {
+                progress.WriteLine(value == null
+                    ? $"{kind}\t{Uri.EscapeDataString(field)}\t$"
+                    : $"{kind}\t{field}\t{Uri.EscapeDataString(value)}\t$");
+            }
+            catch
+            {
+                try { progress.Dispose(); } catch { }
+                progress = null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// One-time migration: enrich Artist with featured artists from title
+    /// so collaboration tracks always show the artist subtitle.
+    /// </summary>
+    private static bool BackfillFolderMetadata(List<Track> tracks, AppSettings settings)
+    {
+        var roots = settings.MusicFolders
+            .Where(f => !string.IsNullOrWhiteSpace(f))
+            .ToArray();
+
+        var changedCount = 0;
+        foreach (var track in tracks)
+        {
+            // Server-side tracks carry connector paths; their placeholders are the
+            // server's to resolve, same as during a scan.
+            if (track.SourceType != SourceType.Local) continue;
+            if (Helpers.FolderMetadata.TryApplyToTrack(track, roots))
+                changedCount++;
+        }
+        return changedCount > 0;
+    }
+
+    private static bool BackfillRejoinMergedFeatured(List<Track> tracks)
+    {
+        var changedCount = 0;
+        foreach (var track in tracks)
+        {
+            var rejoined = MetadataService.RejoinMergedFeaturedCredit(track.Artist, track.Title);
+            if (!string.Equals(rejoined, track.Artist, StringComparison.Ordinal))
+            {
+                track.Artist = rejoined;
+                changedCount++;
+            }
+        }
+        return changedCount > 0;
+    }
+
+    private bool BackfillArtistFromTitle(List<Track> tracks)
+    {
+        var changedCount = 0;
+        foreach (var track in tracks)
+        {
+            var enriched = MetadataService.EnrichArtistFromTitle(track.Artist, track.Title);
+            if (!string.Equals(enriched, track.Artist, StringComparison.Ordinal))
+            {
+                track.Artist = enriched;
+                changedCount++;
+            }
+        }
+        return changedCount > 0;
+    }
+
+    /// <inheritdoc />
+    public async Task<int> ApplyMergeFeaturedFromTitlesAsync(bool enabled, CancellationToken ct = default)
+    {
+        CancellationTokenSource cts;
+        lock (_mergeFeatApplyLock)
+        {
+            _mergeFeatApplyCts?.Cancel();
+            cts = CancellationTokenSource.CreateLinkedTokenSource(_shutdownCts.Token, ct);
+            _mergeFeatApplyCts = cts;
+        }
+
+        try
+        {
+            var token = cts.Token;
+            var snapshot = _tracks.ToList();
+            var changed = new List<Track>();
+
+            if (enabled)
+            {
+                // Merging is pure string work against the indexed titles, but it is a
+                // full-library pass — run it on the pool so the toggle click that
+                // awaits this doesn't stall the UI thread.
+                await Task.Run(() =>
+                {
+                    foreach (var track in snapshot)
+                    {
+                        if (token.IsCancellationRequested) break;
+                        var enriched = MetadataService.EnrichArtistFromTitle(track.Artist, track.Title);
+                        if (!string.Equals(enriched, track.Artist, StringComparison.Ordinal))
+                        {
+                            track.Artist = enriched;
+                            changed.Add(track);
+                        }
+                    }
+                }, CancellationToken.None);
+            }
+            else
+            {
+                // Un-merging needs the pre-merge artist, which only exists in the file
+                // tags — but only collaboration tracks whose artist actually echoes a
+                // featured name from the title can have been merged, so the re-read is
+                // bounded to those. Server-backed sources (Navidrome/WebDav/Plex) have
+                // no readable file; their tracks are rebuilt fresh on the next connector
+                // sync, which honors the flipped toggle.
+                // The candidate scan is itself a full-library pass, so it runs on the
+                // pool with the re-reads rather than on the caller's (UI) thread.
+                await Task.Run(() =>
+                {
+                    var candidates = snapshot
+                        .Where(t => t.SourceType is SourceType.Local or SourceType.Smb &&
+                                    MetadataService.MayHaveMergedFeaturedCredit(t.Artist, t.Title))
+                        .ToList();
+
+                    if (candidates.Count == 0) return;
+
+                    try
+                    {
+                        Parallel.ForEach(
+                            candidates,
+                            new ParallelOptions
+                            {
+                                MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2),
+                                CancellationToken = token
+                            },
+                            track =>
+                            {
+                                try
+                                {
+                                    var refreshed = _metadata.ReadTrackMetadata(track.FilePath);
+                                    if (refreshed == null) return;
+                                    if (!string.Equals(refreshed.Artist, track.Artist, StringComparison.Ordinal))
+                                    {
+                                        track.Artist = refreshed.Artist;
+                                        lock (changed) changed.Add(track);
+                                    }
+                                }
+                                catch
+                                {
+                                    // Non-fatal: keep the merged credit for unreadable files.
+                                }
+                            });
+                    }
+                    catch (OperationCanceledException) { }
+                }, CancellationToken.None);
+            }
+
+            if (changed.Count == 0)
+                return 0;
+
+            // Superseded or shutting down: skip persistence. A newer flip's pass will
+            // re-cover these tracks (both directions are idempotent over the library),
+            // and at shutdown the exit flush saves the JSON.
+            if (token.IsCancellationRequested)
+                return changed.Count;
+
+            await RebuildIndexesAsync();
+            await SaveAsync();
+            try { await _sqliteIndex.UpsertTracksAsync(changed); }
+            catch { /* JSON save above is authoritative; SQLite catches up on the next full sync */ }
+            LibraryUpdated?.Invoke(this, EventArgs.Empty);
+            return changed.Count;
+        }
+        finally
+        {
+            lock (_mergeFeatApplyLock)
+            {
+                if (_mergeFeatApplyCts == cts)
+                    _mergeFeatApplyCts = null;
+                cts.Dispose();
+            }
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<int> ApplyArtistCreditJoinAsync(CancellationToken ct = default)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_shutdownCts.Token, ct);
+        var token = cts.Token;
+        try { await _artistJoinGate.WaitAsync(token); }
+        catch (OperationCanceledException) { return 0; }
+
+        try
+        {
+            AppSettings settings;
+            try { settings = await _persistence.LoadSettingsAsync(); }
+            catch { return 0; }
+
+            var join = ArtistCredit.JoinText;
+            if (string.Equals(settings.ArtistCreditJoin, join, StringComparison.Ordinal))
+                return 0;
+
+            // Any join an earlier build or an interrupted pass could have stored, not just the
+            // recorded one: a pass cut short by shutdown leaves some tracks on its join. A
+            // false positive ("Earth, Wind & Fire" as one tag value) costs one tag re-read
+            // that restores the same credit.
+            var stale = new[] { settings.ArtistCreditJoin, ", ", "; ", " / " }
+                .Where(j => !string.IsNullOrEmpty(j) && !string.Equals(j, join, StringComparison.Ordinal))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            bool HasStaleJoin(string? value) =>
+                !string.IsNullOrEmpty(value) && stale.Any(j => value.Contains(j, StringComparison.Ordinal));
+
+            var snapshot = _tracks.ToList();
+            var changed = new List<Track>();
+            var movedTracks = new List<(Guid TrackId, Guid From, Guid To)>();
+
+            // Same shape as the merge-featured un-merge pass: only Artist / AlbumArtist are
+            // taken from the re-read, so favorites, play counts, ratings and lyrics stay.
+            // Server-backed sources have no readable file; their next sync rebuilds them.
+            await Task.Run(() =>
+            {
+                var candidates = snapshot
+                    .Where(t => t.SourceType is SourceType.Local or SourceType.Smb &&
+                                (HasStaleJoin(t.Artist) || HasStaleJoin(t.AlbumArtist)))
+                    .ToList();
+                if (candidates.Count == 0) return;
+
+                try
+                {
+                    Parallel.ForEach(
+                        candidates,
+                        new ParallelOptions
+                        {
+                            MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2),
+                            CancellationToken = token
+                        },
+                        track =>
+                        {
+                            try
+                            {
+                                var refreshed = _metadata.ReadTrackMetadata(track.FilePath);
+                                if (refreshed == null) return;
+                                var artistChanged = !string.Equals(refreshed.Artist, track.Artist, StringComparison.Ordinal);
+                                var albumArtistChanged = !string.Equals(refreshed.AlbumArtist, track.AlbumArtist, StringComparison.Ordinal);
+                                if (!artistChanged && !albumArtistChanged) return;
+
+                                lock (changed)
+                                {
+                                    if (artistChanged)
+                                        track.Artist = refreshed.Artist;
+                                    if (albumArtistChanged)
+                                    {
+                                        var oldAlbumId = track.AlbumId;
+                                        track.AlbumArtist = refreshed.AlbumArtist;
+                                        track.AlbumId = Track.ComputeAlbumId(track.AlbumArtist, track.Album);
+                                        if (track.AlbumId != oldAlbumId)
+                                            movedTracks.Add((track.Id, oldAlbumId, track.AlbumId));
+                                    }
+                                    changed.Add(track);
+                                }
+                            }
+                            catch
+                            {
+                                // Non-fatal: keep the stored credit for unreadable files.
+                            }
+                        });
+                }
+                catch (OperationCanceledException) { }
+            }, CancellationToken.None);
+
+            // The album artist is part of the album's key: carry its cached cover (and the
+            // animated ones) over, as the metadata editor does when an edit re-keys an album.
+            // Copied, not moved — tracks of the album that kept the old key still use it.
+            // Runs even when cancelled: the re-keyed tracks are no longer candidates.
+            foreach (var (trackId, from, to) in movedTracks)
+            {
+                if (to == Track.UnknownAlbumBucketId) continue;
+                CopyIfMissing(_persistence.GetArtworkPath(from), _persistence.GetArtworkPath(to));
+                foreach (var ext in new[] { ".mp4", ".webm" })
+                {
+                    CopyIfMissing(_persistence.GetAnimatedCoverPath(from, null, ext), _persistence.GetAnimatedCoverPath(to, null, ext));
+                    CopyIfMissing(_persistence.GetAnimatedCoverPath(from, trackId, ext), _persistence.GetAnimatedCoverPath(to, trackId, ext));
+                }
+            }
+
+            // Superseded by shutdown: skip persistence like the merge-featured pass; the
+            // exit flush saves the JSON, and the join stays unrecorded so the next start
+            // finishes the pass.
+            if (token.IsCancellationRequested)
+                return changed.Count;
+
+            if (changed.Count > 0)
+            {
+                await RebuildIndexesAsync();
+                await SaveAsync();
+                try { await _sqliteIndex.UpsertTracksAsync(changed); }
+                catch { /* JSON save above is authoritative; SQLite catches up on the next full sync */ }
+                LibraryUpdated?.Invoke(this, EventArgs.Empty);
+            }
+
+            try
+            {
+                await _persistence.UpdateSettingsAsync(s => s.ArtistCreditJoin = join);
+            }
+            catch
+            {
+                // Non-fatal: the next start repeats the (idempotent) pass.
+            }
+
+            return changed.Count;
+        }
+        finally
+        {
+            _artistJoinGate.Release();
+        }
+
+        static void CopyIfMissing(string from, string to)
+        {
+            try
+            {
+                if (File.Exists(from) && !File.Exists(to))
+                    File.Copy(from, to);
+            }
+            catch
+            {
+                // Non-fatal: the missing-artwork heal re-extracts the cover.
+            }
+        }
+    }
+
+    private static int EstimateBitrateKbps(long fileSizeBytes, TimeSpan duration)
+    {
+        if (fileSizeBytes <= 0 || duration.TotalSeconds <= 0)
+            return 0;
+
+        var estimated = (int)Math.Round((fileSizeBytes * 8d) / duration.TotalSeconds / 1000d);
+        return estimated > 0 ? estimated : 0;
+    }
+
+    /// <summary>
+    /// Degree of parallelism for the scan's file reads. Metadata reading is
+    /// I/O-bound, so a single HDD or network share thrashes seeking once more than
+    /// a handful of readers hit it at once — basing this on ProcessorCount (16-24
+    /// on modern CPUs) hurts spinning/network volumes and barely helps SSDs.
+    /// Capped low by default; UNDERTONE_SCAN_THREADS overrides it for A/B testing.
+    /// </summary>
+    private static int GetScanParallelism()
+    {
+        var raw = Environment.GetEnvironmentVariable("UNDERTONE_SCAN_THREADS");
+        if (int.TryParse(raw, out var n) && n >= 1)
+            return Math.Min(n, 64);
+        return Math.Min(Environment.ProcessorCount, 8);
+    }
+
+    /// <summary>
+    /// Existing tracks that live under a directory whose listing failed this scan and
+    /// that the scan did not see — i.e. tracks that would otherwise be dropped because
+    /// their parent folder was unreachable, not because their file is gone.
+    /// </summary>
+    /// <remarks>Internal for tests (InternalsVisibleTo Undertone.Tests).</remarks>
+    internal static List<Track> SelectTracksUnderFailedDirectories(
+        IReadOnlyList<Track> existingTracks,
+        HashSet<Guid> scannedIds,
+        IEnumerable<string> failedDirectories)
+    {
+        var failedPrefixes = failedDirectories.Distinct(StringComparer.Ordinal).ToArray();
+        if (failedPrefixes.Length == 0)
+            return new List<Track>();
+
+        return existingTracks
+            .Where(t => !scannedIds.Contains(t.Id) && failedPrefixes.Any(p => PathIsUnder(t.FilePath, p)))
+            .ToList();
+    }
+
+    /// <summary>Where a file added on its own (GitHub #108) stands during a scan.</summary>
+    private enum AddedFileState
+    {
+        /// <summary>On disk: scanned like any walked file.</summary>
+        Present,
+        /// <summary>Its folder lists fine without it: deleted or moved, drops out.</summary>
+        Gone,
+        /// <summary>Its folder is missing or unreadable (unplugged drive, offline share): kept.</summary>
+        Unreachable,
+    }
+
+    /// <summary>
+    /// Only a folder that lists fine without the file proves it gone — the same bar the
+    /// walk sets for a deleted subfolder. A missing or unlistable folder is "unavailable",
+    /// never "deleted", and a file still listed but not stat-able (locked, no access) is
+    /// kept too.
+    /// </summary>
+    private static AddedFileState ProbeAddedFile(string path, out ScanEntry? entry)
+    {
+        if (LocalFileSystemSource.TryCreateEntry(path, out entry))
+            return AddedFileState.Present;
+
+        try
+        {
+            var dir = Path.GetDirectoryName(path);
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
+                return AddedFileState.Unreachable;
+            var name = Path.GetFileName(path);
+            foreach (var file in Directory.EnumerateFiles(dir))
+            {
+                if (string.Equals(Path.GetFileName(file), name, PathComparison.Comparison))
+                    return AddedFileState.Unreachable;
+            }
+            return AddedFileState.Gone;
+        }
+        catch
+        {
+            return AddedFileState.Unreachable;
+        }
+    }
+
+    /// <summary>
+    /// True when a root is not a filesystem path (a SAF tree URI on Android). Such roots
+    /// are compared as opaque strings: Path.GetFullPath would rewrite them into nonsense.
+    /// </summary>
+    private static bool IsUriRoot(string root) => root.Contains("://", StringComparison.Ordinal);
+
+    /// <summary>
+    /// Is <paramref name="filePath"/> under <paramref name="root"/>? Filesystem roots are
+    /// normalized and compared as paths; URI roots by ordinal prefix — a SAF document URI
+    /// starts with its tree URI, and a document under a directory document starts with
+    /// that directory's URI followed by an encoded separator.
+    /// </summary>
+    internal static bool PathIsUnder(string filePath, string root)
+    {
+        if (IsUriRoot(root))
+        {
+            return filePath.Equals(root, StringComparison.Ordinal)
+                || filePath.StartsWith(root + "/", StringComparison.Ordinal)
+                || filePath.StartsWith(root + "%2F", StringComparison.Ordinal);
+        }
+        var normalizedRoot = TryNormalizePath(root);
+        var normalizedPath = TryNormalizePath(filePath);
+        return normalizedRoot != null && normalizedPath != null && IsUnderRoot(normalizedPath, normalizedRoot);
+    }
+
+    internal static bool IsUnderRoot(string normalizedPath, string root)
+    {
+        if (normalizedPath.Equals(root, PathComparison.Comparison))
+            return true;
+
+        return normalizedPath.StartsWith(root + Path.DirectorySeparatorChar, PathComparison.Comparison) ||
+               normalizedPath.StartsWith(root + Path.AltDirectorySeparatorChar, PathComparison.Comparison);
+    }
+
+    internal static string NormalizePath(string path)
+    {
+        var full = Path.GetFullPath(path);
+        return full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    }
+
+    private static string? TryNormalizePath(string path)
+    {
+        try
+        {
+            return NormalizePath(path);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Computes a hash of all track IDs for cache validation.
+    /// Uses XOR which is order-independent — catches additions/removals.
+    /// </summary>
+    private static string ComputeTrackIdHash(List<Track> tracks)
+    {
+        long h0 = 0, h1 = 0;
+        foreach (var t in tracks)
+        {
+            var bytes = t.Id.ToByteArray();
+            h0 ^= BitConverter.ToInt64(bytes, 0);
+            h1 ^= BitConverter.ToInt64(bytes, 8);
+        }
+        return $"{h0:X16}{h1:X16}";
+    }
+
+    /// <summary>
+    /// Tries to restore album/artist indexes from the cached indexes.json.
+    /// Returns true if cache was valid and indexes were restored successfully.
+    /// </summary>
+    private async Task<bool> TryRestoreFromCacheAsync()
+    {
+        try
+        {
+            var cache = await _persistence.LoadIndexCacheAsync();
+            // The cache holds the visible set it was built from (RebuildIndexesCoreAsync), so
+            // validating against today's visible set also catches a changed hidden list.
+            var tracks = VisibleTracks(_tracks);
+            if (cache == null || cache.Version != CurrentIndexCacheVersion || cache.TrackCount != tracks.Count)
+                return false;
+
+            // The artist list is only valid for the grouping it was built under; a
+            // changed "Group Artists By" or separator set must fall through to a rebuild.
+            if (!string.Equals(cache.ArtistGroupingSignature, ArtistCredit.Signature, StringComparison.Ordinal))
+                return false;
+
+            // The ID-hash validation and full album reconstruction + sort are CPU-bound
+            // over the whole library. This fast path runs on every launch; resuming the
+            // LoadIndexCacheAsync await on the UI thread meant all of it ran there and
+            // stalled startup. Offload to a worker (RebuildIndexesAsync already does the
+            // same), capture the results into locals, and assign the indexes only after a
+            // successful, non-stale rebuild. Track.AlbumArtworkPath is a plain property
+            // (no change notification) and nothing reads these indexes until LoadAsync
+            // raises LibraryUpdated, so the off-thread writes are safe.
+            List<Album>? newAlbums = null;
+            Dictionary<Guid, Track>? newTrackIndex = null;
+            Dictionary<Guid, Album>? newAlbumIndex = null;
+
+            var ok = await Task.Run(() =>
+            {
+                if (cache.TrackIdHash != ComputeTrackIdHash(tracks))
+                    return false;
+
+                // Cache is valid — restore indexes without expensive rebuild
+                var trackIndex = new Dictionary<Guid, Track>(tracks.Count);
+                foreach (var t in tracks)
+                    trackIndex[t.Id] = t;
+
+                var albums = new List<Album>(cache.Albums.Count);
+                var albumIndex = new Dictionary<Guid, Album>(cache.Albums.Count);
+
+                foreach (var entry in cache.Albums)
+                {
+                    var albumTracks = new List<Track>(entry.TrackIds.Count);
+                    foreach (var tid in entry.TrackIds)
+                    {
+                        if (trackIndex.TryGetValue(tid, out var track))
+                            albumTracks.Add(track);
+                    }
+
+                    // If tracks are missing, cache is stale
+                    if (albumTracks.Count != entry.TrackCount)
+                        return false;
+
+                    var album = new Album
+                    {
+                        Id = entry.Id,
+                        Name = entry.Name,
+                        Artist = entry.Artist,
+                        // From the tracks, not the cached value, so a cache written while
+                        // the year (or genre) came from the first track alone heals on the next launch.
+                        Year = Album.ResolveYear(albumTracks),
+                        Genre = Album.ResolveGenre(albumTracks),
+                        TrackCount = entry.TrackCount,
+                        TotalDuration = TimeSpan.FromTicks(entry.TotalDurationTicks),
+                        ArtworkPath = entry.ArtworkPath,
+                        Tracks = albumTracks
+                    };
+
+                    albums.Add(album);
+                    albumIndex[album.Id] = album;
+
+                    // Populate track artwork paths
+                    foreach (var t in albumTracks)
+                        t.AlbumArtworkPath = album.ArtworkPath;
+                }
+                ApplyOwnTrackArtwork(_persistence, tracks);
+
+                newAlbums = albums
+                    .OrderBy(a => GetPrimaryArtist(a.Artist), StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(a => a.Year)
+                    .ThenBy(a => a.Name, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                newTrackIndex = trackIndex;
+                newAlbumIndex = albumIndex;
+                return true;
+            });
+
+            if (!ok)
+                return false;
+
+            _albums = newAlbums!;
+            _artists = cache.Artists;
+            _trackIndex = newTrackIndex!;
+            _albumIndex = newAlbumIndex!;
+            // Invalidate under the lock so it can't race a concurrent rebuild in
+            // GetAlbumsByArtist and leave a stale index behind; next reader rebuilds.
+            lock (_albumsByArtistLock) { _albumsByArtistIndex = null; }
+
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Saves the current album/artist indexes to cache for fast restore on next startup.
+    /// </summary>
+    /// <summary>
+    /// Persists a coherent index snapshot. The three collections must come from the same
+    /// rebuild — see the note at the call site.
+    /// </summary>
+    private async Task SaveIndexCacheAsync(
+        List<Track> tracks, List<Album> albums, List<Artist> artists, string artistGroupingSignature)
+    {
+        try
+        {
+            var cache = new LibraryIndexCache
+            {
+                Version = CurrentIndexCacheVersion,
+                TrackCount = tracks.Count,
+                TrackIdHash = ComputeTrackIdHash(tracks),
+                Artists = artists.ToList(),
+                ArtistGroupingSignature = artistGroupingSignature
+            };
+
+            foreach (var album in albums)
+            {
+                cache.Albums.Add(new CachedAlbumEntry
+                {
+                    Id = album.Id,
+                    Name = album.Name,
+                    Artist = album.Artist,
+                    Year = album.Year,
+                    Genre = album.Genre,
+                    TrackCount = album.TrackCount,
+                    TotalDurationTicks = album.TotalDuration.Ticks,
+                    ArtworkPath = album.ArtworkPath,
+                    TrackIds = album.Tracks.Select(t => t.Id).ToList()
+                });
+            }
+
+            await _persistence.SaveIndexCacheAsync(cache);
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Write("Library", $"Failed to save index cache: {ex.Message}");
+            System.Diagnostics.Debug.WriteLine($"[LibraryService] Failed to save index cache: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Generates a deterministic GUID from a file path so that
+    /// rescanning the same file always produces the same track ID.
+    /// </summary>
+    private static Guid ComputeFileId(string filePath)
+    {
+        var normalized = filePath.Replace('\\', '/').ToLowerInvariant();
+        var hash = System.Security.Cryptography.MD5.HashData(
+            System.Text.Encoding.UTF8.GetBytes(normalized));
+        return new Guid(hash);
+    }
+
+    /// <summary>The id a scan or import gives the file at <paramref name="path"/> (normalized
+    /// the way ImportFilesAsync does), so callers can find its library track.</summary>
+    internal static Guid TrackIdForPath(string path) => ComputeFileId(TryNormalizePath(path) ?? path);
+
+    /// <summary>
+    /// An unchanged WAV that was read before the RIFF INFO fallback (year 0 from an ICRD
+    /// like "2019-05-10", or no album from IPRD) is read again instead of taking the
+    /// unchanged-file fast path, so a rescan repairs it (Discord Tangent). Only a candidate:
+    /// the scan re-reads it only when <see cref="MetadataService.RiffInfoWouldFill"/> finds
+    /// a year or album to fill, so a WAV that truly has no date stays on the fast path
+    /// (and a no-change launch still skips the rebuild). Internal for tests.
+    /// </summary>
+    /// <summary>
+    /// A stream-backed (Android) ALAC scanned before its decoder-config atom was read from the
+    /// stream: TagLib# gives ALAC no bit depth, so it was stored with none ("48 kHz ALAC", and a
+    /// 96 kHz file at 48 kHz without its Hi-Res badge). Read once more; with the atom read, the
+    /// depth is known and the fast path holds again.
+    /// </summary>
+    internal static bool NeedsAlacDepthReread(Track existing, ScanEntry entry) =>
+        entry.LocalPath == null
+        && existing.BitsPerSample <= 0
+        && MetadataService.IsAlacContainer(Path.GetExtension(entry.Name).ToLowerInvariant(), existing.Codec);
+
+    internal static bool NeedsWavInfoReread(Track existing) =>
+        (existing.Year == 0 || existing.Album == "Unknown Album")
+        && Path.GetExtension(existing.FilePath) is { } ext
+        && (ext.Equals(".wav", StringComparison.OrdinalIgnoreCase) || ext.Equals(".wave", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// True when a known track's stored path and the path just found for the same id
+    /// differ in spelling and the stored one no longer exists: a case-only rename on a
+    /// case-sensitive filesystem (Linux; the id folds case, see ComputeFileId). The
+    /// unchanged-file fast paths kept the stale path — a file VLC can't open — through
+    /// every rescan. Where the old spelling still resolves (case-insensitive volumes)
+    /// the fast path is taken exactly as before.
+    /// </summary>
+    private static bool IsStaleCaseSpelling(string storedPath, string foundPath) =>
+        !string.Equals(storedPath, foundPath, StringComparison.Ordinal) && !File.Exists(storedPath);
+
+    /// <summary>Returns the first artist token for sorting (e.g. "Bad Bunny" from "Bad Bunny & J Balvin").</summary>
+    private static string GetPrimaryArtist(string? artist)
+    {
+        if (string.IsNullOrWhiteSpace(artist))
+            return string.Empty;
+        return Track.GetPrimaryArtist(artist);
+    }
+
+    /// <summary>Stable artist id from the name (MD5 of the trimmed, lower-cased name) —
+    /// the key the artist portrait cache is filed under.</summary>
+    public static Guid ComputeArtistId(string artistName)
+    {
+        var hash = System.Security.Cryptography.MD5.HashData(
+            System.Text.Encoding.UTF8.GetBytes(artistName.Trim().ToLowerInvariant()));
+        return new Guid(hash);
+    }
+}

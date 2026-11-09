@@ -1,0 +1,1212 @@
+using System.Collections.ObjectModel;
+using System.Diagnostics;
+using Avalonia.Threading;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using Undertone.Helpers;
+using Undertone.Models;
+using Undertone.Services;
+
+namespace Undertone.ViewModels;
+
+/// <summary>
+/// ViewModel for displaying and managing a single playlist.
+/// </summary>
+public partial class PlaylistViewModel : ViewModelBase, ISearchable, IDisposable
+{
+    private readonly PlayerViewModel _player;
+    private readonly ILibraryService _library;
+    private readonly IPersistenceService _persistence;
+    private readonly SidebarViewModel _sidebar;
+    private readonly ArtistImageService? _artistImageService;
+    private readonly System.ComponentModel.PropertyChangedEventHandler _playerPropertyChangedHandler;
+
+    private Playlist _playlist;
+    private PlaylistNavItem? _navItem;
+    private string _currentFilter = string.Empty;
+
+    /// <summary>Saved scroll offset for restoring position after navigation.</summary>
+    public double SavedScrollOffset { get; set; }
+
+    /// <summary>Tracks currently Ctrl-selected in the view. Set by code-behind.</summary>
+    public List<Track> CtrlSelectedTracks { get; set; } = new();
+
+    [ObservableProperty] private string _name;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(TrackCountText))]
+    private int _trackCount;
+
+    /// <summary>Header stats: "1 track", "12 tracks" (the header read "1 tracks").</summary>
+    public string TrackCountText => TrackCount == 1 ? "1 track" : $"{TrackCount} tracks";
+    [ObservableProperty] private string _totalDuration = "";
+    [ObservableProperty] private string _totalSize = "";
+
+    /// <summary>This load's copy of <see cref="Playlist.TrackAddedAt"/>: the rows' "Added" date and
+    /// NEW badge read it (PlaylistAddedConverter), falling back to the track's library date.</summary>
+    [ObservableProperty] private IReadOnlyDictionary<Guid, DateTime> _trackAddedAt = new Dictionary<Guid, DateTime>();
+    [ObservableProperty] private bool _isSmartPlaylist;
+    [ObservableProperty] private string? _playlistArtworkPath;
+    [ObservableProperty] private Guid? _currentPlayingTrackId;
+    [ObservableProperty] private bool _isPlayerPlaying;
+    [ObservableProperty] private string _playlistDescription = string.Empty;
+    [ObservableProperty] private bool _isDescriptionOpen;
+    [ObservableProperty] private bool _isDescriptionEditing;
+    [ObservableProperty] private string _descriptionEditorText = string.Empty;
+    [ObservableProperty] private string _searchText = string.Empty;
+
+    /// <summary>View-only sort applied to the displayed track list (does not change saved order).</summary>
+    [ObservableProperty] private PlaylistSortMode _sortMode = PlaylistSortMode.Manual;
+
+    public bool IsManualSort => SortMode == PlaylistSortMode.Manual;
+
+    /// <summary>True when drag-reorder is possible: manual playlist, manual sort, no active filter.
+    /// Drives the row grip-handle affordance in the # column.</summary>
+    public bool CanReorder => IsManualPlaylist && IsManualSort && string.IsNullOrWhiteSpace(SearchText);
+
+    partial void OnSearchTextChanged(string value)
+    {
+        OnPropertyChanged(nameof(CanReorder));
+    }
+    public string SortLabel => SortMode switch
+    {
+        PlaylistSortMode.Title => "Title",
+        PlaylistSortMode.Artist => "Artist",
+        PlaylistSortMode.Album => "Album",
+        PlaylistSortMode.Duration => "Duration",
+        PlaylistSortMode.RecentlyAdded => "Recently Added",
+        PlaylistSortMode.ReleaseDateOldest => "Release Date (Oldest)",
+        PlaylistSortMode.ReleaseDateNewest => "Release Date (Newest)",
+        PlaylistSortMode.Badge => "Badge",
+        PlaylistSortMode.DateModifiedNewest => "Date Modified (Newest)",
+        PlaylistSortMode.DateModifiedOldest => "Date Modified (Oldest)",
+        _ => "Manual"
+    };
+
+    partial void OnSortModeChanged(PlaylistSortMode value)
+    {
+        OnPropertyChanged(nameof(IsManualSort));
+        OnPropertyChanged(nameof(SortLabel));
+        OnPropertyChanged(nameof(CanReorder));
+        LoadTracks();
+
+        // This view-model is rebuilt on every navigation, so the pick has to live on
+        // the persisted playlist or it snaps back to Manual. ModifiedAt is left
+        // alone: a view preference is not a content edit.
+        _playlist.SortMode = value.ToString();
+        _ = _persistence.SavePlaylistsAsync(_sidebar.Playlists.ToList());
+    }
+
+    /// <summary>Empty-state flags: which overlay to show when the track list is empty.</summary>
+    [ObservableProperty] private bool _showEmptyManual;
+    [ObservableProperty] private bool _showEmptySmart;
+    [ObservableProperty] private bool _showNoResults;
+
+    public bool HasDescription => !string.IsNullOrWhiteSpace(PlaylistDescription);
+    public bool HasDescriptionChanges =>
+        !string.Equals(
+            (DescriptionEditorText ?? string.Empty).Trim(),
+            PlaylistDescription.Trim(),
+            StringComparison.Ordinal);
+
+    public bool IsManualPlaylist => !IsSmartPlaylist;
+
+    /// <summary>Id of the playlist shown; used to sync the sidebar highlight on Back/Forward.</summary>
+    public Guid PlaylistId => _playlist.Id;
+
+    /// <summary>Formatted creation date, e.g. "Created July 2026".</summary>
+    public string CreatedDateDisplay =>
+        $"Created {_playlist.CreatedAt.ToLocalTime():MMMM yyyy}";
+
+    /// <summary>Formatted last-modified date, e.g. "Updated Jul 18".</summary>
+    public string ModifiedDateDisplay
+    {
+        get
+        {
+            var modified = _playlist.ModifiedAt.ToLocalTime();
+            return modified.Year == DateTime.Now.Year
+                ? $"Updated {modified:MMM d}"
+                : $"Updated {modified:MMM yyyy}";
+        }
+    }
+
+    /// <summary>Creation date without the "Created " prefix, for the labelled fact
+    /// tiles in the description dialog (the label already says CREATED).</summary>
+    public string CreatedDateValue => _playlist.CreatedAt.ToLocalTime().ToString("MMMM yyyy");
+
+    /// <summary>Last-modified date without the "Updated " prefix; see
+    /// <see cref="CreatedDateValue"/>.</summary>
+    public string ModifiedDateValue
+    {
+        get
+        {
+            var modified = _playlist.ModifiedAt.ToLocalTime();
+            return modified.Year == DateTime.Now.Year
+                ? modified.ToString("MMM d")
+                : modified.ToString("MMM yyyy");
+        }
+    }
+
+    /// <summary>Playlist cover color (hex).</summary>
+    /// <summary>Starred in the sidebar (hero star button, 09-14).</summary>
+    public bool IsPinned => _playlist.IsPinned;
+
+    [RelayCommand]
+    private async Task TogglePin()
+    {
+        await _sidebar.TogglePinAsync(_playlist.Id);
+        OnPropertyChanged(nameof(IsPinned));
+        OnPropertyChanged(nameof(StarTip));
+    }
+
+    /// <summary>The hero star's tooltip: one button now (the artist page's zooming star), so its
+    /// text follows the state instead of two buttons swapping.</summary>
+    public string StarTip => Undertone.Localization.Loc.T(IsPinned ? "LibraryPlaylists.UnstarFromSidebar" : "LibraryPlaylists.StarSidebar");
+
+    public string PlaylistColor => _playlist.Color;
+
+    /// <summary>Custom cover art path (if set).</summary>
+    public string? PlaylistCoverArtPath => _playlist.CoverArtPath;
+
+    /// <summary>Up to 4 unique album art paths for collage (synced from sidebar nav item).</summary>
+    public string? Art1 => _navItem?.Art1;
+    public string? Art2 => _navItem?.Art2;
+    public string? Art3 => _navItem?.Art3;
+    public string? Art4 => _navItem?.Art4;
+    public bool HasCustomArt => !string.IsNullOrEmpty(PlaylistCoverArtPath);
+    public bool HasCollageArt => !HasCustomArt && Art1 != null && Art2 != null;
+    public bool HasSingleArt => !HasCustomArt && Art1 != null && Art2 == null;
+    public bool ShowFallbackIcon => !HasCustomArt && Art1 == null;
+
+    /// <summary>Image used for the ambient blurred backdrop (custom cover, else first collage art).</summary>
+    public string? BackdropArtPath => HasCustomArt ? PlaylistCoverArtPath : Art1;
+
+    /// <summary>Resolved tracks in this playlist (order matches playlist).</summary>
+    public BulkObservableCollection<Track> Tracks { get; } = new();
+
+    /// <summary>Library-only suggestions (same artists as the playlist) shown in the left rail.</summary>
+    public ObservableCollection<Track> SuggestedTracks { get; } = new();
+    public bool HasSuggestions => IsManualPlaylist && SuggestedTracks.Count > 0;
+
+    /// <summary>Number of Ctrl-selected rows; drives the floating selection action bar.</summary>
+    [ObservableProperty] private int _selectedCount;
+    public bool HasSelection => SelectedCount > 0;
+    partial void OnSelectedCountChanged(int value) => OnPropertyChanged(nameof(HasSelection));
+
+    /// <summary>Inline title rename state (click the title to edit).</summary>
+    [ObservableProperty] private bool _isRenamingName;
+    [ObservableProperty] private string _nameEditorText = string.Empty;
+
+    /// <summary>Unique artists represented by tracks in this playlist.</summary>
+    public ObservableCollection<PlaylistFeaturedArtist> FeaturedArtists { get; } = new();
+    public bool HasFeaturedArtists => FeaturedArtists.Count > 0;
+    public string? FirstFeaturedArtistName => FeaturedArtists.FirstOrDefault()?.Name;
+
+    /// <summary>Subset shown stacked in the left rail; the header chevron opens the full list.</summary>
+    public IEnumerable<PlaylistFeaturedArtist> TopFeaturedArtists => FeaturedArtists.Take(5);
+
+    /// <summary>Fires when the user wants to go back to the previous view.</summary>
+    public event EventHandler? BackRequested;
+
+    /// <summary>Fires when the user wants to view an album from a track.</summary>
+    public event EventHandler<Track>? ViewAlbumRequested;
+
+    public PlaylistViewModel(Playlist playlist, PlayerViewModel player,
+        ILibraryService library, IPersistenceService persistence, SidebarViewModel sidebar,
+        ArtistImageService? artistImageService = null, bool showSideRail = true)
+    {
+        _showSideRail = showSideRail; // before LoadTracks: a hidden rail fetches nothing
+        _player = player;
+        _library = library;
+        _persistence = persistence;
+        _sidebar = sidebar;
+        _artistImageService = artistImageService;
+        _playlist = playlist;
+        _navItem = _sidebar.PlaylistItems.FirstOrDefault(n => n.PlaylistId == playlist.Id);
+        _name = playlist.Name;
+        _isSmartPlaylist = playlist.IsSmartPlaylist;
+        _playlistDescription = playlist.Description ?? string.Empty;
+
+        // Restore the persisted sort before the first load; the backing field is set
+        // directly so this doesn't trigger OnSortModeChanged's save round-trip.
+        if (Enum.TryParse<PlaylistSortMode>(playlist.SortMode, ignoreCase: true, out var savedSort))
+            _sortMode = savedSort;
+
+        LoadTracks();
+
+        // Track the currently playing song
+        CurrentPlayingTrackId = _player.CurrentTrack?.Id;
+        IsPlayerPlaying = _player.State == PlaybackState.Playing;
+        _playerPropertyChangedHandler = (_, e) =>
+        {
+            if (e.PropertyName == nameof(PlayerViewModel.CurrentTrack))
+                CurrentPlayingTrackId = _player.CurrentTrack?.Id;
+            if (e.PropertyName == nameof(PlayerViewModel.State))
+                IsPlayerPlaying = _player.State == PlaybackState.Playing;
+        };
+        _player.PropertyChanged += _playerPropertyChangedHandler;
+
+        if (_isSmartPlaylist)
+            _library.LibraryUpdated += OnLibraryUpdated;
+
+        _sidebar.PlaylistTracksChanged += OnPlaylistTracksChanged;
+        _sidebar.PlaylistEdited += OnPlaylistEdited;
+    }
+
+    private void OnLibraryUpdated(object? sender, EventArgs e)
+    {
+        Dispatcher.UIThread.Post(() => LoadTracks());
+    }
+
+    private void OnPlaylistTracksChanged(object? sender, Guid playlistId)
+    {
+        if (playlistId == _playlist.Id)
+            Dispatcher.UIThread.Post(() => LoadTracks());
+    }
+
+    /// <summary>Header values the Edit Playlist dialog can change, read from the playlist.</summary>
+    private static readonly string[] EditedHeaderProperties =
+    {
+        nameof(PlaylistColor), nameof(PlaylistCoverArtPath), nameof(HasCustomArt), nameof(HasCollageArt),
+        nameof(HasSingleArt), nameof(ShowFallbackIcon), nameof(BackdropArtPath), nameof(IsPinned),
+        nameof(StarTip), nameof(ModifiedDateDisplay), nameof(ModifiedDateValue),
+    };
+
+    /// <summary>
+    /// The Edit Playlist dialog saved this playlist, from this page or from the sidebar's menu
+    /// while the page is open. The page used to refresh only after its own Edit button, and
+    /// then not the star, the cover's visibility flags or the Updated date: a removed cover
+    /// left a blank square, a new one stayed hidden until the page was reopened.
+    /// </summary>
+    private void OnPlaylistEdited(object? sender, Guid playlistId)
+    {
+        if (playlistId != _playlist.Id) return;
+        Name = _playlist.Name;
+        PlaylistDescription = _playlist.Description ?? string.Empty;
+        foreach (var property in EditedHeaderProperties)
+            OnPropertyChanged(property);
+    }
+
+    /// <summary>
+    /// True when the track matches the "Find in Playlist" query: the library search syntax
+    /// (<see cref="Undertone.Helpers.SearchQuery"/>, GitHub #107). A blank query matches everything.
+    /// Scans should parse once and call <see cref="Undertone.Helpers.SearchQuery.Matches"/> instead.
+    /// </summary>
+    public static bool MatchesSearch(Track track, string query)
+        => Undertone.Helpers.SearchQuery.Parse(query).Matches(track);
+
+    [RelayCommand]
+    private void SetSort(string mode)
+    {
+        if (Enum.TryParse<PlaylistSortMode>(mode, ignoreCase: true, out var parsed))
+            SortMode = parsed;
+    }
+
+    /// <summary>Pure view-only sort for the displayed list. Manual preserves the playlist order.</summary>
+    public static IReadOnlyList<Track> SortTracks(IReadOnlyList<Track> tracks, PlaylistSortMode mode,
+        IReadOnlyDictionary<Guid, DateTime>? addedAt = null)
+    {
+        if (tracks == null) return Array.Empty<Track>();
+        return mode switch
+        {
+            PlaylistSortMode.Title => tracks.OrderBy(t => t.Title, StringComparer.OrdinalIgnoreCase).ToList(),
+            PlaylistSortMode.Artist => tracks.OrderBy(t => t.PrimaryArtist, StringComparer.OrdinalIgnoreCase)
+                                             .ThenBy(t => t.Title, StringComparer.OrdinalIgnoreCase).ToList(),
+            PlaylistSortMode.Album => tracks.OrderBy(t => t.Album, StringComparer.OrdinalIgnoreCase)
+                                            .ThenBy(t => t.DiscNumber).ThenBy(t => t.TrackNumber).ToList(),
+            PlaylistSortMode.Duration => tracks.OrderBy(t => t.Duration).ToList(),
+            // When it joined this playlist (Playlist.TrackAddedAt), else its library date.
+            PlaylistSortMode.RecentlyAdded => tracks.OrderByDescending(t =>
+                addedAt != null && addedAt.TryGetValue(t.Id, out var added) ? added : t.DateAdded).ToList(),
+            PlaylistSortMode.Badge => tracks
+                .OrderBy(t => !t.HasBadge)
+                .ThenBy(t => t.Badge ?? string.Empty, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(t => t.Title, StringComparer.OrdinalIgnoreCase).ToList(),
+            // Disc/track stay ascending in both: flipping to newest-first reverses
+            // the discography, not the running order inside each record. The album
+            // tie-break DOES flip with the direction, so two albums sharing a
+            // release date mirror instead of both ending alphabetical.
+            PlaylistSortMode.ReleaseDateOldest => tracks
+                .OrderBy(IsUndated).ThenBy(ReleaseKey)
+                .ThenBy(t => t.Album, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(t => t.DiscNumber).ThenBy(t => t.TrackNumber).ToList(),
+            PlaylistSortMode.ReleaseDateNewest => tracks
+                .OrderBy(IsUndated).ThenByDescending(ReleaseKey)
+                .ThenByDescending(t => t.Album, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(t => t.DiscNumber).ThenBy(t => t.TrackNumber).ToList(),
+            // GitHub #89: file last-write time; Title keeps same-timestamp tracks
+            // (a batch retag) in a stable order in both directions.
+            PlaylistSortMode.DateModifiedNewest => tracks
+                .OrderByDescending(t => t.LastModified)
+                .ThenBy(t => t.Title, StringComparer.OrdinalIgnoreCase).ToList(),
+            PlaylistSortMode.DateModifiedOldest => tracks
+                .OrderBy(t => t.LastModified)
+                .ThenBy(t => t.Title, StringComparer.OrdinalIgnoreCase).ToList(),
+            _ => tracks
+        };
+    }
+
+    /// <summary>Year 0 means "never tagged", not "year zero" — those sink to the end
+    /// either way instead of opening the oldest-first list.</summary>
+    private static bool IsUndated(Track track) => track.Year <= 0;
+
+    /// <summary>
+    /// Release instant for sorting: the tagged date when it parses, otherwise the start
+    /// of the tagged year. Two albums from the same year order by the finer date, and a
+    /// file with only a year still lands among its contemporaries.
+    /// </summary>
+    private static DateTime ReleaseKey(Track track) =>
+        Track.TryParseReleaseDate(track.ReleaseDate, out var exact) ? exact
+        : track.Year > 0 ? new DateTime(track.Year, 1, 1)
+        : DateTime.MinValue;
+
+
+    public void ApplyFilter(string query)
+    {
+        if (SearchText != query)
+            SearchText = query;
+
+        _currentFilter = query;
+        LoadTracks();
+    }
+
+    /// <summary>Stale-result guard: LoadTracks runs can overlap (search keystrokes,
+    /// LibraryUpdated every ~1.5 s during scans); only the newest result is applied.</summary>
+    private int _loadGeneration;
+
+    private async void LoadTracks()
+    {
+        try
+        {
+            var generation = Interlocked.Increment(ref _loadGeneration);
+
+            // Snapshot mutable state on the UI thread; TrackIds is edited by
+            // remove/reorder so the background pass must not enumerate it live.
+            var playlist = _playlist;
+            var isSmart = playlist.IsSmartPlaylist;
+            var trackIds = isSmart ? null : playlist.TrackIds.ToList();
+            var addedAt = new Dictionary<Guid, DateTime>(playlist.TrackAddedAt);
+            var filter = _currentFilter;
+            var sortMode = SortMode;
+            var library = _library;
+
+            // Smart-playlist eval and filter/sort are full-list passes; run them off the
+            // UI thread like LibrarySongsViewModel.ApplyFilterAndSort does.
+            var (allResolvedTracks, sorted, unfiltered) = await Task.Run(() =>
+            {
+                IEnumerable<Track> resolved = isSmart
+                    ? SmartPlaylistEvaluator.Evaluate(playlist, library.Tracks)
+                    : trackIds!.Select(id => library.GetTrackById(id)).OfType<Track>();
+
+                var all = resolved.ToList();
+
+                if (string.IsNullOrWhiteSpace(filter))
+                    return (all, SortTracks(all, sortMode, addedAt), (IReadOnlyList<Track>?)null);
+
+                var filtered = all.Where(Undertone.Helpers.SearchQuery.Parse(filter).Matches).ToList();
+                return (all, SortTracks(filtered, sortMode, addedAt), SortTracks(all, sortMode, addedAt));
+            });
+
+            if (generation != _loadGeneration) return;
+
+            TrackAddedAt = addedAt; // before the rows, so their Added / NEW read this load's dates
+            _unfilteredTracks = unfiltered;
+            Tracks.ReplaceAll(sorted);
+
+            TrackCount = Tracks.Count;
+            var total = TimeSpan.FromTicks(Tracks.Sum(t => t.Duration.Ticks));
+            TotalDuration = total.TotalHours >= 1
+                ? $"{(int)total.TotalHours}h {total.Minutes}m"
+                : $"{(int)total.TotalMinutes} min";
+
+            // Compute total file size from the size the library already indexed.
+            //
+            // This used to do File.Exists + new FileInfo(...).Length per track, synchronously
+            // on the UI thread — and LoadTracks runs on every debounced search keystroke, sort
+            // change, library update and membership change. For a 3,000-track playlist on a
+            // NAS/SMB share that was 6,000 blocking filesystem round-trips per keystroke.
+            // Track.FileSize is populated by MetadataService during scan and kept current by
+            // the watcher, so the number is the same without touching the disk.
+            long totalBytes = 0;
+            foreach (var t in Tracks)
+                totalBytes += t.FileSize;
+            TotalSize = totalBytes switch
+            {
+                >= 1_073_741_824 => $"{totalBytes / 1_073_741_824.0:F1} GB",
+                >= 1_048_576 => $"{totalBytes / 1_048_576.0:F1} MB",
+                _ => $"{totalBytes / 1024.0:F0} KB"
+            };
+
+            // Use first track's album artwork as playlist cover
+            PlaylistArtworkPath = Tracks.FirstOrDefault()?.AlbumArtworkPath;
+
+            UpdateEmptyStateFlags(allResolvedTracks.Count);
+
+            RebuildFeaturedArtists(allResolvedTracks);
+            RebuildSuggestions();
+            OnPropertyChanged(nameof(ModifiedDateDisplay));
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[PlaylistVM] LoadTracks failed: {ex.Message}");
+        }
+    }
+
+    // ── Suggested songs (left rail) ──────────────────────────
+
+    /// <summary>Membership snapshot so filter/sort reloads don't reshuffle the picks.</summary>
+    private string? _lastSuggestionKey;
+
+    /// <summary>Stale-result guard for the suggestion scan (mirrors _loadGeneration).</summary>
+    private int _suggestionGeneration;
+
+    private void RebuildSuggestions(bool force = false)
+    {
+        if (IsSmartPlaylist) return;
+        // Rail hidden: no scan. Forget the key so showing it again builds fresh picks.
+        if (!ShowSideRail) { _lastSuggestionKey = null; return; }
+
+        var key = string.Join(",", _playlist.TrackIds);
+        if (!force && key == _lastSuggestionKey) return;
+        _lastSuggestionKey = key;
+
+        _ = RebuildSuggestionsAsync(_playlist.TrackIds.ToList());
+    }
+
+    /// <summary>The candidate scan runs ParseArtistTokens (regex) over every library
+    /// track, so it lives on a background thread; only the 3 picks touch the UI.</summary>
+    private async Task RebuildSuggestionsAsync(List<Guid> trackIds)
+    {
+        try
+        {
+            var generation = Interlocked.Increment(ref _suggestionGeneration);
+            var library = _library;
+
+            var picks = await Task.Run(() =>
+            {
+                var inPlaylist = new HashSet<Guid>(trackIds);
+                var playlistArtists = new HashSet<string>(
+                    trackIds
+                        .Select(id => library.GetTrackById(id))
+                        .OfType<Track>()
+                        .SelectMany(t => Track.ParseArtistTokens(t.Artist)),
+                    StringComparer.OrdinalIgnoreCase);
+
+                if (playlistArtists.Count == 0) return new List<Track>();
+
+                var candidates = library.Tracks
+                    .Where(t => !inPlaylist.Contains(t.Id)
+                                && !t.IsSnoozed // snoozed = hidden from suggestions (owner 10-10)
+                                && Track.ParseArtistTokens(t.Artist).Any(playlistArtists.Contains))
+                    .ToList();
+
+                return candidates.OrderBy(_ => Random.Shared.Next()).Take(3).ToList();
+            });
+
+            if (generation != _suggestionGeneration) return;
+
+            SuggestedTracks.Clear();
+            foreach (var pick in picks)
+                SuggestedTracks.Add(pick);
+
+            OnPropertyChanged(nameof(HasSuggestions));
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[PlaylistVM] Suggestion rebuild failed: {ex.Message}");
+        }
+    }
+
+    [RelayCommand]
+    private void RefreshSuggestions() => RebuildSuggestions(force: true);
+
+    // ── Rail on/off (Discord, DendyAly 11-02) ──────────────────
+
+    /// <summary>The Featured Artists / Suggested rail shows (Settings PlaylistShowSideRail).
+    /// Hidden, the track list takes its width and neither list is built.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(SideRailMenuLabel))]
+    private bool _showSideRail = true;
+
+    /// <summary>The tracks the rail was last built from, so showing it again needs no reload.</summary>
+    private IReadOnlyList<Track> _railTracks = Array.Empty<Track>();
+
+    private Action<bool>? _sideRailAction;
+
+    /// <summary>The app's setter for the shared setting; the page follows it back through <see cref="ShowSideRail"/>.</summary>
+    public void SetSideRailAction(Action<bool> action) => _sideRailAction = action;
+
+    /// <summary>The playlist options menu entry: what a click does.</summary>
+    public string SideRailMenuLabel => Undertone.Localization.Loc.T(ShowSideRail ? "Playlist.HideSideRail" : "Playlist.ShowSideRail");
+
+    partial void OnShowSideRailChanged(bool value)
+    {
+        RebuildFeaturedArtists(_railTracks);
+        if (value) RebuildSuggestions(force: true);
+        else if (SuggestedTracks.Count > 0)
+        {
+            Interlocked.Increment(ref _suggestionGeneration); // drop a scan still running
+            SuggestedTracks.Clear();
+            OnPropertyChanged(nameof(HasSuggestions));
+        }
+    }
+
+    [RelayCommand]
+    private void ToggleSideRail()
+    {
+        if (_sideRailAction is { } action) action(!ShowSideRail);
+        else ShowSideRail = !ShowSideRail;
+    }
+
+    [RelayCommand]
+    private async Task AddSuggested(Track track)
+    {
+        if (track == null || IsSmartPlaylist) return;
+        // Raises PlaylistTracksChanged, which reloads this view (and the suggestions).
+        await _sidebar.AddTracksToPlaylist(_playlist.Id, new[] { track });
+    }
+
+    // ── Inline title rename ──────────────────────────────────
+
+    [RelayCommand]
+    private void StartRename()
+    {
+        NameEditorText = Name;
+        IsRenamingName = true;
+    }
+
+    public async Task CommitRenameAsync()
+    {
+        var newName = (NameEditorText ?? string.Empty).Trim();
+        IsRenamingName = false;
+        if (string.IsNullOrEmpty(newName) || string.Equals(newName, Name, StringComparison.Ordinal))
+            return;
+
+        await _sidebar.RenamePlaylist(_playlist.Id, newName);
+        Name = _playlist.Name;
+        OnPropertyChanged(nameof(ModifiedDateDisplay));
+    }
+
+    public void CancelRename() => IsRenamingName = false;
+
+    /// <param name="unfilteredCount">Track count before the search filter was applied.</param>
+    private void UpdateEmptyStateFlags(int unfilteredCount)
+    {
+        var filterActive = !string.IsNullOrWhiteSpace(_currentFilter);
+        ShowNoResults = Tracks.Count == 0 && filterActive && unfilteredCount > 0;
+        ShowEmptyManual = Tracks.Count == 0 && !ShowNoResults && !IsSmartPlaylist;
+        ShowEmptySmart = Tracks.Count == 0 && !ShowNoResults && IsSmartPlaylist;
+    }
+
+    private void RebuildFeaturedArtists(IReadOnlyList<Track> tracks)
+    {
+        _railTracks = tracks;
+        // Rail hidden: no list and no artist-picture downloads until it is shown again.
+        if (!ShowSideRail)
+        {
+            if (FeaturedArtists.Count == 0) return;
+            FeaturedArtists.Clear();
+            OnPropertyChanged(nameof(HasFeaturedArtists));
+            OnPropertyChanged(nameof(FirstFeaturedArtistName));
+            OnPropertyChanged(nameof(TopFeaturedArtists));
+            return;
+        }
+        var artistCounts = tracks
+            .SelectMany(t => Track.ParseArtistTokens(t.Artist))
+            .Where(name => !string.Equals(name, "Unknown Artist", StringComparison.OrdinalIgnoreCase))
+            .GroupBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .Select(group => new { Name = group.First(), TrackCount = group.Count() })
+            .OrderByDescending(item => item.TrackCount)
+            .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
+            .Take(20)
+            .ToList();
+
+        FeaturedArtists.Clear();
+
+        if (artistCounts.Count == 0)
+        {
+            OnPropertyChanged(nameof(HasFeaturedArtists));
+            OnPropertyChanged(nameof(FirstFeaturedArtistName));
+            OnPropertyChanged(nameof(TopFeaturedArtists));
+            return;
+        }
+
+        var libraryArtists = _library.Artists
+            .GroupBy(a => a.Name, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
+        var artistsToFetch = new List<Artist>();
+
+        foreach (var entry in artistCounts)
+        {
+            libraryArtists.TryGetValue(entry.Name, out var artist);
+            var item = new PlaylistFeaturedArtist(
+                entry.Name,
+                entry.TrackCount,
+                artist?.ImagePath);
+
+            FeaturedArtists.Add(item);
+
+            if (artist != null)
+            {
+                artistsToFetch.Add(artist);
+                if (_artistImageService?.HasCachedImage(artist.Id) == true)
+                    item.ImagePath = _artistImageService.GetCachedImagePath(artist.Id);
+            }
+        }
+
+        OnPropertyChanged(nameof(HasFeaturedArtists));
+        OnPropertyChanged(nameof(FirstFeaturedArtistName));
+        OnPropertyChanged(nameof(TopFeaturedArtists));
+
+        if (_artistImageService != null && artistsToFetch.Count > 0)
+        {
+            var itemsByName = FeaturedArtists.ToDictionary(a => a.Name, StringComparer.OrdinalIgnoreCase);
+            _ = _artistImageService.FetchAndCacheAsync(artistsToFetch, (artist, path) =>
+            {
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (itemsByName.TryGetValue(artist.Name, out var item))
+                        item.ImagePath = path;
+                });
+            });
+        }
+    }
+
+    [RelayCommand]
+    private void PlayAll()
+    {
+        var tracks = Tracks.ToList();
+        if (tracks.Count == 0) return;
+        _player.ReplaceQueueAndPlay(tracks, 0);
+    }
+
+    /// <summary>The whole playlist in the current sort while a search narrows <see cref="Tracks"/>;
+    /// null without a search. A song played from a search continues with the playlist after it
+    /// (as LibrarySongsViewModel.PlayContext), not with the other search results only.</summary>
+    private IReadOnlyList<Track>? _unfilteredTracks;
+
+    [RelayCommand]
+    private void PlayFrom(Track track)
+    {
+        var tracks = _unfilteredTracks != null && _unfilteredTracks.Contains(track)
+            ? _unfilteredTracks.ToList()
+            : Tracks.ToList();
+        var idx = tracks.IndexOf(track);
+        if (idx < 0) idx = 0;
+        _player.ReplaceQueueAndPlay(tracks, idx);
+    }
+
+    /// <summary>The Ctrl-selection when the acted-on row is part of it, else just that row.</summary>
+    private List<Track> SelectionOr(Track track) =>
+        CtrlSelectedTracks.Count > 0 && CtrlSelectedTracks.Contains(track) ? CtrlSelectedTracks.ToList() : new List<Track> { track };
+
+    [RelayCommand]
+    private Task RateTrack(RateRequest request) => _library.SetTracksRatingAsync(SelectionOr(request.Track), request.Stars);
+
+    /// <summary>GitHub #74: Badge ▸ menu. Null badge = "Remove badge"; a request whose name
+    /// is <see cref="BadgeRequest.NewBadge"/> prompts for one. Bulk-aware like Rate.</summary>
+    [RelayCommand]
+    private async Task SetBadge(BadgeRequest request)
+    {
+        var name = request.Badge;
+        if (name == BadgeRequest.NewBadge)
+        {
+            name = await Helpers.BadgeNamePrompt.ShowAsync();
+            if (string.IsNullOrWhiteSpace(name)) return;
+        }
+        await _library.SetTracksBadgeAsync(SelectionOr(request.Track), name);
+        OnPropertyChanged(nameof(BadgeNames));
+        if (SortMode == PlaylistSortMode.Badge) LoadTracks();
+    }
+
+    /// <summary>Badge names in use across the library, for the Badge ▸ menu.</summary>
+    public IReadOnlyList<string> BadgeNames => _library.GetBadgeNames();
+
+    [RelayCommand]
+    private async Task FetchLyrics(Track track)
+    {
+        var tracks = SelectionOr(track);
+        CtrlSelectedTracks.Clear();
+        await MetadataHelper.OpenBulkLyricsDialog(tracks, remove: false);
+    }
+
+    [RelayCommand]
+    private async Task RemoveLyrics(Track track)
+    {
+        var tracks = SelectionOr(track);
+        CtrlSelectedTracks.Clear();
+        await MetadataHelper.OpenBulkLyricsDialog(tracks, remove: true);
+    }
+
+    [RelayCommand]
+    private async Task OpenLyricsStudio(Track track)
+    {
+        var tracks = SelectionOr(track);
+        CtrlSelectedTracks.Clear();
+        await MetadataHelper.OpenLyricsStudio(tracks);
+    }
+
+    [RelayCommand]
+    private async Task SendToFolder(Track track)
+    {
+        var tracks = SelectionOr(track);
+        CtrlSelectedTracks.Clear();
+        await MetadataHelper.OpenSendToFolderDialog(tracks);
+    }
+
+    /// <summary>Whole playlist → folder (header action).</summary>
+    [RelayCommand]
+    private async Task SendPlaylistToFolder()
+    {
+        var tracks = Tracks.ToList();
+        if (tracks.Count == 0) return;
+        await MetadataHelper.OpenSendToFolderDialog(tracks);
+    }
+
+    [RelayCommand]
+    private async Task RemoveTrack(Track track)
+    {
+        // Smart playlist contents come from its rules, not TrackIds: the row would just
+        // come back on the next reload.
+        if (IsSmartPlaylist) return;
+        var tracks = SelectionOr(track);
+        foreach (var t in tracks)
+        {
+            var displayIdx = Tracks.IndexOf(t);
+            if (displayIdx >= 0)
+                Tracks.RemoveAt(displayIdx);
+            _playlist.TrackIds.Remove(t.Id);
+            if (!_playlist.TrackIds.Contains(t.Id)) _playlist.TrackAddedAt.Remove(t.Id);
+        }
+        // The whole-playlist list a search-play continues with must lose them too.
+        if (_unfilteredTracks != null)
+        {
+            var unfiltered = _unfilteredTracks.ToList();
+            foreach (var t in tracks) unfiltered.Remove(t);
+            _unfilteredTracks = unfiltered;
+        }
+        _playlist.ModifiedAt = DateTime.UtcNow;
+        TrackCount = Tracks.Count;
+
+        var total = TimeSpan.FromTicks(Tracks.Sum(t => t.Duration.Ticks));
+        TotalDuration = total.TotalHours >= 1
+            ? $"{(int)total.TotalHours}h {total.Minutes}m"
+            : $"{(int)total.TotalMinutes} min";
+        UpdateEmptyStateFlags(_playlist.TrackIds.Count);
+        RebuildFeaturedArtists(Tracks.ToList());
+
+        await _persistence.SavePlaylistsAsync(_sidebar.Playlists.ToList());
+        CtrlSelectedTracks.Clear();
+    }
+
+    public async Task MoveTrack(int fromIndex, int toIndex)
+    {
+        if (IsSmartPlaylist) return;
+        // Tracks is the filtered view while a search is active; rebuilding
+        // TrackIds from it would silently delete every non-matching track.
+        if (!string.IsNullOrWhiteSpace(_currentFilter)) return;
+        // Reordering only makes sense in Manual sort — otherwise the displayed
+        // order isn't the saved order and persisting it would scramble the playlist.
+        if (SortMode != PlaylistSortMode.Manual) return;
+        if (fromIndex < 0 || fromIndex >= Tracks.Count) return;
+        if (toIndex < 0 || toIndex >= Tracks.Count) return;
+        if (fromIndex == toIndex) return;
+
+        Tracks.Move(fromIndex, toIndex);
+
+        // Rebuild TrackIds to match new order
+        ApplyDisplayedOrder(_playlist.TrackIds, Tracks);
+        _playlist.ModifiedAt = DateTime.UtcNow;
+
+        await _persistence.SavePlaylistsAsync(_sidebar.Playlists.ToList());
+    }
+
+    /// <summary>
+    /// GitHub #74: dragging one row of a multi-selection moves the whole selection as a
+    /// block to <paramref name="insertIndex"/> (an insertion index in the CURRENT list,
+    /// the same one the drop indicator draws at). The block keeps its list order.
+    /// </summary>
+    public async Task MoveTracks(IReadOnlyList<Track> moved, int insertIndex)
+    {
+        if (IsSmartPlaylist) return;
+        if (!string.IsNullOrWhiteSpace(_currentFilter)) return;
+        if (SortMode != PlaylistSortMode.Manual) return;
+        if (moved.Count == 0) return;
+
+        var target = ReorderBlock(Tracks.ToList(), moved, insertIndex);
+        if (target.SequenceEqual(Tracks)) return;
+
+        // Walk the target order and pull each row up into place: at most one Move per
+        // selected row, so the virtualized list keeps its realized rows (a ReplaceAll
+        // would rebuild every one).
+        for (var i = 0; i < target.Count; i++)
+        {
+            if (ReferenceEquals(Tracks[i], target[i])) continue;
+            var from = Tracks.IndexOf(target[i]);
+            if (from > i) Tracks.Move(from, i);
+        }
+
+        ApplyDisplayedOrder(_playlist.TrackIds, Tracks);
+        _playlist.ModifiedAt = DateTime.UtcNow;
+
+        await _persistence.SavePlaylistsAsync(_sidebar.Playlists.ToList());
+    }
+
+    /// <summary>Pure block move: <paramref name="moved"/> (in any order) is lifted out of
+    /// <paramref name="list"/> and re-inserted, in its original relative order, where
+    /// <paramref name="insertIndex"/> pointed before the lift.</summary>
+    /// <summary>
+    /// Writes the displayed order back into <paramref name="trackIds"/>, slot by slot: an id
+    /// that is not displayed (a track under a hidden library folder) keeps its place instead
+    /// of being dropped from the playlist by a reorder. Falls back to the displayed list when
+    /// the displayed rows don't map one-to-one onto the saved ids.
+    /// </summary>
+    internal static void ApplyDisplayedOrder(IList<Guid> trackIds, IReadOnlyList<Track> displayed)
+    {
+        var shown = new HashSet<Guid>(displayed.Select(t => t.Id));
+        var slots = trackIds.Count(shown.Contains);
+        if (slots != displayed.Count)
+        {
+            trackIds.Clear();
+            foreach (var t in displayed)
+                trackIds.Add(t.Id);
+            return;
+        }
+
+        var next = 0;
+        for (var i = 0; i < trackIds.Count; i++)
+            if (shown.Contains(trackIds[i]))
+                trackIds[i] = displayed[next++].Id;
+    }
+
+    internal static List<Track> ReorderBlock(IReadOnlyList<Track> list, IReadOnlyList<Track> moved, int insertIndex)
+    {
+        var movedSet = new HashSet<Track>(moved);
+        var block = list.Where(movedSet.Contains).ToList();
+        var rest = new List<Track>(list.Count);
+        var insertAt = 0;
+        for (var i = 0; i < list.Count; i++)
+        {
+            if (i == insertIndex) insertAt = rest.Count;
+            if (!movedSet.Contains(list[i])) rest.Add(list[i]);
+        }
+        if (insertIndex >= list.Count) insertAt = rest.Count;
+        rest.InsertRange(insertAt, block);
+        return rest;
+    }
+
+    [RelayCommand]
+    private void PlayNext(Track track) => _player.AddNext(track);
+
+    [RelayCommand]
+    private void AddToQueue(Track track) => _player.AddToQueue(track);
+
+    [RelayCommand]
+    private void StartRadio(Track track) => _player.StartRadioCommand.Execute(track);
+
+    /// <summary>The row, or the Ctrl-selection it is in (owner 10-10), in one snooze write.</summary>
+    [RelayCommand]
+    private Task SnoozeForMonth(Track track)
+    {
+        var tracks = SelectionOr(track);
+        CtrlSelectedTracks.Clear();
+        return _player.SnoozeTracksForMonthAsync(tracks);
+    }
+
+    [RelayCommand]
+    private void ShuffleAll()
+    {
+        var tracks = Tracks.ToList();
+        if (tracks.Count == 0) return;
+        _player.PlayShuffled(tracks);
+    }
+
+    /// <summary>Opens the add-to-playlist picker for the current multi-selection
+    /// (floating selection bar).</summary>
+    public async Task OpenAddSelectedToPlaylistAsync()
+    {
+        var tracks = CtrlSelectedTracks.ToList();
+        if (tracks.Count == 0) return;
+        CtrlSelectedTracks.Clear();
+        await _sidebar.OpenAddToPlaylistAsync(tracks);
+    }
+
+    [RelayCommand]
+    private async Task AddToNewPlaylist(Track track)
+    {
+        var tracks = SelectionOr(track);
+        await _sidebar.CreatePlaylistWithTracksAsync(tracks);
+        CtrlSelectedTracks.Clear();
+    }
+
+    [RelayCommand]
+    private async Task OpenMetadata(Track track)
+    {
+        var sel = SelectionOr(track);
+        if (sel.Count > 1)
+        {
+            CtrlSelectedTracks.Clear();
+            await MetadataHelper.OpenBatchMetadataWindow(sel);
+        }
+        else
+        {
+            await MetadataHelper.OpenMetadataWindow(track);
+        }
+    }
+
+    [RelayCommand]
+    private async Task ConvertTracks(Track track)
+    {
+        var tracks = SelectionOr(track);
+        CtrlSelectedTracks.Clear();
+        await MetadataHelper.OpenAudioConverterDialog(tracks);
+    }
+
+    [RelayCommand]
+    private async Task ScanReplayGain(Track track)
+    {
+        var tracks = SelectionOr(track);
+        CtrlSelectedTracks.Clear();
+        await MetadataHelper.OpenReplayGainScannerDialog(tracks);
+    }
+
+    [RelayCommand]
+    private async Task ToggleFavorite(Track track)
+    {
+        var tracks = SelectionOr(track);
+        foreach (var t in tracks)
+            t.IsFavorite = !t.IsFavorite;
+        await _library.SaveTrackUserStateAsync(tracks);
+        _library.NotifyFavoritesChanged(tracks);
+        CtrlSelectedTracks.Clear();
+    }
+
+    /// <summary>Toggles favorite for a single track only (used by the inline row heart),
+    /// independent of any multi-selection so a heart click never affects other rows.
+    /// Kept synchronous: an async command would disable every heart button (they share this
+    /// one command instance) while the save awaits, flickering all hearts. The bool flip
+    /// updates the bound heart instantly; persistence runs in the background.</summary>
+    [RelayCommand]
+    private void ToggleFavoriteSingle(Track track)
+    {
+        if (track == null) return;
+        track.IsFavorite = !track.IsFavorite;
+        _ = PersistFavoriteChangeAsync(track);
+    }
+
+    private async Task PersistFavoriteChangeAsync(Track track)
+    {
+        await _library.SaveTrackUserStateAsync(new[] { track });
+        _library.NotifyFavoritesChanged(new[] { track });
+    }
+
+    [RelayCommand]
+    private void ViewAlbum(Track track)
+    {
+        ViewAlbumRequested?.Invoke(this, track);
+    }
+
+    [RelayCommand]
+    private void ShowInExplorer(Track track)
+    {
+        if (track == null || !File.Exists(track.FilePath)) return;
+        Helpers.PlatformHelper.ShowInFileManager(track.FilePath);
+    }
+
+    private Action<Track>? _searchLyricsAction;
+    public void SetSearchLyricsAction(Action<Track> action) => _searchLyricsAction = action;
+
+    [RelayCommand]
+    private void SearchLyrics(Track track) => _searchLyricsAction?.Invoke(track);
+
+    private Action<string>? _viewArtistAction;
+    public void SetViewArtistAction(Action<string> action) => _viewArtistAction = action;
+
+    [RelayCommand]
+    private void ViewArtist(string artistName)
+    {
+        if (!string.IsNullOrWhiteSpace(artistName))
+            _viewArtistAction?.Invoke(artistName);
+    }
+
+    private Action<IReadOnlyList<PlaylistFeaturedArtist>>? _openFeaturedArtistsAction;
+    public void SetOpenFeaturedArtistsAction(Action<IReadOnlyList<PlaylistFeaturedArtist>> action) => _openFeaturedArtistsAction = action;
+
+    [RelayCommand]
+    private void OpenFeaturedArtists()
+    {
+        if (FeaturedArtists.Count > 0)
+            _openFeaturedArtistsAction?.Invoke(FeaturedArtists.ToList());
+    }
+
+    // ── Description ──────────────────────────────────────────
+
+    partial void OnPlaylistDescriptionChanged(string value)
+    {
+        OnPropertyChanged(nameof(HasDescription));
+        OnPropertyChanged(nameof(HasDescriptionChanges));
+        SaveDescriptionEditCommand.NotifyCanExecuteChanged();
+    }
+
+    partial void OnDescriptionEditorTextChanged(string value)
+    {
+        OnPropertyChanged(nameof(HasDescriptionChanges));
+        SaveDescriptionEditCommand.NotifyCanExecuteChanged();
+    }
+
+    /// <summary>Raised once a description edit has been saved; the pop-up closes on it.</summary>
+    public event EventHandler? DescriptionSaved;
+
+    [RelayCommand]
+    private async Task OpenDescription()
+    {
+        DescriptionEditorText = PlaylistDescription;
+        IsDescriptionEditing = false;
+        await Views.PlaylistDescriptionDialog.ShowAsync(this);
+        IsDescriptionEditing = false;
+    }
+
+    /// <summary>Opens the description dialog straight into edit mode (ghost
+    /// "Add a description…" affordance shown when the playlist has none).</summary>
+    [RelayCommand]
+    private async Task AddDescription()
+    {
+        DescriptionEditorText = string.Empty;
+        IsDescriptionEditing = true;
+        await Views.PlaylistDescriptionDialog.ShowAsync(this);
+        IsDescriptionEditing = false;
+    }
+
+    [RelayCommand]
+    private void CloseDescription()
+    {
+        IsDescriptionEditing = false;
+        IsDescriptionOpen = false;
+    }
+
+    [RelayCommand]
+    private void StartDescriptionEdit()
+    {
+        DescriptionEditorText = PlaylistDescription;
+        IsDescriptionEditing = true;
+    }
+
+    /// <summary>Saves the edited description, only when the text really changed (the pop-up's
+    /// Ctrl+Enter reaches this without the Save button's disabled state; an unchanged save
+    /// would still bump the playlist's Updated date).</summary>
+    [RelayCommand(CanExecute = nameof(HasDescriptionChanges))]
+    private async Task SaveDescriptionEdit()
+    {
+        if (!HasDescriptionChanges) return;
+        var edited = (DescriptionEditorText ?? string.Empty).Trim();
+        _playlist.Description = edited;
+        _playlist.ModifiedAt = DateTime.UtcNow;
+        // The header's "Updated …" line reads ModifiedAt; say it moved (as a rename does).
+        OnPropertyChanged(nameof(ModifiedDateDisplay));
+        OnPropertyChanged(nameof(ModifiedDateValue));
+        PlaylistDescription = edited;
+        DescriptionEditorText = edited;
+        IsDescriptionEditing = false;
+        IsDescriptionOpen = false;
+        await _persistence.SavePlaylistsAsync(_sidebar.Playlists.ToList());
+        DescriptionSaved?.Invoke(this, EventArgs.Empty);
+    }
+
+    [RelayCommand]
+    private void CancelDescriptionEdit()
+    {
+        DescriptionEditorText = PlaylistDescription;
+        IsDescriptionEditing = false;
+    }
+
+    // ── Playlist-level actions (3-dot menu) ──────────────────
+
+    [RelayCommand]
+    private void PlayNextAll()
+    {
+        _player.AddNextRange(Tracks.ToList(), _playlist.Name);
+    }
+
+    [RelayCommand]
+    private void AddAllToQueue()
+    {
+        _player.AddRangeToQueue(Tracks.ToList(), _playlist.Name);
+    }
+
+    /// <summary>Opens the search-driven library picker to add songs to this (manual) playlist.</summary>
+    [RelayCommand]
+    private async Task AddSongs()
+    {
+        if (IsSmartPlaylist) return;
+        await _sidebar.OpenAddSongsAsync(_playlist);
+    }
+
+    [RelayCommand]
+    private async Task EditPlaylist()
+    {
+        // The header refreshes from the sidebar's PlaylistEdited (OnPlaylistEdited).
+        await _sidebar.EditPlaylistAsync(_playlist);
+    }
+
+    [RelayCommand]
+    private async Task DeletePlaylist()
+    {
+        var confirmed = await Views.ConfirmationDialog.ShowAsync($"Are you sure you want to delete \"{_playlist.Name}\"? This cannot be undone.");
+        if (!confirmed) return;
+        await _sidebar.DeletePlaylistAsync(_playlist.Id);
+        BackRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    [RelayCommand]
+    private void GoBack()
+    {
+        BackRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    public void Dispose()
+    {
+        _player.PropertyChanged -= _playerPropertyChangedHandler;
+        _sidebar.PlaylistTracksChanged -= OnPlaylistTracksChanged;
+        _sidebar.PlaylistEdited -= OnPlaylistEdited;
+        if (_playlist.IsSmartPlaylist)
+            _library.LibraryUpdated -= OnLibraryUpdated;
+    }
+}
+
+/// <summary>View-only display order for a playlist's track list.</summary>
+public enum PlaylistSortMode
+{
+    Manual,
+    Title,
+    Artist,
+    Album,
+    Duration,
+    RecentlyAdded,
+
+    // Two modes rather than one plus a direction toggle: playlist sort has no
+    // direction control (each mode carries its own, like RecentlyAdded), and
+    // "old to new" / "new to old" is the whole point of the request.
+    ReleaseDateOldest,
+    ReleaseDateNewest,
+
+    /// <summary>GitHub #74: grouped by the user badge (A→Z), unbadged tracks last.</summary>
+    Badge,
+
+    /// <summary>GitHub #89: by the file's last-modified time, one mode per direction
+    /// like ReleaseDate*. Appended so saved sort names stay valid.</summary>
+    DateModifiedNewest,
+    DateModifiedOldest
+}
+
+public partial class PlaylistFeaturedArtist : ObservableObject
+{
+    public PlaylistFeaturedArtist(string name, int trackCount, string? imagePath)
+    {
+        Name = name;
+        TrackCount = trackCount;
+        ImagePath = imagePath;
+    }
+
+    public string Name { get; }
+    public int TrackCount { get; }
+    [ObservableProperty] private string? _imagePath;
+}

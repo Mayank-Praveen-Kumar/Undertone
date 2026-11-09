@@ -1,0 +1,31 @@
+<controls:GlassPanel xmlns="https://github.com/avaloniaui"
+                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                     xmlns:controls="using:Undertone.Controls"
+                     x:Class="Undertone.Mobile.Views.ProfileButton"
+                     Classes="header-glass">
+    <!-- The profile button for a tab page's header: a round glass button (Apple's avatar circle,
+         its thin rim included) holding the signed-in desktop's picture, else the person glyph.
+         Code-behind drives both from AvatarPath and Command, so the control works under any
+         DataContext (ShellViewModel or a page with a Shell). -->
+    <controls:GlassPanel.Styles>
+        <Style Selector="Border.avatar">
+            <Setter Property="Width" Value="40" />
+            <Setter Property="Height" Value="40" />
+            <Setter Property="CornerRadius" Value="20" />
+            <Setter Property="ClipToBounds" Value="True" />
+            <Setter Property="Background" Value="{DynamicResource PhoneFillBrush}" />
+            <Setter Property="HorizontalAlignment" Value="Center" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+        </Style>
+    </controls:GlassPanel.Styles>
+
+    <!-- "glass-round" (MobileStyles): the circle's full 44 dp touch target, Apple-style press dim. -->
+    <Button Name="ProfileButtonRoot" Classes="glass-round" AutomationProperties.Name="Profile and settings">
+        <Panel>
+            <PathIcon Name="AvatarGlyph" Data="{DynamicResource PhPerson}" />
+            <Border Name="AvatarClip" Classes="avatar" IsVisible="False">
+                <controls:CachedImage Name="AvatarImage" DecodeWidth="128" Stretch="UniformToFill" />
+            </Border>
+        </Panel>
+    </Button>
+</controls:GlassPanel>

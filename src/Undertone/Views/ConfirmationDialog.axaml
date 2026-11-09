@@ -1,0 +1,75 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:loc="using:Undertone.Localization"
+        xmlns:controls="using:Undertone.Controls"
+        xmlns:sys="using:System"
+        x:Class="Undertone.Views.ConfirmationDialog"
+        Title="{loc:T Confirmation.Confirm}"
+        CanResize="False"
+        WindowDecorations="None"
+        Background="Transparent"
+        TransparencyLevelHint="Transparent"
+        ShowInTaskbar="False">
+
+    <!-- Owner 10-10: the blurred app behind, like the other pop-ups (it was a flat dark tint;
+         seen on Lyrics Studio's Clear lyrics). PillDialogHost draws the blurred, dimmed owner
+         and the card, swallows clicks and wheel on the backdrop, and plays the open/close
+         animation on every close path. The answer is kept in Confirmed, never in Close(result). -->
+    <controls:PillDialogHost>
+
+        <StackPanel x:Name="DialogCard" Width="332" Margin="24,20,24,18" Spacing="18">
+
+            <!-- Message (+ optional title, detail lines, note and option switch; see ConfirmationRequest) -->
+            <StackPanel Spacing="10">
+                <TextBlock x:Name="TitleText"
+                           IsVisible="False"
+                           FontSize="16" FontWeight="SemiBold"
+                           TextWrapping="Wrap" />
+                <TextBlock x:Name="MessageText"
+                           Text="{loc:T Confirmation.AreYouSure}"
+                           FontSize="14"
+                           TextWrapping="Wrap" />
+                <ItemsControl x:Name="DetailsList" IsVisible="False">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <StackPanel Spacing="6"/>
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="sys:String">
+                            <Grid ColumnDefinitions="Auto,*">
+                                <Ellipse Width="5" Height="5" Margin="2,7,10,0" VerticalAlignment="Top"
+                                         Fill="{DynamicResource AccentColorBrush}"/>
+                                <TextBlock Grid.Column="1" Text="{Binding}" FontSize="13" TextWrapping="Wrap"/>
+                            </Grid>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <TextBlock x:Name="NoteText"
+                           IsVisible="False"
+                           FontSize="12" Opacity="0.65"
+                           TextWrapping="Wrap" />
+                <!-- The option (e.g. Remove a plugin: "Also delete its data and settings"): a
+                     Settings row, label left and the app's round switch right (owner 10-29: no
+                     square checkbox). Clicking the label flips it too. -->
+                <Grid x:Name="OptionRow" ColumnDefinitions="*,Auto" IsVisible="False" Margin="0,4,0,0"
+                      Background="Transparent" PointerPressed="OnOptionRowPressed">
+                    <TextBlock x:Name="OptionLabel" FontSize="13" TextWrapping="Wrap"
+                               VerticalAlignment="Center" Margin="0,0,14,0"/>
+                    <controls:LottieToggle x:Name="OptionToggle" Grid.Column="1" VerticalAlignment="Center"/>
+                </Grid>
+            </StackPanel>
+
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+                <Button Classes="pill-secondary"
+                        Content="{loc:T Confirmation.Cancel}"
+                        Click="OnCancelClick" />
+                <Button x:Name="ConfirmButton"
+                        Classes="pill-primary"
+                        Content="{loc:T Confirmation.Confirm}"
+                        Click="OnConfirmClick" />
+            </StackPanel>
+        </StackPanel>
+
+    </controls:PillDialogHost>
+</Window>

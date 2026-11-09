@@ -1,0 +1,181 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="Undertone.Controls.ColorPickerFlyout"
+             x:Name="Root">
+
+    <UserControl.Styles>
+        <Style Selector="Button.color-swatch-btn /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+        <Style Selector="Button.color-swatch-btn:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+        <Style Selector="Button.color-swatch-btn:pressed /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+        <Style Selector="TextBox.hex-input /template/ Border#PART_BorderElement">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+        </Style>
+        <Style Selector="TextBox.hex-input:pointerover /template/ Border#PART_BorderElement">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+        <Style Selector="TextBox.hex-input:focus /template/ Border#PART_BorderElement">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+        <Style Selector="TextBox.hex-input:focus-within /template/ Border#PART_BorderElement">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+    </UserControl.Styles>
+
+    <!-- Reads the name the picker is given where it is used (its swatch Panel read
+         "Avalonia.Controls.Panel"). -->
+    <Button x:Name="SwatchButton"
+            Classes="color-swatch-btn"
+            AutomationProperties.Name="{Binding #Root.(AutomationProperties.Name)}"
+            Cursor="Hand"
+            Background="Transparent"
+            BorderThickness="0"
+            Padding="0">
+        <Button.Content>
+            <!-- 3px headroom so the global hover scale (1.045) never pushes the swatch
+                 past the button's layout bounds, where it gets clipped flat at the sides. -->
+            <Panel Width="{Binding #Root.SwatchSize}"
+                   Height="{Binding #Root.SwatchSize}"
+                   Margin="3">
+                <!-- Default visual: filled circle showing the current Hex. -->
+                <Ellipse x:Name="DefaultSwatch"
+                         IsVisible="{Binding #Root.SwatchContent, Converter={x:Static ObjectConverters.IsNull}}"
+                         Stroke="#1FFFFFFF" StrokeThickness="1"/>
+                <!-- Custom content override: caller supplies its own visual (e.g. rainbow + plus). -->
+                <ContentPresenter Content="{Binding #Root.SwatchContent}"
+                                  IsVisible="{Binding #Root.SwatchContent, Converter={x:Static ObjectConverters.IsNotNull}}"/>
+            </Panel>
+        </Button.Content>
+
+        <Button.Flyout>
+            <Flyout Placement="Bottom" ShowMode="Standard">
+                <!-- Named so code-behind can reach the FlyoutPresenter above it: the presenter
+                     is what plays the Settings-style open/close fade+scale (see the .cs). -->
+                <Border x:Name="PickerBody" Padding="16" CornerRadius="18"
+                        Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                        MinWidth="392">
+                    <StackPanel Spacing="14">
+
+                        <!-- Saturation/Value spectrum -->
+                        <!-- Exactly one rounding mechanism: the explicit rounded Clip.
+                             This used to also carry CornerRadius and a 1px border, and the
+                             gradient layers used Margin="-1" to bleed back out from under
+                             that border's content inset. Three antialiased edges that have
+                             to land on the same subpixel never do — the mismatch showed as
+                             pale fringes in the corners and a hue-coloured seam along the
+                             bottom, where the value gradient's black end was pushed 1px
+                             below the clip. No border thickness means no inset, which means
+                             no negative margins; the hairline is drawn as an overlay on top
+                             of the content so its own edge covers the clip's. -->
+                        <Border x:Name="Spectrum"
+                                Width="360" Height="142"
+                                ClipToBounds="True"
+                                PointerPressed="OnSpectrumPointerPressed"
+                                PointerMoved="OnSpectrumPointerMoved">
+                            <Border.Clip>
+                                <RectangleGeometry Rect="0,0,360,142" RadiusX="8" RadiusY="8"/>
+                            </Border.Clip>
+                            <Grid>
+                                <Rectangle x:Name="HueWash"/>
+                                <Border>
+                                    <Border.Background>
+                                        <LinearGradientBrush StartPoint="0%,0%" EndPoint="0%,100%">
+                                            <GradientStop Offset="0" Color="#00FFFFFF"/>
+                                            <GradientStop Offset="1" Color="#FF000000"/>
+                                        </LinearGradientBrush>
+                                    </Border.Background>
+                                </Border>
+                                <Border BorderThickness="1"
+                                        BorderBrush="#1FFFFFFF"
+                                        CornerRadius="8"
+                                        IsHitTestVisible="False"/>
+                                <Canvas IsHitTestVisible="False">
+                                    <Ellipse x:Name="SpectrumThumb"
+                                             Width="20" Height="20"
+                                             Fill="Transparent"
+                                             Stroke="White"
+                                             StrokeThickness="3"/>
+                                </Canvas>
+                            </Grid>
+                        </Border>
+
+                        <!-- Hue track -->
+                        <Border x:Name="HueTrack"
+                                Width="360" Height="20"
+                                CornerRadius="10"
+                                ClipToBounds="True"
+                                PointerPressed="OnHuePointerPressed"
+                                PointerMoved="OnHuePointerMoved">
+                            <Border.Clip>
+                                <RectangleGeometry Rect="0,0,360,20" RadiusX="10" RadiusY="10"/>
+                            </Border.Clip>
+                            <Grid>
+                                <!-- No CornerRadius here: the outer Clip already rounds this
+                                     to the same radius, and two roundings that must agree to
+                                     the subpixel are what fringed the ends of the track. -->
+                                <Border>
+                                    <Border.Background>
+                                        <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,0%">
+                                            <GradientStop Offset="0.00" Color="#FFFF0000"/>
+                                            <GradientStop Offset="0.17" Color="#FFFFFF00"/>
+                                            <GradientStop Offset="0.33" Color="#FF00FF00"/>
+                                            <GradientStop Offset="0.50" Color="#FF00FFFF"/>
+                                            <GradientStop Offset="0.67" Color="#FF0000FF"/>
+                                            <GradientStop Offset="0.83" Color="#FFFF00FF"/>
+                                            <GradientStop Offset="1.00" Color="#FFFF0000"/>
+                                        </LinearGradientBrush>
+                                    </Border.Background>
+                                </Border>
+                                <Canvas IsHitTestVisible="False">
+                                    <Ellipse x:Name="HueThumb"
+                                             Width="18" Height="18"
+                                             Fill="White"
+                                             Stroke="#1A1A1A"
+                                             StrokeThickness="1"/>
+                                </Canvas>
+                            </Grid>
+                        </Border>
+
+                        <!-- Hex row with leading round swatch -->
+                        <Grid Width="360" Height="34" UseLayoutRounding="True">
+                            <Rectangle Fill="{DynamicResource SystemControlBackgroundAltHighBrush}"
+                                       RadiusX="17" RadiusY="17"/>
+                            <Grid ColumnDefinitions="Auto,*" Margin="8,5">
+                                <Border x:Name="HexRowSwatch"
+                                        Grid.Column="0"
+                                        Width="22" Height="22" CornerRadius="11"
+                                        VerticalAlignment="Center"
+                                        Margin="0,0,8,0"/>
+                                <TextBox x:Name="HexInput"
+                                         Classes="hex-input"
+                                         Grid.Column="1"
+                                         Watermark="#RRGGBB"
+                                         FontFamily="Consolas, Courier New, monospace"
+                                         FontWeight="Bold"
+                                         Background="Transparent"
+                                         BorderThickness="0"
+                                         Padding="0"
+                                         Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}"
+                                         FocusAdorner="{x:Null}"
+                                         VerticalContentAlignment="Center"/>
+                            </Grid>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+            </Flyout>
+        </Button.Flyout>
+    </Button>
+</UserControl>

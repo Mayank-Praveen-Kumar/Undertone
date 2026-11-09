@@ -1,0 +1,13 @@
+{
+  "id": "dev.undertone.plugins.kawarp",
+  "name": "Kawarp",
+  "version": "1.0.0",
+  "author": "Undertone",
+  "description": "A moving album-art background behind the lyrics.",
+  "type": "dotnet",
+  "entry": "Undertone.Plugins.Kawarp.dll",
+  "apiVersion": "1.0",
+  "minAppVersion": "1.5.3",
+  "platforms": ["windows", "macos", "linux"],
+  "permissions": []
+}

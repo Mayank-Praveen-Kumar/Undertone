@@ -1,0 +1,2176 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using Undertone.Helpers;
+using Undertone.Models;
+
+namespace Undertone.Services;
+
+/// <summary>
+/// TagLib#-based metadata reader. Extracts ID3v2, Vorbis, FLAC, and other tag formats.
+/// </summary>
+public class MetadataService : IMetadataService
+{
+    private static readonly Lazy<bool> FfprobeAvailable = new(() =>
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "ffprobe",
+                Arguments = "-version",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var proc = Process.Start(psi);
+            if (proc == null)
+                return false;
+
+            if (!proc.WaitForExit(1500))
+            {
+                try { proc.Kill(true); } catch { }
+                return false;
+            }
+
+            return proc.ExitCode == 0;
+        }
+        catch
+        {
+            return false;
+        }
+    });
+
+    /// <summary>
+    /// Audio file extensions we consider valid.
+    /// Includes lossless (FLAC, ALAC, AIFF, WAV, APE, WavPack),
+    /// lossy (MP3, AAC, OGG, Opus, WMA), and container formats (M4A, M4B, MP4, ASF).
+    /// .m4a can contain either AAC (lossy) or ALAC (lossless) — both are supported.
+    /// .m4b is the same MP4 container under Apple's audiobook name (usually AAC + chapters).
+    /// </summary>
+    public static readonly HashSet<string> SupportedExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".mp3", ".flac", ".ogg", ".oga", ".m4a", ".wav", ".wma", ".aac",
+        ".opus", ".aiff", ".aif", ".aifc", ".ape", ".wv", ".alac", ".mp4", ".m4b",
+        // ASF is the container behind .wma (TagLib reads/writes its tags natively;
+        // the bundled VLC ships an asf demuxer + WMA decoders in libavcodec).
+        // Like .mp4 above, a video-bearing .asf plays audio-only (--no-video).
+        ".asf",
+        // DSD: .dsf is read by TagLib; .dff is read by DsdiffReader (TagLib ships no
+        // DSDIFF parser). Both now surface in the library, but playback is not yet
+        // supported — the bundled VLC 3.x has no DSD demuxer/decoder.
+        ".dsf", ".dff"
+    };
+
+    public Track? ReadTrackMetadata(string filePath) => ReadTrackMetadata(filePath, out _);
+
+    /// <summary>
+    /// The record label alone — the same <see cref="ExtendedTagIO.ReadLabel"/> lookup
+    /// <see cref="ReadTrackMetadata(string)"/> fills <see cref="Track.Label"/> with, minus
+    /// everything else that read does. Owner 10-08: the v11 label backfill used the full read
+    /// and kept the music HDD busy at 50–75 MB/s every launch — audio properties, the ffprobe
+    /// fallback and the embedded cover bytes (11–15 MB per hi-res FLAC) for one text frame.
+    /// A plain FLAC is read block-header by block-header (<see cref="ExtendedTagIO.TryReadFlacLabel"/>):
+    /// TagLib# loads every FLAC metadata block, covers included, whatever the ReadStyle. Other
+    /// formats open with ReadStyle.None (no audio properties) | PictureLazy.
+    /// Empty when the file has no label or can't be read.
+    /// </summary>
+    public string ReadLabel(string filePath)
+    {
+        if (string.IsNullOrWhiteSpace(filePath) || filePath.IndexOfAny(Path.GetInvalidPathChars()) >= 0)
+            return string.Empty;
+        // DSDIFF has no TagLib reader; ReadDsdiffTrack never yields a label either.
+        if (Path.GetExtension(filePath).Equals(".dff", StringComparison.OrdinalIgnoreCase))
+            return string.Empty;
+        // FLAC: TagLib# reads every metadata block (covers included) whatever the ReadStyle,
+        // so read just the comment block; anything unusual falls through to TagLib below.
+        if (Path.GetExtension(filePath).Equals(".flac", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                if (ExtendedTagIO.TryReadFlacLabel(stream, out var flacLabel))
+                    return flacLabel;
+            }
+            catch (Exception)
+            {
+                // Locked or vanished: let the TagLib path decide, as before.
+            }
+        }
+        try
+        {
+            using var file = TagLib.File.Create(filePath, TagLib.ReadStyle.None | TagLib.ReadStyle.PictureLazy);
+            return ExtendedTagIO.ReadLabel(file);
+        }
+        catch (Exception)
+        {
+            return string.Empty;
+        }
+    }
+
+    /// <summary>The file's genres (<see cref="Track.Genre"/> form) without a full read: the
+    /// FLAC comment block alone, otherwise TagLib with lazy pictures, like <see cref="ReadLabel"/>.</summary>
+    public string ReadGenres(string filePath)
+    {
+        if (string.IsNullOrWhiteSpace(filePath) || filePath.IndexOfAny(Path.GetInvalidPathChars()) >= 0)
+            return string.Empty;
+        var ext = Path.GetExtension(filePath);
+        // DSDIFF has no TagLib reader; ReadDsdiffTrack never yields a genre either.
+        if (ext.Equals(".dff", StringComparison.OrdinalIgnoreCase))
+            return string.Empty;
+        if (ext.Equals(".flac", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                if (ExtendedTagIO.TryReadFlacGenres(stream, out var flacGenres))
+                    return flacGenres;
+            }
+            catch (Exception)
+            {
+                // Locked or vanished: let the TagLib path decide.
+            }
+        }
+        try
+        {
+            using var file = TagLib.File.Create(filePath, TagLib.ReadStyle.None | TagLib.ReadStyle.PictureLazy);
+            return Track.JoinGenres(file.Tag.Genres);
+        }
+        catch (Exception)
+        {
+            return string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// The ReplayGain tags alone, for the ReplayGain column's backfill (GitHub #151): the FLAC
+    /// comment block alone, otherwise TagLib with no audio properties and lazy pictures, like
+    /// <see cref="ReadLabel"/>. Null when the file can't be read (try again later);
+    /// <see cref="ReplayGainValues.None"/> when it has no ReplayGain tags.
+    /// </summary>
+    public ReplayGainValues? ReadReplayGain(string filePath) => ReplayGainTags.ReadFile(filePath);
+
+    public Track? ReadTrackMetadata(string filePath, out byte[]? embeddedArt)
+    {
+        embeddedArt = null;
+
+        if (string.IsNullOrWhiteSpace(filePath))
+            return null;
+
+        // Reject paths with invalid characters
+        if (filePath.IndexOfAny(Path.GetInvalidPathChars()) >= 0)
+            return null;
+
+        // Sanity cap only. This was 2 GB with the comment "unlikely to be audio", which
+        // silently excluded real content from the library with no message: a single-file
+        // DSD128 album rip, a long 24/192 live set, or a full-concert WAV all exceed it.
+        // 16 GB still catches a genuinely wrong file without excluding hi-res audio.
+        const long MaxAudioFileBytes = 16L * 1024 * 1024 * 1024;
+        try
+        {
+            var fi = new FileInfo(filePath);
+            if (fi.Length > MaxAudioFileBytes)
+            {
+                DebugLog.Write("Metadata",
+                    $"Skipped '{filePath}' — {fi.Length / (1024 * 1024)} MB exceeds the " +
+                    $"{MaxAudioFileBytes / (1024 * 1024 * 1024)} GB import cap.");
+                return null;
+            }
+        }
+        catch
+        {
+            return null;
+        }
+
+        // DSDIFF (.dff) has no TagLib reader, so it would throw below and be dropped.
+        // Parse its header directly so the file still lands in the library. (.dsf is
+        // a different DSD container that TagLib does handle, via the path below.)
+        if (Path.GetExtension(filePath).Equals(".dff", StringComparison.OrdinalIgnoreCase))
+            return ReadDsdiffTrack(filePath, out embeddedArt);
+
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                // PictureLazy: pictures load only when SelectBestEmbeddedPicture reads
+                // their bytes below, so a file whose art is not wanted (embedded artwork
+                // off) never materialises it.
+                using var file = TagLib.File.Create(filePath, TagLib.ReadStyle.Average | TagLib.ReadStyle.PictureLazy);
+                var fileInfo = new FileInfo(filePath);
+                return BuildTrack(file, filePath, fileInfo.Name, fileInfo.Length, fileInfo.LastWriteTimeUtc, localPath: filePath, out embeddedArt);
+            }
+            catch (Exception ex) when (IsFileBusy(ex) && attempt < ReadRetryDelaysMs.Length)
+            {
+                // Another program has the file open right now: a download or copy finishing,
+                // a tag editor saving, an antivirus or indexer scan. Giving up at once left a
+                // new song out of the scan (or the folder watcher's import) with nothing to
+                // bring it back before the next full scan, so a short hold is waited out.
+                Thread.Sleep(ReadRetryDelaysMs[attempt]);
+            }
+            catch (Exception ex)
+            {
+                // File is corrupted, unsupported, or still held after the waits — skip it
+                // (a scan records nothing for it, so the next pass reads it again).
+                if (IsFileBusy(ex))
+                    DebugLog.Write("Metadata", $"Skipped '{Path.GetFileName(filePath)}': still in use by "
+                        + $"another program after {ReadRetryDelaysMs.Sum()} ms");
+                else if (ex is not TagLib.CorruptFileException and not TagLib.UnsupportedFormatException)
+                    UnexpectedReadFailure.Note($"'{Path.GetFileName(filePath)}': {ex.GetType().Name}: {ex.Message}");
+                return null;
+            }
+        }
+    }
+
+    // Waits between tag-read attempts while another program holds the file (see ReadTrackMetadata).
+    private static readonly int[] ReadRetryDelaysMs = [50, 100, 200, 400, 800];
+
+    // A tag read that failed for a reason other than a corrupt or unsupported file drops the
+    // song just as silently; the first few per session are named with the exception.
+    private static readonly CappedBreadcrumb UnexpectedReadFailure =
+        new("Metadata", "tag read failed:", cap: 20, isEnabled: () => true);
+
+    /// <summary>
+    /// What reading a file another program has open throws: a sharing violation at the open
+    /// (a writer, or anything that opened it exclusively) or a lock violation on a locked
+    /// range. Windows names both by code, so a failing disk or a vanished share is not waited
+    /// on; elsewhere the only refusal is .NET's own share-mode lock, and any I/O error but a
+    /// missing file counts.
+    /// </summary>
+    private static bool IsFileBusy(Exception ex) => ex is IOException io && (OperatingSystem.IsWindows()
+        ? io.HResult is unchecked((int)0x80070020) or unchecked((int)0x80070021) // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+        : io is not FileNotFoundException and not DirectoryNotFoundException and not EndOfStreamException);
+
+    /// <summary>
+    /// Reads a scan entry: by path when the entry has one (the desktop path with its
+    /// ffprobe/ALAC/DSDIFF extras), otherwise through the entry's stream (Android SAF,
+    /// where TagLib.File.Create(path) has nothing to open).
+    /// </summary>
+    public Track? ReadTrackMetadata(ScanEntry entry, out byte[]? embeddedArt)
+    {
+        if (entry.LocalPath is { } local)
+            return ReadTrackMetadata(local, out embeddedArt);
+
+        embeddedArt = null;
+        var ext = Path.GetExtension(entry.Name);
+        // DSDIFF has no TagLib reader and the DsdiffReader path is file-based; not on Android in v1.
+        if (!SupportedExtensions.Contains(ext) || ext.Equals(".dff", StringComparison.OrdinalIgnoreCase))
+            return null;
+        try
+        {
+            using var abstraction = new StreamFileAbstraction(entry.Name, entry.OpenRead());
+            using var file = TagLib.File.Create(abstraction, null, TagLib.ReadStyle.Average | TagLib.ReadStyle.PictureLazy);
+            return BuildTrack(file, entry.Path, entry.Name, entry.Length, entry.LastWriteTimeUtc, localPath: null, out embeddedArt);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Read-only TagLib file abstraction over a caller-supplied seekable stream.</summary>
+    internal sealed class StreamFileAbstraction : TagLib.File.IFileAbstraction, IDisposable
+    {
+        private readonly Stream _stream;
+        public StreamFileAbstraction(string name, Stream stream) { Name = name; _stream = stream; }
+        public string Name { get; }
+        public Stream ReadStream => _stream;
+        public Stream WriteStream => throw new NotSupportedException("Scan entries are read-only.");
+        public void CloseStream(Stream stream) { /* owned here; disposed once in Dispose */ }
+        public void Dispose() => _stream.Dispose();
+    }
+
+    /// <summary>
+    /// Builds the Track from an opened TagLib file. <paramref name="localPath"/> is null
+    /// for stream-backed entries (Android SAF): those skip the path-only extras (ffprobe
+    /// metrics, folder-derived metadata) rather than throwing on a content:// string. The
+    /// ALAC atom is read from the entry's own stream instead: without it every ALAC on the
+    /// phone had no bit depth (TagLib# gives none for ALAC, and the path read failed on the
+    /// content:// name), so a 24-bit file read as "48 kHz ALAC" and a 96 kHz one as 48 kHz.
+    /// </summary>
+    private Track? BuildTrack(TagLib.File file, string filePath, string fileName, long length, DateTime lastWriteUtc,
+        string? localPath, out byte[]? embeddedArt)
+    {
+        embeddedArt = null;
+        var tag = file.Tag;
+        var props = file.Properties;
+        var ext = Path.GetExtension(fileName).ToLowerInvariant();
+
+        var codec = DetermineCodec(file, ext);
+        var sampleRate = NormalizeSampleRate(props.AudioSampleRate);
+        // ALAC: the decoder config atom is the authority for bit depth AND sample rate (see
+        // ResolveAlacSampleRate). Read once here: from the path, or from the stream TagLib read.
+        var alacConfig = !IsAlacContainer(ext, codec) ? (BitDepth: 0, SampleRate: 0)
+            : localPath != null ? TryReadAlacConfigFromFile(localPath)
+            : TryReadAlacConfig(file.FileAbstraction.ReadStream);
+        var bitsPerSample = NormalizeBitsPerSample(props.BitsPerSample, file, ext, sampleRate, codec, alacConfig.BitDepth);
+        sampleRate = ResolveAlacSampleRate(sampleRate, alacConfig.SampleRate);
+        var bitrate = NormalizeBitrate(props.AudioBitrate, length, props.Duration);
+
+        var duration = props.Duration;
+        if (localPath != null && NeedsFfprobeFallback(sampleRate, bitsPerSample, bitrate, duration, IsLosslessFormat(codec ?? string.Empty, ext)))
+            TryPopulateAudioMetricsWithFfprobe(localPath, ref sampleRate, ref bitsPerSample, ref bitrate, ref duration);
+        if (localPath != null)
+            ApplyCountedMp3Length(localPath, ext, ref bitrate, ref duration);
+
+        // Preserve all credited performers so featured artists show in track rows.
+        var artist = FirstNonEmpty(JoinTagValues(tag.Performers), tag.FirstPerformer, tag.FirstAlbumArtist, "Unknown Artist");
+        // Resolve the album-artist used for grouping/display. A compilation with no
+        // explicit album-artist tag is filed under "Various Artists" so the release
+        // stays as one album instead of fragmenting into one album per performer.
+        var isCompilation = ExtendedTagIO.ReadIsCompilation(file);
+        var explicitAlbumArtist = JoinTagValues(tag.AlbumArtists);
+        if (string.IsNullOrWhiteSpace(explicitAlbumArtist))
+            explicitAlbumArtist = tag.FirstAlbumArtist ?? string.Empty;
+        var albumArtist = Track.ResolveAlbumArtist(explicitAlbumArtist, tag.FirstPerformer, isCompilation);
+        var riff = ReadRiffInfoFallback(file);
+        var album = FirstNonEmpty(tag.Album, riff.Album, "Unknown Album");
+        var title = string.IsNullOrWhiteSpace(tag.Title)
+            ? Path.GetFileNameWithoutExtension(fileName)
+            : tag.Title;
+
+        // Merge featured artists from title into artist field when Performers tag is incomplete
+        artist = EnrichArtistFromTitle(artist, title);
+
+        var embeddedLyrics = EmbeddedLyrics.Read(file);
+        var track = new Track
+        {
+            FilePath = filePath,
+            Title = title,
+            Artist = artist,
+            AlbumArtist = albumArtist,
+            Album = album,
+            Genre = Track.JoinGenres(tag.Genres), // every genre, not just the first (GitHub #123 follow-up)
+            TrackNumber = (int)tag.Track,
+            TrackCount = (int)tag.TrackCount,
+            DiscNumber = tag.Disc > 0 ? (int)tag.Disc : 1,
+            DiscCount = tag.DiscCount > 0 ? (int)tag.DiscCount : 1,
+            Bpm = (int)tag.BeatsPerMinute,
+            MusicalKey = ReadMusicalKey(file),
+            Year = tag.Year > 0 ? (int)tag.Year : riff.Year,
+            Duration = duration,
+            AlbumId = Track.ComputeAlbumId(albumArtist, album),
+            FileSize = length,
+            LastModified = lastWriteUtc,
+            DateAdded = DateTime.UtcNow,
+            IsExplicit = DetectExplicit(file),
+            Composer = tag.FirstComposer ?? string.Empty,
+            // USLT / LYRICS / ©lyr, then the UNSYNCEDLYRICS-style aliases other taggers write (#135).
+            Lyrics = embeddedLyrics.Text,
+            Comment = tag.Comment ?? string.Empty,
+            Copyright = ReadCopyright(file),
+            Label = ExtendedTagIO.ReadLabel(file),
+            ReleaseDate = FirstNonEmpty(ReadReleaseDate(file, tag), riff.ReleaseDate),
+            IsCompilation = isCompilation,
+            Grouping = tag.Grouping ?? string.Empty,
+            ShowComposerInAllViews = ExtendedTagIO.ReadShowComposer(file),
+            UseWorkAndMovement = ExtendedTagIO.ReadUseWorkAndMovement(file),
+            WorkName = ExtendedTagIO.ReadWorkName(file),
+            MovementName = ExtendedTagIO.ReadMovementName(file),
+            MovementNumber = ExtendedTagIO.ReadMovementNumber(file),
+            MovementCount = ExtendedTagIO.ReadMovementCount(file),
+            Rating = ExtendedTagIO.ReadRating(file),
+            IsDisliked = ExtendedTagIO.ReadIsDisliked(file),
+            // Audio quality properties
+            Bitrate = bitrate,
+            SampleRate = sampleRate,
+            BitsPerSample = bitsPerSample,
+            Codec = codec ?? string.Empty
+        };
+
+        PopulateReleaseType(track, file);
+        // From the tags already parsed: the Songs list's ReplayGain column (GitHub #151).
+        track.ApplyReplayGain(ReplayGainTags.Read(file));
+
+        // Timed lyrics kept apart from the text field (SYLT, SYNCEDLYRICS) are the file's own
+        // and win over a stored online result (#135). Left unassigned when the file has none,
+        // so a rescan keeps synced lyrics saved for the song earlier.
+        if (!string.IsNullOrWhiteSpace(embeddedLyrics.Synced))
+            track.SyncedLyrics = embeddedLyrics.Synced;
+
+        // Untagged files (iTunes WAV rips most notably) fall back to the folder
+        // structure for artist/album and the "NN " filename prefix for the track
+        // number, instead of all merging into the shared Unknown-Album bucket.
+        // No-op when the tags are real. Path-based (folder structure), so it only
+        // runs for entries reachable by path.
+        if (localPath != null)
+            Helpers.FolderMetadata.TryApplyToTrack(track, MusicRootFolders);
+
+        // Pull the embedded cover from the already-parsed tag (no extra I/O) so a
+        // scan can cache album art inline instead of re-opening every file later.
+        embeddedArt = UseEmbeddedArtwork ? SelectBestEmbeddedPicture(file.Tag.Pictures) : null;
+
+        return track;
+    }
+
+    /// <summary>
+    /// Builds a Track for a DSDIFF (.dff) file via <see cref="DsdiffReader"/>, since
+    /// TagLib# cannot open that container. Returns null when the file isn't a readable
+    /// DSDIFF, so the scan skips it exactly as it did before DSD support.
+    /// </summary>
+    private Track? ReadDsdiffTrack(string filePath, out byte[]? embeddedArt)
+    {
+        embeddedArt = null;
+        try
+        {
+            using var stream = File.OpenRead(filePath);
+            var info = DsdiffReader.TryRead(stream);
+            if (info == null)
+                return null;
+
+            var fileInfo = new FileInfo(filePath);
+            var artist = string.IsNullOrWhiteSpace(info.Artist) ? "Unknown Artist" : info.Artist!;
+            const string album = "Unknown Album";
+            var title = string.IsNullOrWhiteSpace(info.Title)
+                ? Path.GetFileNameWithoutExtension(filePath)
+                : info.Title!;
+
+            var track = new Track
+            {
+                FilePath = filePath,
+                Title = title,
+                Artist = artist,
+                AlbumArtist = artist,
+                Album = album,
+                Duration = info.Duration,
+                AlbumId = Track.ComputeAlbumId(artist, album),
+                FileSize = fileInfo.Length,
+                LastModified = fileInfo.LastWriteTimeUtc,
+                DateAdded = DateTime.UtcNow,
+                SampleRate = info.SampleRate,
+                BitsPerSample = 1,                 // DSD is a 1-bit format
+                Bitrate = NormalizeBitrate(0, fileInfo.Length, info.Duration),
+                Codec = "DSD"
+            };
+            // Same folder/filename fallback as the TagLib path above.
+            Helpers.FolderMetadata.TryApplyToTrack(track, MusicRootFolders);
+            // DSDIFF carries no ReplayGain we read: nothing for the backfill to look up.
+            track.ReplayGainChecked = true;
+            return track;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public byte[]? ExtractEmbeddedArt(string filePath)
+    {
+        if (!UseEmbeddedArtwork) return null;
+        try
+        {
+            using var file = TagLib.File.Create(filePath);
+            return SelectBestEmbeddedPicture(file.Tag.Pictures);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public byte[]? ExtractAlbumArt(string filePath)
+    {
+        // 1. Try embedded artwork first (most reliable), unless disabled in Settings.
+        // Prefer FrontCover if present; within each bucket pick largest payload.
+        var namesAnAlbum = false;
+        try
+        {
+            using var file = TagLib.File.Create(filePath);
+            if (UseEmbeddedArtwork)
+            {
+                var bestEmbedded = SelectBestEmbeddedPicture(file.Tag.Pictures);
+                if (bestEmbedded != null)
+                    return bestEmbedded;
+            }
+            namesAnAlbum = Track.IsRealAlbumName(file.Tag.Album);
+        }
+        catch
+        {
+            // Fall through to folder-level search
+        }
+
+        // A file without a real album name is filed under the library-wide "Unknown
+        // Album" bucket (Track.UnknownAlbumBucketId), which is shared by every such
+        // file from every folder — so a cover picked up below would be stamped on all
+        // of them and stick. That is how a loose file dropped from some album's folder
+        // ended up wearing that album's cover. Note IsRealAlbumName, not a null check:
+        // files tagged with a literal "Unknown Album" (other tools export exactly
+        // that) land in the same shared bucket as untagged ones.
+        // Folder art only identifies an album when the track actually claims one.
+        if (!namesAnAlbum)
+            return null;
+
+        // 2. Fall back to artwork files in the same directory.
+        return TryReadFolderArt(Path.GetDirectoryName(filePath));
+    }
+
+    /// <summary>
+    /// Reads the best cover image sitting directly in <paramref name="directory"/>
+    /// (cover/folder/album/front/art/artwork.*), or null when there is none.
+    /// Keeps preferred names order, but chooses the largest file among matches.
+    /// <para>
+    /// Separate from <see cref="ExtractAlbumArt"/> so the drop import can still recover
+    /// a dropped album folder's cover after its audio has been relocated into the
+    /// managed library root — the source file is gone by then, its folder is not.
+    /// Callers own the attribution check: only pass a directory whose cover belongs to
+    /// the album being filled in.
+    /// </para>
+    /// </summary>
+    public static byte[]? TryReadFolderArt(string? directory)
+    {
+        try
+        {
+            var bestFile = TryGetFolderArtFile(directory);
+            if (bestFile != null && bestFile.Exists)
+                return File.ReadAllBytes(bestFile.FullName);
+        }
+        catch
+        {
+            // Non-critical — return null
+        }
+
+        return null;
+    }
+
+    private static readonly string[] FolderArtNames = { "cover", "folder", "album", "front", "art", "artwork" };
+    private static readonly string[] FolderArtExtensions = { ".jpg", ".jpeg", ".png", ".bmp", ".webp" };
+
+    /// <summary>
+    /// True when <paramref name="path"/> is named like a folder cover (cover/folder/album/
+    /// front/art/artwork + image extension). Lets the folder watcher react to a replaced
+    /// cover image without treating every image in the tree as library-relevant.
+    /// </summary>
+    public static bool IsFolderArtCandidate(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        var ext = Path.GetExtension(path);
+        if (!FolderArtExtensions.Contains(ext, StringComparer.OrdinalIgnoreCase)) return false;
+        var name = Path.GetFileNameWithoutExtension(path);
+        return FolderArtNames.Contains(name, StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// The folder cover image <see cref="TryReadFolderArt"/> would pick for
+    /// <paramref name="directory"/> (largest of the recognised names), without reading it.
+    /// Null when the folder has none. Used to compare the image's mtime against the
+    /// cached album cover so a replaced cover.jpg is re-extracted on the next scan.
+    /// </summary>
+    public static FileInfo? TryGetFolderArtFile(string? directory)
+    {
+        if (string.IsNullOrWhiteSpace(directory)) return null;
+        try
+        {
+            // One listing matched case-insensitively: probing exact lower-case names with
+            // File.Exists missed Folder.jpg / Cover.JPG on case-sensitive file systems (Linux).
+            var found = Directory.EnumerateFiles(directory).Where(IsFolderArtCandidate).ToList();
+            var candidates = new List<FileInfo>();
+            foreach (var name in FolderArtNames)
+            {
+                foreach (var ext in FolderArtExtensions)
+                {
+                    foreach (var artPath in found)
+                    {
+                        if (string.Equals(Path.GetFileName(artPath), name + ext, StringComparison.OrdinalIgnoreCase))
+                            candidates.Add(new FileInfo(artPath));
+                    }
+                }
+            }
+
+            return candidates
+                .OrderByDescending(f => f.Length)
+                .FirstOrDefault();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static byte[]? SelectBestEmbeddedPicture(TagLib.IPicture[]? pictures)
+    {
+        if (pictures == null || pictures.Length == 0)
+            return null;
+
+        TagLib.IPicture? bestFrontCover = null;
+        TagLib.IPicture? bestAny = null;
+        var bestFrontCoverBytes = -1;
+        var bestAnyBytes = -1;
+
+        foreach (var picture in pictures)
+        {
+            var bytes = picture?.Data?.Data;
+            if (bytes == null || bytes.Length == 0)
+                continue;
+
+            if (bytes.Length > bestAnyBytes)
+            {
+                bestAny = picture;
+                bestAnyBytes = bytes.Length;
+            }
+
+            if (picture!.Type == TagLib.PictureType.FrontCover && bytes.Length > bestFrontCoverBytes)
+            {
+                bestFrontCover = picture;
+                bestFrontCoverBytes = bytes.Length;
+            }
+        }
+
+        return bestFrontCover?.Data?.Data ?? bestAny?.Data?.Data;
+    }
+
+    public bool WriteTrackMetadata(Track track) => WriteTrackMetadata(track, track.FilePath, null);
+
+    public bool WriteTrackMetadata(Track track, bool genreEdited)
+        => WriteTrackMetadataCore(track, track.FilePath, null, genreEdited);
+
+    public bool WriteTrackMetadata(Track track, string targetFilePath, string? titleOverride = null)
+        => WriteTrackMetadataCore(track, targetFilePath, titleOverride, genreEdited: false);
+
+    private bool WriteTrackMetadataCore(Track track, string targetFilePath, string? titleOverride, bool genreEdited)
+    {
+        return SaveTagsAtomically(targetFilePath, file =>
+        {
+            var tag = file.Tag;
+
+            tag.Title = string.IsNullOrEmpty(titleOverride) ? track.Title : titleOverride;
+            tag.Performers = SplitArtistList(track.Artist);
+            tag.AlbumArtists = SplitArtistList(track.AlbumArtist);
+            tag.Album = track.Album;
+            // The model holds every genre joined with "; " (GitHub #123 follow-up, 2026-10-10);
+            // each one is written as its own value. Rewritten only when the list changed, so an
+            // ordinary save leaves the file's genre field exactly as it was. Outside an editor
+            // genre edit, a row holding only some of the file's genres (one read before
+            // multi-genre support keeps just the first) must not shrink the file's list: a
+            // lyrics or rating save would silently drop the rest.
+            var newGenres = Track.SplitGenres(track.Genre);
+            var fileGenres = Track.SplitGenres(Track.JoinGenres(tag.Genres));
+            var wouldOnlyDropGenres = !genreEdited && fileGenres.Length > newGenres.Length
+                                      && newGenres.All(g => fileGenres.Contains(g, StringComparer.OrdinalIgnoreCase));
+            if (!newGenres.SequenceEqual(fileGenres, StringComparer.Ordinal) && !wouldOnlyDropGenres)
+                tag.Genres = newGenres;
+            tag.Track = (uint)Math.Max(0, track.TrackNumber);
+            tag.TrackCount = (uint)Math.Max(0, track.TrackCount);
+            tag.Disc = (uint)Math.Max(0, track.DiscNumber);
+            tag.DiscCount = (uint)Math.Max(0, track.DiscCount);
+            tag.BeatsPerMinute = (uint)Math.Max(0, track.Bpm);
+            // Year 0 means "unknown", not "erase": a track read before Undertone found the
+            // file's date (a WAV's full ICRD date read as 0 up to 1.5.6) had every lyrics,
+            // rating or tag save empty the date frames in the file (Discord Tangent, "album
+            // dates going missing"). Clearing a year on purpose goes through ClearYear.
+            if (track.Year > 0)
+            {
+                tag.Year = (uint)track.Year;
+                // TagLib's Year setter stamps a bare "2004" into the very frame the full
+                // release date lives in (TDRC / DATE / ©day), so an unrelated save used to
+                // shrink "2004-02-10" to the year. Put the full date back when it agrees
+                // with the year being written.
+                WriteFullReleaseDate(file, track.ReleaseDate, track.Year);
+            }
+            tag.Composers = string.IsNullOrWhiteSpace(track.Composer) ? Array.Empty<string>() : new[] { track.Composer };
+            // Only a real lyrics change reaches the file (#135): the row's plain text is the
+            // file's lyrics with their timestamps stripped when those are LRC (Edit Info shows
+            // them so), and rewriting it put plain text over timed lyrics in the tag on any
+            // unrelated save, such as a title fix. Alias fields (UNSYNCEDLYRICS, …) count too.
+            // The main field alone counts as unchanged too: a row scanned before every LYRICS
+            // comment was read (#149) holds the first one, and writing it back dropped the rest.
+            if (!PlainLyricsMatch(EmbeddedLyrics.ReadText(file), track.Lyrics, track.SyncedLyrics)
+                && !PlainLyricsMatch(MainLyricsField(file), track.Lyrics, track.SyncedLyrics))
+                WritePlainLyrics(file, track.Lyrics);
+            tag.Comment = string.IsNullOrWhiteSpace(track.Comment) ? null : track.Comment;
+            tag.Grouping = string.IsNullOrWhiteSpace(track.Grouping) ? null : track.Grouping;
+            tag.Copyright = string.IsNullOrWhiteSpace(track.Copyright) ? null : track.Copyright;
+
+            ExtendedTagIO.WriteIsCompilation(file, track.IsCompilation);
+            ExtendedTagIO.WriteReleaseTypeOverride(file, track.IsReleaseTypeOverridden ? track.ReleaseType : null);
+            ExtendedTagIO.WriteShowComposer(file, track.ShowComposerInAllViews);
+            ExtendedTagIO.WriteUseWorkAndMovement(file, track.UseWorkAndMovement);
+            ExtendedTagIO.WriteWorkName(file, track.WorkName);
+            ExtendedTagIO.WriteMovementName(file, track.MovementName);
+            ExtendedTagIO.WriteMovementNumber(file, track.MovementNumber);
+            ExtendedTagIO.WriteMovementCount(file, track.MovementCount);
+            ExtendedTagIO.WriteRating(file, track.Rating);
+            ExtendedTagIO.WriteIsDisliked(file, track.IsDisliked);
+        });
+    }
+
+    /// <summary>The row's plain lyrics say what the file's lyrics text says: equal, or equal once
+    /// the file's LRC stamps are stripped (how the row and Edit Info hold timed tag lyrics), or the
+    /// file's text is the row's synced lyrics (saved inside the file, GitHub #135: the text field
+    /// holds the synced text, and the row's own plain text has no field of its own there).</summary>
+    internal static bool PlainLyricsMatch(string fileText, string? rowText, string? rowSynced = null)
+    {
+        var file = EmbeddedLyrics.Normalize(fileText);
+        var row = EmbeddedLyrics.Normalize(rowText);
+        if (file == row) return true;
+        if (!LyricsTextHelper.ContainsTimestamps(file)) return false;
+        if (file == EmbeddedLyrics.Normalize(rowSynced)) return true;
+        return !LyricsTextHelper.ContainsTimestamps(row)
+            && EmbeddedLyrics.Normalize(LyricsTextHelper.StripTimestamps(file)).Trim() == row.Trim();
+    }
+
+    /// <summary>The plain-lyrics write <see cref="WriteTrackMetadata(Track)"/> has always done (text field
+    /// only, timed fields untouched). New text also replaces the UNSYNCEDLYRICS-style aliases, which
+    /// would otherwise keep the old text readable. An empty row clears only the main field, as
+    /// before: a row scanned before aliases were read is empty while its file is not, and an
+    /// unrelated save must not erase lyrics the app never showed (removals go through WriteLyrics).</summary>
+    private static string MainLyricsField(TagLib.File file)
+    {
+        try { return file.Tag.Lyrics ?? string.Empty; } catch { return string.Empty; }
+    }
+
+    private static void WritePlainLyrics(TagLib.File file, string? plain)
+    {
+        var value = string.IsNullOrWhiteSpace(plain) ? null : plain;
+        file.Tag.Lyrics = value;
+        if (value == null) return;
+        EmbeddedLyrics.RemoveAliases(file, synced: false);
+    }
+
+    public bool WriteLyrics(string filePath, string? plain, string? synced, Func<EmbeddedLyricsText, bool>? onlyIf = null)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath)) return false;
+            if ((File.GetAttributes(filePath) & FileAttributes.ReadOnly) != 0)
+            {
+                DebugLog.Write("Metadata", $"Lyrics not written, read-only file: '{filePath}'");
+                return false;
+            }
+            // Read first: an approval check needs the current lyrics, and a file that already
+            // holds these lyrics is not copied and rewritten for nothing.
+            var current = EmbeddedLyrics.ReadFile(filePath);
+            if (onlyIf != null && !onlyIf(current)) return false;
+            if (EmbeddedLyrics.Holds(current, plain, synced)) return true;
+            return SaveTagsAtomically(filePath, file => EmbeddedLyrics.Write(file, plain, synced));
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Write("Metadata", $"Lyrics write failed for '{filePath}': {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Applies tag edits and saves them without ever rewriting the target file in
+    /// place on macOS/Linux. TagLib's <c>file.Save()</c> mutates the file on disk;
+    /// on Unix there is no mandatory file lock, so doing that to the track the audio
+    /// player is currently streaming corrupts its open read and drops the sound while
+    /// the position clock keeps ticking (the macOS "audio silently stops on save" bug).
+    /// Writing to a same-directory copy and atomically renaming it over the original
+    /// leaves the player's open file descriptor pointing at the untouched original
+    /// inode, so playback is undisturbed and the new tags take effect on next load.
+    /// Windows takes the same path (crash safety); there the rename over the playing
+    /// file needs POSIX semantics or the player letting go of it (see <see cref="ReplaceWithCopy"/>).
+    /// </summary>
+    private static bool SaveTagsAtomically(string targetFilePath, Action<TagLib.File> applyTags)
+        => SaveTagsAtomically(targetFilePath, applyTags, out _);
+
+    /// <inheritdoc cref="SaveTagsAtomically(string, Action{TagLib.File})"/>
+    /// <param name="error">
+    /// Human-readable reason the save failed, or null on success. Callers surface this
+    /// instead of silently reporting success — the old blanket <c>catch { return false; }</c>
+    /// combined with every caller discarding the bool meant editing the currently-playing
+    /// track (whose handle libVLC holds) closed the dialog cleanly, showed the new tags,
+    /// and left the file untouched until the next rescan reverted the edit.
+    /// </param>
+    private static bool SaveTagsAtomically(string targetFilePath, Action<TagLib.File> applyTags, out string? error)
+    {
+        error = null;
+        try
+        {
+            SaveTagsAtomicallyOrThrow(targetFilePath, applyTags);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            DebugLog.Write("Metadata", $"Tag save failed for '{targetFilePath}': {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The temp-copy + atomic-rename save behind <see cref="SaveTagsAtomically(string, Action{TagLib.File})"/>,
+    /// throwing on failure (after removing the temp copy) so callers that retry on a
+    /// transient <see cref="IOException"/> — the ReplayGain scanner — can tell it apart.
+    /// <paramref name="releaseOpenFile"/> false never has the player let go of the file (see
+    /// <see cref="ReplaceWithCopy"/>): a background write must not put a gap in the music.
+    /// </summary>
+    internal static void SaveTagsAtomicallyOrThrow(string targetFilePath, Action<TagLib.File> applyTags,
+        bool releaseOpenFile = true)
+    {
+        // Same directory keeps the rename on one filesystem (so it is atomic); the
+        // leading dot hides the transient file; the original extension is preserved
+        // so TagLib still detects the format from the work copy.
+        //
+        // This path is now used on Windows too. The old Windows branch called
+        // file.Save() directly on the target: a crash, power loss or full disk midway
+        // through TagLib's rewrite left the user's audio file corrupt with no backup,
+        // and there was no recovery path at all. Copy-then-rename costs one file copy
+        // and makes the write crash-safe on every platform.
+        var dir = Path.GetDirectoryName(targetFilePath);
+        if (string.IsNullOrEmpty(dir)) dir = ".";
+        var tempPath = Path.Combine(dir, $".undertone-{Guid.NewGuid():N}{Path.GetExtension(targetFilePath)}");
+        try
+        {
+            File.Copy(targetFilePath, tempPath, overwrite: true);
+
+            // Preserve the original's permission bits: File.Copy creates the temp with
+            // the default umask, and the rename then replaces the inode — so without
+            // this a shared/NAS library quietly became unreadable to other users after
+            // the first rating or tag edit.
+            TryCopyUnixFileMode(targetFilePath, tempPath);
+
+            using (var file = TagLib.File.Create(tempPath))
+            {
+                applyTags(file);
+                file.Save();
+            }
+            ReplaceWithCopy(tempPath, targetFilePath, releaseOpenFile);
+        }
+        catch
+        {
+            try
+            {
+                if (File.Exists(tempPath))
+                {
+                    // File.Copy carries a read-only original's attribute over to the copy,
+                    // and File.Delete refuses a read-only file: every failed save of a
+                    // read-only track left a full .undertone-* copy beside it.
+                    File.SetAttributes(tempPath, FileAttributes.Normal);
+                    File.Delete(tempPath);
+                }
+            }
+            catch { }
+            throw;
+        }
+    }
+
+    // Waits between rename attempts once the first one was refused: covers handles that
+    // close on their own (a waveform or BPM decode, an antivirus scan of the fresh copy)
+    // and a released holder whose handle closes a moment late (an ffmpeg being killed).
+    private static readonly int[] ReplaceRetryDelaysMs = [50, 100, 200, 400, 800];
+
+    /// <summary>Test seam: skip the POSIX rename, so a test reaches the release fallback on NTFS.</summary>
+    internal static bool PosixReplaceDisabled { get; set; }
+
+    /// <summary>
+    /// Renames the tagged copy over the original. Windows refuses to replace a file while
+    /// any handle on it is open (also one shared for delete: MoveFileEx is no POSIX rename),
+    /// and LibVLC keeps the playing and the staged next track open, so every save of the
+    /// playing track failed with "Access to the path is denied" (live, 10-13).
+    /// A refused rename is retried with POSIX semantics first: LibVLC's handle shares
+    /// delete, so on NTFS the new file takes the name while the player keeps reading the
+    /// old data, untouched, exactly as on macOS/Linux. Where that is refused too (FAT,
+    /// exFAT, network shares; a reader not sharing delete, like the side decode's ffmpeg)
+    /// the registered holders (<see cref="OpenFileHolders"/>) let go of the file, the rename
+    /// is retried briefly, and the holders open it again where they were.
+    /// </summary>
+    private static void ReplaceWithCopy(string tempPath, string targetFilePath, bool releaseOpenFile)
+    {
+        try
+        {
+            File.Move(tempPath, targetFilePath, overwrite: true);
+            return;
+        }
+        catch (Exception ex) when (IsFileInUse(ex))
+        {
+            if (OperatingSystem.IsWindows() && !PosixReplaceDisabled)
+            {
+                if (WindowsPosixRename.TryReplace(tempPath, targetFilePath, out var error))
+                    return;
+                DebugLog.Write("Metadata", $"POSIX replace of '{Path.GetFileName(targetFilePath)}' refused: "
+                    + WindowsPosixRename.Describe(error));
+            }
+            DebugLog.Write("Metadata", $"Replace of '{Path.GetFileName(targetFilePath)}' refused ({ex.Message}), retrying"
+                + (releaseOpenFile ? " with the file released" : ""));
+        }
+
+        if (releaseOpenFile)
+            OpenFileHolders.RunReleased(targetFilePath, () => MoveWithRetries(tempPath, targetFilePath));
+        else
+            MoveWithRetries(tempPath, targetFilePath);
+    }
+
+    private static void MoveWithRetries(string tempPath, string targetFilePath)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                File.Move(tempPath, targetFilePath, overwrite: true);
+                return;
+            }
+            catch (Exception ex) when (IsFileInUse(ex) && attempt < ReplaceRetryDelaysMs.Length)
+            {
+                Thread.Sleep(ReplaceRetryDelaysMs[attempt]);
+            }
+        }
+    }
+
+    /// <summary>What a rename over a file something has open throws: access denied, or a
+    /// sharing violation. A missing file or folder is not worth a retry.</summary>
+    private static bool IsFileInUse(Exception ex) =>
+        ex is UnauthorizedAccessException ||
+        (ex is IOException && ex is not FileNotFoundException && ex is not DirectoryNotFoundException);
+
+    /// <summary>Copies Unix mode bits from source to destination. No-op on Windows.</summary>
+    private static void TryCopyUnixFileMode(string source, string destination)
+    {
+        if (OperatingSystem.IsWindows()) return;
+        try { File.SetUnixFileMode(destination, File.GetUnixFileMode(source)); }
+        catch { /* filesystem may not support Unix modes */ }
+    }
+
+    // Both writers go through SaveTagsAtomically: an in-place file.Save() on
+    // macOS/Linux corrupts the player's open read of the file being tagged
+    // (the "audio silently stops on save" bug), and ratings/artwork are often
+    // written for the currently-playing track.
+    /// <summary>
+    /// Writes the Advanced Details field set through the crash-safe atomic path instead
+    /// of AdvancedTagIO's own in-place <c>file.Save()</c>.
+    /// </summary>
+    bool IMetadataService.WriteAdvancedFields(string filePath, AdvancedTagIO.AdvancedFields fields,
+        AdvancedTagIO.AdvancedFields original)
+    {
+        return SaveTagsAtomically(filePath, file => AdvancedTagIO.ApplyAll(file, fields, original));
+    }
+
+    public bool WriteAdvisory(string filePath, int advisory)
+    {
+        return SaveTagsAtomically(filePath, file => AdvancedTagIO.WriteAdvisory(file, advisory));
+    }
+
+    public bool ClearYear(string filePath)
+    {
+        return SaveTagsAtomically(filePath, file => file.Tag.Year = 0);
+    }
+
+    public bool WriteRating(string filePath, int rating, bool isDisliked)
+    {
+        return SaveTagsAtomically(filePath, file =>
+        {
+            ExtendedTagIO.WriteRating(file, rating);
+            ExtendedTagIO.WriteIsDisliked(file, isDisliked);
+        });
+    }
+
+    public bool WriteAlbumArt(string filePath, byte[]? imageData)
+    {
+        return SaveTagsAtomically(filePath, file =>
+        {
+            // Only front-cover-ish pictures (FrontCover, plus the ambiguous Other
+            // that many taggers use for the cover) are replaced/removed; back
+            // covers, booklets and artist images embedded in the file survive.
+            static bool IsCover(TagLib.IPicture p) =>
+                p.Type is TagLib.PictureType.FrontCover or TagLib.PictureType.Other;
+
+            var kept = file.Tag.Pictures.Where(p => !IsCover(p));
+
+            if (imageData == null || imageData.Length == 0)
+            {
+                file.Tag.Pictures = kept.ToArray();
+                return;
+            }
+
+            // Detect MIME type from image header bytes
+            var mimeType = "image/jpeg";
+            if (imageData.Length >= 4 &&
+                imageData[0] == 0x89 && imageData[1] == 0x50 &&
+                imageData[2] == 0x4E && imageData[3] == 0x47)
+            {
+                mimeType = "image/png";
+            }
+
+            var pic = new TagLib.Picture(new TagLib.ByteVector(imageData))
+            {
+                Type = TagLib.PictureType.FrontCover,
+                MimeType = mimeType
+            };
+            // New front cover first — players typically use the first picture.
+            file.Tag.Pictures = kept.Prepend(pic).ToArray();
+        });
+    }
+
+    public AudioFileInfo? ReadFileInfo(string filePath)
+    {
+        try
+        {
+            // Properties only: never load the embedded pictures.
+            using var file = TagLib.File.Create(filePath, TagLib.ReadStyle.Average | TagLib.ReadStyle.PictureLazy);
+            var props = file.Properties;
+            var fileInfo = new FileInfo(filePath);
+            var ext = Path.GetExtension(filePath).ToLowerInvariant();
+
+            var codec = DetermineCodec(file, ext);
+            var sampleRate = NormalizeSampleRate(props.AudioSampleRate);
+            // ALAC: the decoder config atom is the authority (see ResolveAlacSampleRate); read once.
+            var alacConfig = IsAlacContainer(ext, codec) ? TryReadAlacConfigFromFile(filePath) : (BitDepth: 0, SampleRate: 0);
+            var bitsPerSample = NormalizeBitsPerSample(props.BitsPerSample, file, ext, sampleRate, codec, alacConfig.BitDepth);
+            sampleRate = ResolveAlacSampleRate(sampleRate, alacConfig.SampleRate);
+            var isLossless = IsLosslessFormat(codec, ext);
+            var bitrate = NormalizeBitrate(props.AudioBitrate, fileInfo.Length, props.Duration);
+
+            var duration = props.Duration;
+            if (NeedsFfprobeFallback(sampleRate, bitsPerSample, bitrate, duration, isLossless))
+                TryPopulateAudioMetricsWithFfprobe(filePath, ref sampleRate, ref bitsPerSample, ref bitrate, ref duration);
+            ApplyCountedMp3Length(filePath, ext, ref bitrate, ref duration);
+
+            return new AudioFileInfo
+            {
+                FileName = Path.GetFileName(filePath),
+                FilePath = filePath,
+                FileFormat = GetFileFormat(ext),
+                Codec = codec ?? string.Empty,
+                IsLossless = isLossless,
+                Bitrate = bitrate,
+                SampleRate = sampleRate,
+                BitsPerSample = bitsPerSample,
+                Channels = props.AudioChannels,
+                ChannelDescription = props.AudioChannels switch
+                {
+                    1 => "Mono",
+                    2 => "Stereo",
+                    6 => "5.1 Surround",
+                    8 => "7.1 Surround",
+                    _ => $"{props.AudioChannels} channels"
+                },
+                Duration = duration,
+                FileSize = fileInfo.Length,
+                DateModified = fileInfo.LastWriteTime,
+                DateAdded = fileInfo.CreationTime,
+                Genre = Track.JoinGenres(file.Tag.Genres),
+            };
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static int NormalizeSampleRate(int sampleRate)
+    {
+        if (sampleRate <= 0)
+            return 0;
+
+        // Already in Hz (normal case).
+        if (sampleRate >= 8000)
+            return sampleRate;
+
+        // Some containers report kHz-like integers (e.g., 96 instead of 96000).
+        return sampleRate switch
+        {
+            8 => 8000,
+            11 => 11025,
+            12 => 12000,
+            16 => 16000,
+            22 => 22050,
+            24 => 24000,
+            32 => 32000,
+            44 => 44100,
+            48 => 48000,
+            64 => 64000,
+            88 => 88200,
+            96 => 96000,
+            176 => 176400,
+            192 => 192000,
+            352 => 352800,
+            384 => 384000,
+            // Placeholder values (e.g., 1 kHz) should be treated as unknown.
+            _ => 0
+        };
+    }
+
+    /// <summary>An MP4-family file whose codec reads as Apple Lossless.</summary>
+    internal static bool IsAlacContainer(string ext, string? codec)
+    {
+        if (ext is not (".m4a" or ".m4b" or ".mp4" or ".alac"))
+            return false;
+        var codecLower = (codec ?? string.Empty).ToLowerInvariant();
+        return codecLower.Contains("alac") || codecLower.Contains("lossless");
+    }
+
+    /// <summary>
+    /// The sample rate to store for an ALAC file: the decoder config atom's when it is valid,
+    /// else TagLib's. TagLib# reads the MP4 sample entry's 16.16 rate field, which cannot hold
+    /// hi-res rates — a 96 kHz ALAC came back as 48 kHz (harness 10-10, ffmpeg-encoded), and
+    /// some files carry 0 there. The atom (<see cref="TryReadAlacConfigFromFile"/>) holds the
+    /// real rate. Internal for tests.
+    /// </summary>
+    internal static int ResolveAlacSampleRate(int tagLibSampleRate, int alacConfigSampleRate) =>
+        alacConfigSampleRate >= 8000 ? alacConfigSampleRate : tagLibSampleRate;
+
+    private static int NormalizeBitsPerSample(int bits, TagLib.File file, string ext, int sampleRate, string codec, int alacBitDepth = 0)
+    {
+        if (bits > 0)
+            return bits;
+
+        // Try to read from codec details if available.
+        foreach (var codecInfo in file.Properties.Codecs)
+        {
+            if (codecInfo is TagLib.IAudioCodec audio && audio.Description != null)
+            {
+                var desc = audio.Description.ToLowerInvariant();
+                if (desc.Contains("24"))
+                    return 24;
+                if (desc.Contains("16"))
+                    return 16;
+            }
+        }
+
+        // TagLib# doesn't expose BitsPerSample for ALAC in M4A containers
+        // (the MPEG4 codec class doesn't implement ILosslessAudioCodec).
+        // Read the bit depth directly from the ALAC decoder config atom —
+        // the caller's copy when it already read the atom, else one read here.
+        if (IsAlacContainer(ext, codec))
+        {
+            var bd = alacBitDepth > 0 ? alacBitDepth : TryReadAlacConfigFromFile(file.Name).BitDepth;
+            if (bd > 0) return bd;
+        }
+
+        // Do NOT guess bit depth from sample rate — a 48 kHz FLAC/ALAC file can
+        // be 16-bit or 24-bit. Guessing would mislabel files and corrupt
+        // Hi-Res Lossless badges. Leave as 0 and let ffprobe fallback handle it.
+
+        return 0;
+    }
+
+    /// <summary>
+    /// Reads ALAC bit depth and sample rate directly from the M4A/MP4 container
+    /// by scanning for the inner 'alac' decoder config box.
+    /// Layout after the box type:
+    /// [version+flags 4B][frameLength 4B][compatVersion 1B][bitDepth 1B]
+    /// [tuningParams 3B][numChannels 1B][maxRun 2B][maxFrameBytes 4B]
+    /// [avgBitRate 4B][sampleRate 4B]
+    /// </summary>
+    private static (int BitDepth, int SampleRate) TryReadAlacConfigFromFile(string filePath)
+    {
+        try
+        {
+            using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            return TryReadAlacConfig(fs);
+        }
+        catch
+        {
+            // Best-effort fallback only; return zeros if anything goes wrong.
+        }
+
+        return (0, 0);
+    }
+
+    /// <summary>
+    /// <see cref="TryReadAlacConfigFromFile"/> over an open seekable stream (a file, or the
+    /// Android content stream TagLib read): the stream's position is put back afterwards.
+    /// </summary>
+    private static (int BitDepth, int SampleRate) TryReadAlacConfig(Stream stream)
+    {
+        var position = stream.CanSeek ? stream.Position : 0;
+        try
+        {
+            stream.Position = 0;
+            var scanSize = (int)Math.Min(stream.Length, 1024 * 1024);
+            var data = new byte[scanSize];
+            // A content stream may hand back less than asked per read; fill the window.
+            var bytesRead = 0;
+            while (bytesRead < scanSize)
+            {
+                var n = stream.Read(data, bytesRead, scanSize - bytesRead);
+                if (n <= 0) break;
+                bytesRead += n;
+            }
+            var config = FindAlacConfig(data, bytesRead);
+            if (config.BitDepth > 0)
+                return config;
+
+            // moov after mdat (ffmpeg without +faststart — the Audio Converter's own ALAC
+            // output): the atom sits past the first megabyte. Read moov itself.
+            if (stream.Length > scanSize && Mp4ChapterReader.ReadTopLevelBox(stream, "moov") is { } moov)
+                return FindAlacConfig(moov, moov.Length);
+        }
+        catch
+        {
+            // Best-effort fallback only; return zeros if anything goes wrong.
+        }
+        finally
+        {
+            try { if (stream.CanSeek) stream.Position = position; } catch { /* already unusable */ }
+        }
+
+        return (0, 0);
+    }
+
+    /// <summary>The ALAC decoder config box's bit depth and sample rate within
+    /// <paramref name="data"/>, or zeros (layout on <see cref="TryReadAlacConfigFromFile"/>).</summary>
+    private static (int BitDepth, int SampleRate) FindAlacConfig(byte[] data, int bytesRead)
+    {
+        for (int i = 4; i < bytesRead - 32; i++)
+        {
+            if (data[i] != 'a' || data[i + 1] != 'l' || data[i + 2] != 'a' || data[i + 3] != 'c')
+                continue;
+
+            // Box size is the 4 bytes before the type (big-endian).
+            int boxSize = (data[i - 4] << 24) | (data[i - 3] << 16) | (data[i - 2] << 8) | data[i - 1];
+
+            // Inner ALAC config box is small (typically 36 bytes).
+            // Outer ALAC sample entry is much larger (300+ bytes). Skip it.
+            if (boxSize < 28 || boxSize > 64)
+                continue;
+
+            int configStart = i + 4; // past 'alac' type bytes
+
+            // bitDepth at config offset 9: version(4) + frameLength(4) + compatVersion(1)
+            int bdOffset = configStart + 9;
+            // sampleRate at config offset 24: +tuning(3) +channels(1) +maxRun(2) +maxFrameBytes(4) +avgBitRate(4)
+            int srOffset = configStart + 24;
+
+            if (srOffset + 3 >= bytesRead)
+                continue;
+
+            int bd = data[bdOffset];
+            int sr = (data[srOffset] << 24) | (data[srOffset + 1] << 16) |
+                     (data[srOffset + 2] << 8) | data[srOffset + 3];
+
+            if (bd is 16 or 24 or 32)
+                return (bd, sr >= 8000 ? sr : 0);
+        }
+
+        return (0, 0);
+    }
+
+    private static bool IsLikelyLossyCodec(string codec, string ext)
+    {
+        var codecLower = (codec ?? string.Empty).ToLowerInvariant();
+        if (codecLower.Contains("mp3") || codecLower.Contains("mpeg") ||
+            codecLower.Contains("aac") || codecLower.Contains("vorbis") ||
+            codecLower.Contains("opus") || codecLower.Contains("wma") ||
+            codecLower.Contains("mp4a"))
+            return true;
+
+        // Don't classify .m4a/.mp4 as lossy by extension — these containers
+        // can hold ALAC (lossless). The codec string check above already
+        // catches AAC. Only classify unambiguously lossy extensions.
+        return ext is ".mp3" or ".aac" or ".ogg" or ".opus" or ".wma";
+    }
+
+    private static bool IsLikelyLosslessCodec(string codec, string ext)
+    {
+        var codecLower = (codec ?? string.Empty).ToLowerInvariant();
+        if (codecLower.Contains("flac") || codecLower.Contains("alac") ||
+            codecLower.Contains("lossless") || codecLower.Contains("pcm") ||
+            codecLower.Contains("wavpack") || codecLower.Contains("monkey"))
+            return true;
+
+        return ext is ".flac" or ".alac" or ".wav" or ".aiff" or ".aif" or ".aifc" or ".ape" or ".wv" or ".dsf" or ".dff";
+    }
+
+    private static int NormalizeBitrate(int bitrate, long fileSize, TimeSpan duration)
+    {
+        if (bitrate > 0)
+            return bitrate;
+
+        if (fileSize <= 0 || duration.TotalSeconds <= 0)
+            return 0;
+
+        var estimated = (int)Math.Round((fileSize * 8d) / duration.TotalSeconds / 1000d);
+        return estimated > 0 ? estimated : 0;
+    }
+
+    // A VBR MP3 with no Xing/VBRI header: TagLib's length is a first-frame bitrate guess
+    // (a 65-minute file read as 14:37), so count the frames instead (see Mp3FrameScan).
+    private static void ApplyCountedMp3Length(string path, string ext, ref int bitrate, ref TimeSpan duration)
+    {
+        if (ext == ".mp3" && Mp3FrameScan.TryMeasureHeaderlessVbr(path, out var counted, out var countedKbps))
+        {
+            duration = counted;
+            bitrate = countedKbps;
+        }
+    }
+
+    private static bool NeedsFfprobeFallback(int sampleRate, int bitsPerSample, int bitrate, TimeSpan duration, bool isLossless)
+    {
+        // Bits-per-sample only exists for lossless/PCM formats. Lossy codecs
+        // (MP3, AAC, OGG, Opus, WMA) legitimately report 0, so demanding it for
+        // them would spawn an ffprobe subprocess per file — catastrophic on large
+        // or networked libraries — for a value ffprobe can't supply either.
+        return sampleRate < 8000 || (isLossless && bitsPerSample <= 0) || bitrate <= 0 || duration <= TimeSpan.Zero;
+    }
+
+    private static void TryPopulateAudioMetricsWithFfprobe(string filePath, ref int sampleRate, ref int bitsPerSample, ref int bitrate, ref TimeSpan duration)
+    {
+        if (!FfprobeAvailable.Value)
+            return;
+
+        try
+        {
+            // ArgumentList (not a hand-quoted Arguments string): filenames can
+            // legally contain quotes on Unix and trailing backslashes anywhere,
+            // which broke the quoting and let a crafted name smuggle extra args.
+            var psi = new ProcessStartInfo
+            {
+                FileName = "ffprobe",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            foreach (var arg in new[]
+                     {
+                         "-v", "error", "-select_streams", "a:0",
+                         "-show_entries", "stream=sample_rate,bits_per_sample,bits_per_raw_sample,bit_rate,duration:format=bit_rate,duration",
+                         "-of", "json", filePath
+                     })
+                psi.ArgumentList.Add(arg);
+
+            using var proc = Process.Start(psi);
+            if (proc == null)
+                return;
+
+            // Drain stderr concurrently — a chatty failure fills the 4KB pipe
+            // buffer and wedges ffprobe until the timeout kill if nobody reads it.
+            var stderrTask = proc.StandardError.ReadToEndAsync();
+            var stdout = proc.StandardOutput.ReadToEnd();
+            if (!proc.WaitForExit(2500))
+            {
+                try { proc.Kill(true); } catch { }
+                return;
+            }
+            _ = stderrTask; // content unused; reading it is the point
+
+            using var doc = JsonDocument.Parse(stdout);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("streams", out var streams) &&
+                streams.ValueKind == JsonValueKind.Array &&
+                streams.GetArrayLength() > 0)
+            {
+                var stream = streams[0];
+                if (sampleRate < 8000)
+                {
+                    var streamRate = ParseJsonInt(stream, "sample_rate");
+                    var normalizedStreamRate = NormalizeSampleRate(streamRate);
+                    if (normalizedStreamRate >= 8000)
+                        sampleRate = normalizedStreamRate;
+                }
+
+                if (bitsPerSample <= 0)
+                {
+                    var rawBits = ParseJsonInt(stream, "bits_per_raw_sample");
+                    var bits = rawBits > 0 ? rawBits : ParseJsonInt(stream, "bits_per_sample");
+                    if (bits > 0)
+                        bitsPerSample = bits;
+                }
+
+                if (bitrate <= 0)
+                {
+                    var streamBitrate = ParseJsonInt(stream, "bit_rate");
+                    if (streamBitrate > 0)
+                        bitrate = (int)Math.Round(streamBitrate / 1000d);
+                }
+
+                if (duration <= TimeSpan.Zero)
+                {
+                    var streamDuration = ParseJsonDouble(stream, "duration");
+                    if (streamDuration > 0)
+                        duration = TimeSpan.FromSeconds(streamDuration);
+                }
+            }
+
+            if (root.TryGetProperty("format", out var format))
+            {
+                if (bitrate <= 0)
+                {
+                    var formatBitrate = ParseJsonInt(format, "bit_rate");
+                    if (formatBitrate > 0)
+                        bitrate = (int)Math.Round(formatBitrate / 1000d);
+                }
+
+                if (duration <= TimeSpan.Zero)
+                {
+                    var formatDuration = ParseJsonDouble(format, "duration");
+                    if (formatDuration > 0)
+                        duration = TimeSpan.FromSeconds(formatDuration);
+                }
+            }
+        }
+        catch
+        {
+            // Optional fallback only; keep existing values on failure.
+        }
+    }
+
+    private static int ParseJsonInt(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var value))
+            return 0;
+
+        return value.ValueKind switch
+        {
+            JsonValueKind.Number => value.TryGetInt32(out var number) ? number : 0,
+            JsonValueKind.String => int.TryParse(value.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) ? parsed : 0,
+            _ => 0
+        };
+    }
+
+    private static double ParseJsonDouble(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var value))
+            return 0d;
+
+        return value.ValueKind switch
+        {
+            JsonValueKind.Number => value.TryGetDouble(out var number) ? number : 0d,
+            JsonValueKind.String => double.TryParse(value.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) ? parsed : 0d,
+            _ => 0d
+        };
+    }
+
+    private static string DetermineCodec(TagLib.File file, string ext)
+    {
+        // Try to get codec from TagLib properties
+        foreach (var codec in file.Properties.Codecs)
+        {
+            if (codec is TagLib.IAudioCodec audioCodec)
+            {
+                var desc = audioCodec.Description;
+                if (!string.IsNullOrWhiteSpace(desc))
+                    return desc;
+            }
+        }
+
+        // Fallback: determine from file extension
+        return ext switch
+        {
+            ".mp3" => "MPEG Audio Layer 3",
+            ".flac" => "FLAC",
+            ".ogg" or ".oga" => "Vorbis",
+            ".m4a" or ".m4b" or ".mp4" or ".aac" => "AAC",
+            ".alac" => "Apple Lossless (ALAC)",
+            ".wav" => "PCM (WAV)",
+            ".aiff" or ".aif" or ".aifc" => "PCM (AIFF)",
+            ".opus" => "Opus",
+            ".wma" or ".asf" => "Windows Media Audio",
+            ".ape" => "Monkey's Audio",
+            ".wv" => "WavPack",
+            ".dsf" or ".dff" => "DSD",
+            _ => "Unknown"
+        };
+    }
+
+    private static string JoinTagValues(string[]? values)
+    {
+        if (values == null || values.Length == 0)
+            return string.Empty;
+
+        var normalized = values
+            .Select(v => v?.Trim())
+            .Where(v => !string.IsNullOrWhiteSpace(v))
+            .Select(v => v!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        // Joined with an ACTIVE separator so the values split back apart. A hard-coded ", "
+        // never split again once "," left the separators (GitHub #117), and every credit
+        // combination ("A, B", "A, B, C") became its own artist.
+        return normalized.Length == 0 ? string.Empty : string.Join(ArtistCredit.JoinText, normalized);
+    }
+
+    /// <summary>
+    /// Mirrors <see cref="Models.AppSettings.MergeFeaturedFromTitles"/> so the static
+    /// enrichment path (scan, Navidrome sync, migrations) can honor the toggle without
+    /// threading settings through every call site. Set on startup by LibraryService and
+    /// kept current by SettingsViewModel when the user flips the switch.
+    /// </summary>
+    internal static volatile bool MergeFeaturedFromTitles = true;
+
+    /// <summary>
+    /// Mirrors <see cref="Models.AppSettings.UseEmbeddedArtwork"/> so every artwork
+    /// extraction path (scan, import, backfill, externally opened files) can honor the
+    /// toggle without threading settings through every call site. Set on startup by
+    /// LibraryService and kept current by SettingsViewModel when the user flips it.
+    /// </summary>
+    internal static volatile bool UseEmbeddedArtwork = true;
+
+    /// <summary>
+    /// Configured library roots, mirrored by LibraryService before scans/imports so
+    /// folder-derived metadata fallback (untagged files) never credits a root
+    /// folder itself as an artist or album. Static for the same reason as
+    /// <see cref="UseEmbeddedArtwork"/>: read on scan worker threads.
+    /// </summary>
+    internal static volatile string[] MusicRootFolders = Array.Empty<string>();
+
+    /// <summary>
+    /// If the title contains "feat."/"ft." artists not already present in the artist field,
+    /// merge them in so collaboration tracks always show the full artist credit.
+    /// </summary>
+    internal static string EnrichArtistFromTitle(string artist, string title)
+    {
+        if (!MergeFeaturedFromTitles)
+            return artist;
+
+        var featNames = ExtractFeaturedNamesFromTitle(title);
+        if (featNames.Length == 0)
+            return artist;
+
+        // Find featured artists not already mentioned in the artist string. Whole-word
+        // containment: a credited "Maxwell" must not swallow a featured "Max".
+        var missing = featNames
+            .Where(f => !ContainsArtistName(artist, f))
+            .ToArray();
+
+        if (missing.Length == 0)
+            return artist;
+
+        var join = ArtistCredit.JoinText;
+        return artist + join + string.Join(join, missing);
+    }
+
+    /// <summary>
+    /// Rewrites featured names that an older build merged in with a hard-coded " &amp; "
+    /// ("Rihanna &amp; Drake" from "Work (feat. Drake)") to the active separator, so they
+    /// split into separate credits again now that "&amp;" is no longer a default separator.
+    /// Only a " &amp; " directly in front of a name the TITLE credits as featured is touched;
+    /// a band's own "&amp;" ("Simon &amp; Garfunkel") is left alone.
+    /// </summary>
+    internal static string RejoinMergedFeaturedCredit(string artist, string title)
+    {
+        if (string.IsNullOrWhiteSpace(artist) || !artist.Contains(" & ", StringComparison.Ordinal))
+            return artist;
+
+        var featNames = ExtractFeaturedNamesFromTitle(title);
+        if (featNames.Length == 0)
+            return artist;
+
+        var join = ArtistCredit.JoinText;
+        if (join == " & ")
+            return artist;
+
+        var result = artist;
+        foreach (var name in featNames)
+        {
+            var merged = " & " + name;
+            var idx = result.LastIndexOf(merged, StringComparison.OrdinalIgnoreCase);
+            // Only a whole-name match: "& Drake" must not rewrite "& Drakeo".
+            if (idx < 0) continue;
+            var end = idx + merged.Length;
+            if (end < result.Length && (char.IsLetterOrDigit(result[end]) || result[end] == '_')) continue;
+            result = result[..idx] + join + result[(idx + 3)..];
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Extracts featured-artist names from a "(feat. X)" / "[ft. X &amp; Y]" style title
+    /// segment. Empty when the title carries no such credit.
+    /// </summary>
+    internal static string[] ExtractFeaturedNamesFromTitle(string title)
+    {
+        if (string.IsNullOrWhiteSpace(title))
+            return Array.Empty<string>();
+
+        // Extract "feat. X" / "ft. X" / "featuring X" from parentheses or brackets
+        var match = Regex.Match(title,
+            @"[\(\[]\s*(?:feat\.?|ft\.?|featuring)\s+(.+?)[\)\]]",
+            RegexOptions.IgnoreCase);
+        if (!match.Success)
+            return Array.Empty<string>();
+
+        var featuredRaw = match.Groups[1].Value.Trim();
+        if (string.IsNullOrEmpty(featuredRaw))
+            return Array.Empty<string>();
+
+        // Split featured part by common separators
+        return Regex.Split(featuredRaw, @"\s*(?:,|;|&|\band\b)\s*", RegexOptions.IgnoreCase)
+            .Select(s => s.Trim())
+            .Where(s => !string.IsNullOrWhiteSpace(s))
+            .ToArray();
+    }
+
+    /// <summary>
+    /// Whole-word, case-insensitive containment. Character scan instead of a regex so
+    /// the per-name pattern doesn't thrash the Regex cache during large scans.
+    /// Underscore counts as a word character (so "Max_B" does not credit "Max").
+    /// </summary>
+    private static bool ContainsArtistName(string artist, string name)
+    {
+        static bool IsWordChar(char c) => char.IsLetterOrDigit(c) || c == '_';
+
+        var idx = 0;
+        while ((idx = artist.IndexOf(name, idx, StringComparison.OrdinalIgnoreCase)) >= 0)
+        {
+            var boundaryBefore = idx == 0 || !IsWordChar(artist[idx - 1]);
+            var end = idx + name.Length;
+            var boundaryAfter = end >= artist.Length || !IsWordChar(artist[end]);
+            if (boundaryBefore && boundaryAfter)
+                return true;
+            idx++;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// True when this track's artist may carry a credit that
+    /// <see cref="EnrichArtistFromTitle"/> merged in from the title: the title names
+    /// featured artists and at least one appears in the artist string. Deliberately a
+    /// loose substring match — a superset of every containment rule enrichment has ever
+    /// used — so the un-merge pass never skips a track an older build enriched; a false
+    /// positive only costs a tag re-read that restores the same value.
+    /// </summary>
+    internal static bool MayHaveMergedFeaturedCredit(string artist, string title)
+    {
+        if (string.IsNullOrWhiteSpace(artist))
+            return false;
+
+        return ExtractFeaturedNamesFromTitle(title)
+            .Any(f => artist.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0);
+    }
+
+    private static string[] SplitArtistList(string value) => ArtistCredit.SplitForTag(value);
+
+    private static bool IsLosslessFormat(string codec, string ext)
+    {
+        var codecLower = codec.ToLowerInvariant();
+        if (codecLower.Contains("flac") || codecLower.Contains("alac") ||
+            codecLower.Contains("lossless") || codecLower.Contains("pcm") ||
+            codecLower.Contains("wavpack") || codecLower.Contains("monkey"))
+            return true;
+
+        return ext is ".flac" or ".alac" or ".wav" or ".aiff" or ".aif" or ".aifc" or ".ape" or ".wv" or ".dsf" or ".dff";
+    }
+
+    private static string GetFileFormat(string ext)
+    {
+        return ext switch
+        {
+            ".mp3" => "MP3",
+            ".flac" => "FLAC",
+            ".ogg" or ".oga" => "OGG Vorbis",
+            ".m4a" => "Apple Audio (M4A)",
+            ".m4b" => "Apple Audiobook (M4B)",
+            ".mp4" => "MPEG-4 Audio",
+            ".aac" => "AAC",
+            ".alac" => "Apple Lossless",
+            ".wav" => "WAV",
+            ".aiff" or ".aif" or ".aifc" => "AIFF",
+            ".opus" => "Opus",
+            ".wma" => "Windows Media Audio",
+            ".asf" => "Windows Media Audio (ASF)",
+            ".ape" => "Monkey's Audio",
+            ".wv" => "WavPack",
+            ".dsf" => "DSD (DSF)",
+            ".dff" => "DSD (DFF)",
+            _ => ext.TrimStart('.').ToUpperInvariant()
+        };
+    }
+
+    /// <summary>
+    /// Reads common musical key fields used by DJ/tagging tools.
+    /// ID3v2: TKEY. Xiph: INITIALKEY / KEY. Apple: iTunes freeform boxes.
+    /// </summary>
+    private static string ReadMusicalKey(TagLib.File file)
+    {
+        try
+        {
+            if (file.GetTag(TagLib.TagTypes.Id3v2) is TagLib.Id3v2.Tag id3v2)
+            {
+                var frame = id3v2.GetFrames<TagLib.Id3v2.TextInformationFrame>()
+                    .FirstOrDefault(f => f.FrameId == TagLib.ByteVector.FromString("TKEY", TagLib.StringType.Latin1));
+                var val = frame?.Text?.FirstOrDefault();
+                if (!string.IsNullOrWhiteSpace(val)) return val.Trim();
+
+                foreach (var userFrame in id3v2.GetFrames<TagLib.Id3v2.UserTextInformationFrame>())
+                {
+                    var desc = userFrame.Description;
+                    if (string.Equals(desc, "INITIALKEY", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(desc, "KEY", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(desc, "MUSICALKEY", StringComparison.OrdinalIgnoreCase))
+                    {
+                        val = userFrame.Text?.FirstOrDefault();
+                        if (!string.IsNullOrWhiteSpace(val)) return val.Trim();
+                    }
+                }
+            }
+        }
+        catch { }
+
+        try
+        {
+            if (file.GetTag(TagLib.TagTypes.Xiph) is TagLib.Ogg.XiphComment xiph)
+            {
+                foreach (var fieldName in new[] { "INITIALKEY", "KEY", "MUSICALKEY" })
+                {
+                    var val = xiph.GetField(fieldName)?.FirstOrDefault();
+                    if (!string.IsNullOrWhiteSpace(val)) return val.Trim();
+                }
+            }
+        }
+        catch { }
+
+        try
+        {
+            if (file.GetTag(TagLib.TagTypes.Apple) is TagLib.Mpeg4.AppleTag apple)
+            {
+                foreach (var boxName in new[] { "INITIALKEY", "initialkey", "KEY", "MUSICALKEY" })
+                {
+                    var val = apple.GetDashBox("com.apple.iTunes", boxName);
+                    if (!string.IsNullOrWhiteSpace(val)) return val.Trim();
+                }
+            }
+        }
+        catch { }
+
+        return string.Empty;
+    }
+
+    /// <summary>
+    /// Reads the copyright notice explicitly from format-specific tag fields.
+    /// ID3v2: TCOP frame. Apple: cprt atom. Xiph: COPYRIGHT field.
+    /// Does NOT fall back to tag.Comment.
+    /// </summary>
+    private static string ReadCopyright(TagLib.File file)
+    {
+        // ID3v2 (MP3): TCOP frame
+        try
+        {
+            if (file.GetTag(TagLib.TagTypes.Id3v2) is TagLib.Id3v2.Tag id3v2)
+            {
+                var tcop = id3v2.GetFrames<TagLib.Id3v2.TextInformationFrame>()
+                    .FirstOrDefault(f => f.FrameId == TagLib.ByteVector.FromString("TCOP", TagLib.StringType.Latin1));
+                if (tcop != null)
+                {
+                    var val = tcop.Text?.FirstOrDefault();
+                    if (!string.IsNullOrWhiteSpace(val)) return val.Trim();
+                }
+
+                // Also check TXXX:COPYRIGHT custom frame
+                foreach (var frame in id3v2.GetFrames<TagLib.Id3v2.UserTextInformationFrame>())
+                {
+                    if (string.Equals(frame.Description, "COPYRIGHT", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var val = frame.Text?.FirstOrDefault();
+                        if (!string.IsNullOrWhiteSpace(val)) return val.Trim();
+                    }
+                }
+            }
+        }
+        catch { }
+
+        // Apple tags (M4A/MP4): cprt atom, then freeform COPYRIGHT
+        try
+        {
+            if (file.GetTag(TagLib.TagTypes.Apple) is TagLib.Mpeg4.AppleTag apple)
+            {
+                // cprt atom (standard copyright)
+                var cprt = apple.GetText(TagLib.ByteVector.FromString("cprt", TagLib.StringType.Latin1));
+                if (cprt != null)
+                {
+                    var val = cprt.FirstOrDefault();
+                    if (!string.IsNullOrWhiteSpace(val)) return val.Trim();
+                }
+
+                // Freeform COPYRIGHT box
+                var freeform = apple.GetDashBox("com.apple.iTunes", "COPYRIGHT");
+                if (!string.IsNullOrWhiteSpace(freeform)) return freeform.Trim();
+            }
+        }
+        catch { }
+
+        // Xiph comments (FLAC, OGG, Opus): COPYRIGHT field
+        try
+        {
+            if (file.GetTag(TagLib.TagTypes.Xiph) is TagLib.Ogg.XiphComment xiph)
+            {
+                var fields = xiph.GetField("COPYRIGHT");
+                var val = fields?.FirstOrDefault();
+                if (!string.IsNullOrWhiteSpace(val)) return val.Trim();
+            }
+        }
+        catch { }
+
+        return string.Empty;
+    }
+
+    /// <summary>
+    /// Reads the full release date from RELEASETIME, YEAR, TDRL/TDRC, or date tags across formats.
+    /// Returns raw date string (e.g., "2014-10-27" or "2014/10/27" or "2014-10-27T00:00:00Z"), or empty.
+    /// Only returns values that contain more than just a year (length > 4).
+    /// </summary>
+    /// <summary>
+    /// Re-stamps a full release date ("2004-02-10") into the standard date frames after
+    /// <c>tag.Year</c> reduced them to the year. Skipped when there is no full date, or when
+    /// the date's year no longer matches the year being saved (a year edit wins).
+    /// </summary>
+    private static void WriteFullReleaseDate(TagLib.File file, string? releaseDate, int year)
+    {
+        var value = releaseDate?.Trim();
+        if (string.IsNullOrEmpty(value) || value.Length <= 4) return;
+        if (!Track.TryParseReleaseDate(value, out var parsed) || parsed.Year != year) return;
+
+        try
+        {
+            if (file.GetTag(TagLib.TagTypes.Id3v2) is TagLib.Id3v2.Tag id3v2)
+            {
+                var frame = TagLib.Id3v2.TextInformationFrame.Get(id3v2, "TDRC", true);
+                frame.Text = new[] { value };
+            }
+        }
+        catch { }
+
+        try
+        {
+            if (file.GetTag(TagLib.TagTypes.Xiph) is TagLib.Ogg.XiphComment xiph)
+                xiph.SetField("DATE", value);
+        }
+        catch { }
+
+        try
+        {
+            if (file.GetTag(TagLib.TagTypes.Apple) is TagLib.Mpeg4.AppleTag apple)
+                apple.SetText(TagLib.ByteVector.FromString("\u00A9day", TagLib.StringType.Latin1), new[] { value });
+        }
+        catch { }
+
+        try
+        {
+            // WAV: the year setter wrote a bare "2019" into ICRD.
+            if (file.GetTag(TagLib.TagTypes.RiffInfo) is TagLib.Riff.InfoTag info)
+                info.SetValue(TagLib.ByteVector.FromString("ICRD", TagLib.StringType.Latin1), value);
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// WAV album / date from the RIFF INFO fields TagLib# misreads (Discord Tangent,
+    /// "album dates going missing"). TagLib# reads the year only when ICRD holds a bare
+    /// "2019", so the "2019-05-10" most taggers write read as year 0; and it keeps the
+    /// album in DIRC, while ffmpeg, Windows and most taggers write the standard IPRD.
+    /// Empty values when the file has no INFO chunk. Internal for tests.
+    /// </summary>
+    internal static (int Year, string Album, string ReleaseDate) ReadRiffInfoFallback(TagLib.File file)
+    {
+        try
+        {
+            if (file.GetTag(TagLib.TagTypes.RiffInfo) is not TagLib.Riff.InfoTag info)
+                return (0, string.Empty, string.Empty);
+
+            string Field(string id) =>
+                (info.GetValuesAsStrings(TagLib.ByteVector.FromString(id, TagLib.StringType.Latin1))
+                    .FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? string.Empty).Trim();
+
+            var created = Field("ICRD");
+            var year = 0;
+            var match = System.Text.RegularExpressions.Regex.Match(created, @"(?<!\d)(1[89]\d\d|2\d\d\d)(?!\d)");
+            if (match.Success) year = int.Parse(match.Value, System.Globalization.CultureInfo.InvariantCulture);
+            var releaseDate = created.Length > 4 && Track.TryParseReleaseDate(created, out _) ? created : string.Empty;
+            return (year, Field("IPRD"), releaseDate);
+        }
+        catch
+        {
+            return (0, string.Empty, string.Empty);
+        }
+    }
+
+    /// <summary>
+    /// Whether the WAV at <paramref name="path"/> carries a RIFF INFO year or album that a
+    /// track stored with <paramref name="storedYear"/> / <paramref name="storedAlbum"/> is
+    /// missing. Reads the chunk headers only; false when the file can't be opened.
+    /// </summary>
+    internal static bool RiffInfoWouldFill(string path, int storedYear, string storedAlbum)
+    {
+        try
+        {
+            using var file = TagLib.File.Create(path);
+            var riff = ReadRiffInfoFallback(file);
+            return (storedYear == 0 && riff.Year > 0)
+                || (storedAlbum == "Unknown Album" && riff.Album.Length > 0);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string ReadReleaseDate(TagLib.File file, TagLib.Tag tag)
+    {
+        // ID3v2 (MP3): check TXXX custom frames first (RELEASETIME, RELEASEDATE, YEAR)
+        try
+        {
+            if (file.GetTag(TagLib.TagTypes.Id3v2) is TagLib.Id3v2.Tag id3v2)
+            {
+                // TXXX custom text frames — taggers like MusicBrainz Picard, Mp3tag, etc.
+                // store full dates here as "RELEASETIME", "RELEASEDATE", or even "YEAR"
+                foreach (var frame in id3v2.GetFrames<TagLib.Id3v2.UserTextInformationFrame>())
+                {
+                    var desc = frame.Description;
+                    if (string.Equals(desc, "RELEASETIME", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(desc, "RELEASEDATE", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(desc, "YEAR", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var val = frame.Text?.FirstOrDefault();
+                        if (!string.IsNullOrWhiteSpace(val) && val.Trim().Length > 4) return val.Trim();
+                    }
+                }
+
+                // Standard ID3v2.4 date frames: TDRL (release date), TDRC (recording date)
+                foreach (var frameId in new[] { "TDRL", "TDRC" })
+                {
+                    var frame = id3v2.GetFrames<TagLib.Id3v2.TextInformationFrame>()
+                        .FirstOrDefault(f => f.FrameId == TagLib.ByteVector.FromString(frameId, TagLib.StringType.Latin1));
+                    if (frame != null)
+                    {
+                        var val = frame.Text?.FirstOrDefault();
+                        if (!string.IsNullOrWhiteSpace(val) && val.Trim().Length > 4) return val.Trim();
+                    }
+                }
+            }
+        }
+        catch { }
+
+        // Apple tags (M4A/MP4/AAC/ALAC): freeform boxes + ©day atom
+        try
+        {
+            if (file.GetTag(TagLib.TagTypes.Apple) is TagLib.Mpeg4.AppleTag apple)
+            {
+                // Freeform boxes: ----:com.apple.iTunes:RELEASETIME, RELEASEDATE, YEAR
+                foreach (var boxName in new[] { "RELEASETIME", "RELEASEDATE", "YEAR" })
+                {
+                    var val = apple.GetDashBox("com.apple.iTunes", boxName);
+                    if (!string.IsNullOrWhiteSpace(val) && val.Trim().Length > 4) return val.Trim();
+                }
+
+                // ©day atom often contains full date like "2014-10-27T07:00:00Z"
+                var dayAtom = apple.GetText(TagLib.ByteVector.FromString("\u00A9day", TagLib.StringType.Latin1));
+                if (dayAtom != null)
+                {
+                    var val = dayAtom.FirstOrDefault();
+                    if (!string.IsNullOrWhiteSpace(val) && val.Trim().Length > 4) return val.Trim();
+                }
+            }
+        }
+        catch { }
+
+        // Xiph comments (FLAC, OGG, Opus): check RELEASETIME, RELEASEDATE, DATE, YEAR
+        try
+        {
+            if (file.GetTag(TagLib.TagTypes.Xiph) is TagLib.Ogg.XiphComment xiph)
+            {
+                foreach (var fieldName in new[] { "RELEASETIME", "RELEASEDATE", "DATE", "YEAR" })
+                {
+                    var fields = xiph.GetField(fieldName);
+                    var val = fields?.FirstOrDefault();
+                    if (!string.IsNullOrWhiteSpace(val) && val.Trim().Length > 4) return val.Trim();
+                }
+            }
+        }
+        catch { }
+
+        return string.Empty;
+    }
+
+    /// <summary>
+    /// Detects explicit content from common advisory fields across tag formats.
+    /// Supports ITUNESADVISORY, iTunEXTC, and MP4 rtng/rating values.
+    /// </summary>
+    private static bool DetectExplicit(TagLib.File file)
+    {
+        try
+        {
+            // ID3v2 (MP3, etc.): TXXX:ITUNESADVISORY
+            if (file.GetTag(TagLib.TagTypes.Id3v2) is TagLib.Id3v2.Tag id3v2)
+            {
+                foreach (var frame in id3v2.GetFrames<TagLib.Id3v2.UserTextInformationFrame>())
+                {
+                    if (!string.Equals(frame.Description, "ITUNESADVISORY", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    if (TryParseExplicitFromValues(frame.Text, out var isExplicit))
+                    {
+                        if (isExplicit) return true;
+                    }
+                }
+            }
+        }
+        catch { }
+
+        try
+        {
+            // Xiph comments (FLAC, OGG, Opus)
+            if (file.GetTag(TagLib.TagTypes.Xiph) is TagLib.Ogg.XiphComment xiph)
+            {
+                var fields = xiph.GetField("ITUNESADVISORY");
+                if (TryParseExplicitFromValues(fields, out var isExplicit))
+                {
+                    if (isExplicit) return true;
+                }
+            }
+        }
+        catch { }
+
+        try
+        {
+            // Apple tags (M4A/MP4/AAC/ALAC)
+            if (file.GetTag(TagLib.TagTypes.Apple) is TagLib.Mpeg4.AppleTag apple)
+            {
+                // Freeform advisory: ----:com.apple.iTunes:ITUNESADVISORY
+                if (TryParseExplicitValue(apple.GetDashBox("com.apple.iTunes", "ITUNESADVISORY"), out var advisory))
+                {
+                    if (advisory) return true;
+                }
+
+                // Alternate advisory in iTunes extension field.
+                if (TryParseExplicitValue(apple.GetDashBox("com.apple.iTunes", "iTunEXTC"), out var itunExtc))
+                {
+                    if (itunExtc) return true;
+                }
+
+                // Standard MP4 rating atom that often appears as "rating=1" in ffprobe.
+                if (TryParseExplicitFromValues(apple.GetText(TagLib.ByteVector.FromString("rtng", TagLib.StringType.Latin1)), out var rating))
+                {
+                    if (rating) return true;
+                }
+
+                // Some files store the same value under "rate".
+                if (TryParseExplicitFromValues(apple.GetText(TagLib.ByteVector.FromString("rate", TagLib.StringType.Latin1)), out var rate))
+                {
+                    if (rate) return true;
+                }
+            }
+        }
+        catch { }
+
+        return false;
+    }
+
+    private static bool TryParseExplicitFromValues(IEnumerable<string>? values, out bool isExplicit)
+    {
+        if (values != null)
+        {
+            foreach (var value in values)
+            {
+                if (TryParseExplicitValue(value, out isExplicit))
+                    return true;
+            }
+        }
+
+        isExplicit = false;
+        return false;
+    }
+
+    private static bool TryParseExplicitValue(string? raw, out bool isExplicit)
+    {
+        if (!string.IsNullOrWhiteSpace(raw))
+        {
+            var normalized = raw.Trim().Trim('\0');
+            if (TryParseAdvisoryNumeric(normalized, out var numeric))
+            {
+                // 1 = explicit, 0/2 = clean per iTunes advisory conventions.
+                if (numeric == 1)
+                {
+                    isExplicit = true;
+                    return true;
+                }
+
+                if (numeric == 0 || numeric == 2)
+                {
+                    isExplicit = false;
+                    return true;
+                }
+            }
+
+            if (normalized.Contains("Explicit", StringComparison.OrdinalIgnoreCase))
+            {
+                isExplicit = true;
+                return true;
+            }
+
+            if (normalized.Contains("Clean", StringComparison.OrdinalIgnoreCase))
+            {
+                isExplicit = false;
+                return true;
+            }
+        }
+
+        isExplicit = false;
+        return false;
+    }
+
+    private static bool TryParseAdvisoryNumeric(string value, out int numeric)
+    {
+        if (int.TryParse(value, out numeric))
+            return true;
+
+        // MP4 "rtng" can be returned as a single control character (0x00/0x01/0x02).
+        if (value.Length == 1)
+        {
+            var code = (int)value[0];
+            if (code is 0 or 1 or 2)
+            {
+                numeric = code;
+                return true;
+            }
+        }
+
+        numeric = -1;
+        return false;
+    }
+
+    /// <summary>
+    /// Reads release-type tags and falls back to the iTunes album-name suffix
+    /// ("Album - Single", "Album - EP"). Sets <see cref="Track.ReleaseTypeFromTag"/>
+    /// when a determination was made so the album-level track-count fallback in
+    /// <see cref="LibraryService"/> can skip explicitly-tagged tracks.
+    /// </summary>
+    private static void PopulateReleaseType(Track track, TagLib.File file)
+    {
+        var tagged = ExtendedTagIO.ReadReleaseType(file, out var isOverride);
+        if (tagged.HasValue)
+        {
+            track.ReleaseType = tagged.Value;
+            track.IsReleaseTypeOverridden = isOverride;
+            track.ReleaseTypeFromTag = true;
+            return;
+        }
+
+        if (TryParseReleaseTypeFromAlbumName(track.Album, out var fromName))
+        {
+            track.ReleaseType = fromName;
+            track.ReleaseTypeFromTag = true;
+            return;
+        }
+
+        // Leave Track.ReleaseType at its default (Album); LibraryService applies
+        // the track-count heuristic at album-grouping time.
+        track.ReleaseTypeFromTag = false;
+    }
+
+    /// <summary>
+    /// Detects "Album Name - Single" / "Album Name - EP" suffixes that iTunes
+    /// applies to standalone releases. Conservative: only triggers on the exact
+    /// dash-separated tokens at the end of the album name.
+    /// </summary>
+    private static bool TryParseReleaseTypeFromAlbumName(string? albumName, out ReleaseType type)
+    {
+        type = ReleaseType.Album;
+        if (string.IsNullOrWhiteSpace(albumName)) return false;
+
+        var trimmed = albumName.TrimEnd();
+        int dash = trimmed.LastIndexOf(" - ", StringComparison.Ordinal);
+        if (dash <= 0) return false;
+        var tail = trimmed[(dash + 3)..].Trim().TrimEnd('.', ' ');
+        if (tail.Equals("Single", StringComparison.OrdinalIgnoreCase)) { type = ReleaseType.Single; return true; }
+        if (tail.Equals("EP", StringComparison.OrdinalIgnoreCase)) { type = ReleaseType.EP; return true; }
+        return false;
+    }
+
+    /// <summary>Returns the first non-null, non-whitespace string, or the fallback.</summary>
+    private static string FirstNonEmpty(params string?[] values)
+    {
+        foreach (var v in values)
+        {
+            if (!string.IsNullOrWhiteSpace(v))
+                return v;
+        }
+        return values[^1] ?? "Unknown";
+    }
+}

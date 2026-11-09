@@ -1,0 +1,17 @@
+using Undertone.Models;
+
+namespace Undertone.Services;
+
+/// <summary>
+/// Identifies tracks via online text search (Deezer first, MusicBrainz fallback) using the
+/// track's current tags.
+/// </summary>
+public interface IMetadataFinderService
+{
+    /// <summary>
+    /// Returns tag suggestions for a track, best first, from a text search by the track's
+    /// current tags. Empty when the sources found nothing; throws when nothing was found
+    /// because the search itself failed (network error, HTTP error, timeout).
+    /// </summary>
+    Task<IReadOnlyList<TagSuggestion>> IdentifyAsync(Track track, CancellationToken ct = default);
+}

@@ -1,0 +1,1714 @@
+using System.Collections.Concurrent;
+using System.Text.Json;
+using Undertone.Models;
+using Undertone.Services;
+using Undertone.Services.Sync;
+
+namespace Undertone.Mobile.Services.Account;
+
+/// <summary>
+/// Hands the library's user-state saves to the account service. Create it first, pass it to
+/// the <see cref="LibraryService"/> as its sync recorder, then to
+/// <see cref="UndertoneAccountService"/>, which attaches itself (the library is built before the
+/// service that needs it, hence the indirection).
+/// </summary>
+public sealed class UndertoneStateRecorder : ITrackStateRecorder
+{
+    private volatile ITrackStateRecorder? _target;
+
+    internal void Attach(ITrackStateRecorder target) => _target = target;
+
+    public void RecordTrackStates(IEnumerable<Track> tracks) => _target?.RecordTrackStates(tracks);
+}
+
+/// <summary>
+/// The phone's account on a desktop Undertone Server: sign-in with a pinned certificate, the
+/// desktop's songs as <see cref="SourceType.UndertoneServer"/> tracks in the shared library,
+/// covers, two-way favorites/ratings/playlists through the sync ledger, plays as scrobbles,
+/// and offline downloads.
+///
+/// Threading: every public method may be called from the UI thread; network and file work
+/// runs on the pool. Library tracks are only mutated through <c>marshal</c> (default: the
+/// Avalonia UI thread), because their observable properties are bound. Events fire on any
+/// thread. <see cref="SyncNowAsync"/> is single-flight: a call while a sync runs gets the
+/// running sync's task.
+///
+/// State rules: a new desktop song takes the catalog's favorite/rating/play count; a known one
+/// takes the catalog's favorite/rating unless the phone has an unpushed edit for it, and its
+/// play count only grows. Ledger items then apply newest-wins against unpushed phone edits.
+/// The phone pushes favorite/rating/dislike changes only (play count 0 and no last-played, so
+/// the desktop's max-merge ignores them); plays travel as scrobbles.
+/// </summary>
+public sealed partial class UndertoneAccountService : IUndertoneAccountService, ITrackStateRecorder
+{
+    private const int PushChunk = 2000;
+    private const int ScrobbleBatch = 500;
+    private const int MaxQueuedPlays = 10_000;
+    private const int MaxPlaylistTracks = 10_000;
+    private const int MaxPlaylistName = 200;
+    private const int MaxPlaylistDescription = 2000;
+    private const long MaxPushBytes = 3L * 1024 * 1024; // the server refuses bodies over 4 MB
+    private const int CoverConcurrency = 4;
+    private const int CoverFailureLimit = 8;
+    private const int DownloadConcurrency = 2;
+    private static readonly TimeSpan CoverMaxAge = TimeSpan.FromDays(30);
+    private static readonly HashSet<string> AllowedExtensions = new(StringComparer.Ordinal)
+    {
+        "mp3", "flac", "m4a", "aac", "ogg", "oga", "opus", "wav", "aiff", "aif", "wma", "ape", "wv", "alac",
+        "mp4", "m4b", "dsf", "dff",
+    };
+
+    private readonly ILibraryService _library;
+    private readonly IPersistenceService _persistence;
+    private readonly UndertoneHandlerFactory _handlerFactory;
+    private readonly UndertoneAccountStore _store;
+    private readonly string _offlineDir;
+    private readonly string _deviceId;
+    private readonly Action<Action> _marshal;
+    private readonly TimeProvider _time;
+
+    // _gate guards _account, _client, _sync and _pending. Never held across an await.
+    private readonly object _gate = new();
+    private readonly object _saveGate = new();
+    private volatile UndertoneAccount? _account;
+    private UndertoneServerClient? _client;
+    private UndertoneSyncState _sync;
+    private UndertonePendingState _pending;
+
+    private Task<UndertoneSyncResult>? _syncTask;
+    private CancellationTokenSource? _syncCts;
+    private volatile bool _isSyncing;
+
+    private sealed record DownloadedFile(string Path, long Size);
+    private readonly ConcurrentDictionary<Guid, DownloadedFile> _downloaded = new();
+    /// <summary>Songs downloading now, each with its own stop (Remove Download on it).</summary>
+    private readonly ConcurrentDictionary<Guid, CancellationTokenSource> _inFlight = new();
+    /// <summary>Songs whose download was removed: a batch that still holds one skips it, and one
+    /// that finishes it throws the file away. Cleared when the song is asked for again.</summary>
+    private readonly ConcurrentDictionary<Guid, byte> _withdrawn = new();
+    /// <summary>A finished download joins <see cref="_downloaded"/> and a removal withdraws it under this,
+    /// so a removal can never land between the check and the add.</summary>
+    private readonly object _downloadCommit = new();
+    private readonly SemaphoreSlim _downloadSlots = new(DownloadConcurrency, DownloadConcurrency);
+    private readonly List<Task> _downloadRuns = new();
+    private CancellationTokenSource _downloadCts = new();
+    private int _dlPending, _dlCompleted, _dlFailed, _dlMissing;
+
+    /// <summary>Song suffixes from this process's last catalog (download file extensions).</summary>
+    private readonly ConcurrentDictionary<Guid, string> _suffixes = new();
+    private readonly ConcurrentDictionary<Guid, long> _sizes = new();
+
+    /// <summary>Space downloads and covers always leave free on the phone: "Download everything" on a
+    /// desktop library can be far larger than the phone (the owner's is ~306 GB).</summary>
+    internal const long StorageReserveBytes = 1536L * 1024 * 1024;
+
+    /// <summary>Free bytes on the volume holding a path; tests substitute a full phone.</summary>
+    internal Func<string, long> FreeSpace { get; init; } = DefaultFreeSpace;
+
+    /// <summary>
+    /// Completes once the phone's library has read library.json (AndroidApp: after
+    /// LibraryService.LoadAsync). A sync waits for it: the Account page is reachable before the
+    /// load ends, and importing into a library that has not loaded yet saves library.json with
+    /// the desktop's songs only, dropping every local one.
+    /// </summary>
+    public Task LibraryReady { get; init; } = Task.CompletedTask;
+
+    /// <summary>How long a download may receive nothing before it counts as failed (tests shorten it).</summary>
+    internal TimeSpan DownloadStallTimeout { get; init; } = UndertoneServerClient.DefaultStallTimeout;
+
+    /// <summary>
+    /// This phone has no ALAC decoder: desktop songs that may be ALAC (an MP4-family suffix) are
+    /// streamed and downloaded with <c>format=flac</c>, and the desktop sends a lossless FLAC copy
+    /// of the ALAC ones (AAC, or a desktop without ffmpeg, still sends the original). Downloads
+    /// already on the phone are left as they are.
+    /// </summary>
+    public bool PreferFlacForAlac { get; init; }
+
+    private static bool MayBeAlac(string suffix) => suffix is "m4a" or "mp4" or "m4b" or "alac";
+
+    /// <summary>Whether to ask the desktop for FLAC instead of this song's original.</summary>
+    private bool WantsFlac(Guid id)
+    {
+        if (!PreferFlacForAlac) return false;
+        if (_suffixes.TryGetValue(id, out var suffix)) return MayBeAlac(suffix);
+        // Before this run's first catalog (suffixes are per process): the codec that catalog mapped,
+        // which is "ALAC" only for an MP4-family song at a lossless bitrate (CodecFor).
+        return _library.GetTrackById(id) is { SourceType: SourceType.UndertoneServer } t && t.Codec == "ALAC";
+    }
+
+    private static long DefaultFreeSpace(string path)
+    {
+        // statvfs on the path itself (Unix DriveInfo accepts any directory); unknown = no limit,
+        // so a platform that cannot tell never blocks downloads.
+        try { return new DriveInfo(path).AvailableFreeSpace; }
+        catch (Exception) { return long.MaxValue; }
+    }
+    /// <summary>Albums the server had no cover for this process (not re-asked every sync).</summary>
+    private readonly ConcurrentDictionary<Guid, byte> _coverMisses = new();
+
+    /// <param name="library">The shared library (desktop songs join it as UndertoneServer tracks).</param>
+    /// <param name="persistence">For covers (GetArtworkPath) and playlists.json.</param>
+    /// <param name="handlerFactory">Builds the TLS handler; the service passes the pin check.</param>
+    /// <param name="accountDir">No-backup directory for the account files (Android NoBackupFilesDir).</param>
+    /// <param name="offlineDir">Where downloads go (Android FilesDir/offline).</param>
+    /// <param name="deviceName">Shown in the desktop's device list (e.g. Build.Model); 1–64 printable chars.</param>
+    /// <param name="stateRecorder">The recorder the LibraryService was built with, so phone favorite/rating
+    /// edits of desktop songs are queued for the next sync. Null = those edits are not pushed.</param>
+    /// <param name="marshal">Runs an action on the UI thread (default Avalonia's dispatcher).</param>
+    /// <param name="time">Clock (tests).</param>
+    public UndertoneAccountService(ILibraryService library, IPersistenceService persistence, UndertoneHandlerFactory handlerFactory,
+        string accountDir, string offlineDir, string deviceName, UndertoneStateRecorder? stateRecorder = null,
+        Action<Action>? marshal = null, TimeProvider? time = null)
+    {
+        _library = library;
+        _persistence = persistence;
+        _handlerFactory = handlerFactory;
+        _store = new UndertoneAccountStore(accountDir);
+        _offlineDir = Path.GetFullPath(offlineDir);
+        DeviceName = SanitizeDeviceName(deviceName);
+        _marshal = marshal ?? (a => Avalonia.Threading.Dispatcher.UIThread.Post(a));
+        _time = time ?? TimeProvider.System;
+
+        _deviceId = _store.LoadOrCreateDeviceId();
+        _account = _store.LoadAccount();
+        _sync = _store.LoadSyncState();
+        _pending = _store.LoadPending();
+        // A play the last run held for its verdict can no longer get one (the song's clock went
+        // with that run): counted only, never sent on to Last.fm.
+        for (var i = 0; i < _pending.Plays.Count; i++)
+            if (_pending.Plays[i].Scrobble == PlayScrobbleWire.Pending)
+                _pending.Plays[i] = _pending.Plays[i] with { Scrobble = PlayScrobbleWire.Of(PlayScrobble.No) };
+        IndexDownloads();
+        LoadCachedAvatar();
+        stateRecorder?.Attach(this);
+    }
+
+    /// <summary>Tests: unpushed favorite/rating edits and queued plays.</summary>
+    internal int PendingTrackCount { get { lock (_gate) return _pending.Tracks.Count; } }
+    public int PendingPlayCount { get { lock (_gate) return _pending.Plays.Count; } }
+
+    public string DeviceId => _deviceId;
+    public string DeviceName { get; }
+
+    public UndertoneAccount? Account => _account;
+    public bool IsSignedIn => _account is not null;
+    public bool IsSyncing => _isSyncing;
+
+    public event EventHandler? StateChanged;
+    public event EventHandler<UndertoneSyncProgress>? SyncProgress;
+    public event EventHandler<UndertoneDownloadProgress>? DownloadProgress;
+    public event EventHandler? PlaylistsChanged;
+
+    private DateTime UtcNow => _time.GetUtcNow().UtcDateTime;
+
+    // ── Sign-in / sign-out ────────────────────────────────────────────────
+
+    public async Task<string> ProbeFingerprintAsync(string serverUrl, CancellationToken ct = default)
+    {
+        var url = UndertoneServerClient.NormalizeServerUrl(serverUrl);
+        return await Task.Run(() => UndertoneServerClient.ProbeFingerprintAsync(_handlerFactory, url, ct), ct).ConfigureAwait(false);
+    }
+
+    public async Task SignInAsync(string serverUrl, string userName, string password, string confirmedFingerprint,
+        CancellationToken ct = default)
+    {
+        var url = UndertoneServerClient.NormalizeServerUrl(serverUrl);
+        var user = (userName ?? string.Empty).Trim();
+        if (user.Length == 0 || string.IsNullOrEmpty(password))
+            throw new UndertoneServerException(UndertoneErrorKind.BadCredentials, "Enter your user name and password.");
+        var fingerprint = url.StartsWith("https://", StringComparison.Ordinal)
+            ? UndertoneServerClient.NormalizeFingerprint(confirmedFingerprint)
+            : string.Empty;
+
+        SignInResult result;
+        // The pinned handler refuses any other certificate, so this only succeeds against the
+        // certificate the user confirmed.
+        using (var client = new UndertoneServerClient(_handlerFactory, url, fingerprint, deviceKey: null))
+            result = await Task.Run(() => client.SignInAsync(user, password, _deviceId, DeviceName, ct), ct).ConfigureAwait(false);
+
+        CompleteSignIn(url, fingerprint, result, user);
+    }
+
+    public async Task SignInWithPairingAsync(Undertone.Services.Server.PairingPayload pairing, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(pairing);
+        var fingerprint = UndertoneServerClient.NormalizeFingerprint(pairing.Fingerprint);
+        UndertoneServerException? unreachable = null, otherCertificate = null;
+        foreach (var url in pairing.ServerUrls)
+        {
+            try
+            {
+                SignInResult result;
+                // Pinned to the code's fingerprint: a computer at this address with any other
+                // certificate fails the TLS handshake, before the secret is written.
+                using (var client = new UndertoneServerClient(_handlerFactory, url, fingerprint, deviceKey: null))
+                    result = await Task.Run(() => client.PairSignInAsync(pairing.Secret, _deviceId, DeviceName, ct), ct).ConfigureAwait(false);
+                if (string.IsNullOrWhiteSpace(result.User))
+                    throw new UndertoneServerException(UndertoneErrorKind.Server, "The server did not say which account signed in.");
+                CompleteSignIn(url, fingerprint, result, result.User!);
+                return;
+            }
+            // Nothing reached a server that holds the pin there: the next address may.
+            catch (UndertoneServerException ex) when (ex.Kind == UndertoneErrorKind.CertificateChanged)
+            {
+                otherCertificate = ex;
+            }
+            catch (UndertoneServerException ex) when (ex.Kind is UndertoneErrorKind.Unreachable or UndertoneErrorKind.NotUndertone or UndertoneErrorKind.UnknownHost)
+            {
+                unreachable ??= ex;
+            }
+        }
+        // Something at the code's address that is not the computer which showed it says so;
+        // else the computer could not be reached at any of its addresses.
+        throw otherCertificate ?? unreachable
+              ?? new UndertoneServerException(UndertoneErrorKind.Unreachable, "Can't reach the desktop.");
+    }
+
+    /// <summary>A sign-in the server accepted (password or QR): the account is stored, with its pin.</summary>
+    private void CompleteSignIn(string url, string fingerprint, SignInResult result, string user)
+    {
+        var account = new UndertoneAccount
+        {
+            ServerUrl = url,
+            UserName = string.IsNullOrWhiteSpace(result.User) ? user : result.User!,
+            DeviceKey = result.ApiKey,
+            Fingerprint = fingerprint,
+            DeviceId = _deviceId,
+            DeviceName = DeviceName,
+            ServerName = result.Server ?? string.Empty,
+            DisplayName = result.DisplayName,
+        };
+        lock (_gate)
+        {
+            // Another server or user: nothing from the old checkpoint or queue applies.
+            if (!SameIdentity(_sync.ServerUrl, _sync.UserName, account) || !SameIdentity(_pending.ServerUrl, _pending.UserName, account))
+            {
+                _sync = new UndertoneSyncState { ServerUrl = account.ServerUrl, UserName = account.UserName };
+                _pending = new UndertonePendingState { ServerUrl = account.ServerUrl, UserName = account.UserName };
+                _store.SaveSyncState(_sync);
+                _store.SavePending(_pending);
+            }
+            _store.SaveAccount(account);
+            _client?.Dispose();
+            _client = null;
+            _account = account;
+            _signedOutByComputer = false;
+        }
+        DebugLog.Write("Account", $"signed in (sync {(result.SyncEnabled ? "on" : "off")} on the desktop)");
+        RaiseStateChanged();
+        StartAvatarRefresh();
+    }
+
+    private static bool SameIdentity(string url, string user, UndertoneAccount account) =>
+        string.Equals(url, account.ServerUrl, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(user, account.UserName, StringComparison.OrdinalIgnoreCase);
+
+    public async Task SignOutAsync(bool removeDownloads, CancellationToken ct = default)
+    {
+        // Stop whatever is running for this account first.
+        Task? running;
+        lock (_gate)
+        {
+            _syncCts?.Cancel();
+            running = _syncTask;
+        }
+        if (running is not null)
+        {
+            try { await running.ConfigureAwait(false); } catch { /* cancelled or failed: irrelevant now */ }
+        }
+        await StopDownloadsAsync().ConfigureAwait(false);
+        await StopUploadsAsync().ConfigureAwait(false);
+
+        UndertoneServerClient? client;
+        List<Guid> syncedPlaylists;
+        lock (_gate)
+        {
+            client = _account is null ? null : GetClientLocked();
+            syncedPlaylists = _sync.Playlists.Keys
+                .Select(k => UndertoneRemoteIds.TryParseSyncId(k, out var g) ? g : Guid.Empty)
+                .Where(g => g != Guid.Empty).ToList();
+        }
+
+        if (client is not null)
+        {
+            // Best effort: the key dies on the desktop too. Offline or already revoked is fine.
+            try
+            {
+                using var shortWait = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                shortWait.CancelAfter(TimeSpan.FromSeconds(5));
+                await Task.Run(() => client.SignOutAsync(shortWait.Token), shortWait.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is UndertoneServerException or OperationCanceledException)
+            {
+                DebugLog.Write("Account", "sign-out: key not revoked on the desktop (unreachable or already gone)");
+            }
+        }
+
+        lock (_gate)
+        {
+            _store.DeleteAccount();
+            _store.DeleteSyncData();
+            _sync = new UndertoneSyncState();
+            _pending = new UndertonePendingState();
+            _client?.Dispose();
+            _client = null;
+            _account = null;
+        }
+        ClearAvatar();
+        RaiseStateChanged();
+
+        var playlistsRemoved = await Task.Run(async () =>
+        {
+            // Before the library has loaded there is nothing to remove yet, and the load would
+            // bring the desktop's songs back. A failed load: remove what there is.
+            await LibraryReady.ContinueWith(_ => { }, TaskScheduler.Default).ConfigureAwait(false);
+            await _library.RemoveRemoteTracksAsync().ConfigureAwait(false);
+            var removed = false;
+            if (syncedPlaylists.Count > 0)
+            {
+                var ids = syncedPlaylists.ToHashSet();
+                var playlists = await _persistence.LoadPlaylistsAsync().ConfigureAwait(false);
+                if (playlists.RemoveAll(p => ids.Contains(p.Id)) > 0)
+                {
+                    await _persistence.SavePlaylistsAsync(playlists).ConfigureAwait(false);
+                    removed = true;
+                }
+            }
+            if (removeDownloads) DeleteAllDownloadFiles();
+            else DeletePartFiles();
+            DeleteSavedLyrics();
+            return removed;
+        }).ConfigureAwait(false);
+        // Only now: a reload on the StateChanged above would still read the desktop's playlists.
+        if (playlistsRemoved) RaisePlaylistsChanged();
+        DebugLog.Write("Account", $"signed out (downloads {(removeDownloads ? "removed" : "kept")})");
+        RaiseDownloadProgress();
+        RaiseStateChanged();
+    }
+
+    /// <summary>The server rejected the key: forget the account locally (downloads and the
+    /// library stay until the user signs in again or signs out).</summary>
+    private volatile bool _signedOutByComputer;
+    public bool WasSignedOutByComputer => _signedOutByComputer;
+
+    private void ForgetAccountLocally()
+    {
+        lock (_gate)
+        {
+            if (_account is null) return;
+            _store.DeleteAccount();
+            _client?.Dispose();
+            _client = null;
+            _account = null;
+            _signedOutByComputer = true;
+        }
+        ClearAvatar();
+        DebugLog.Write("Account", "the desktop no longer accepts this phone's key; signed out locally");
+        RaiseStateChanged();
+    }
+
+    private UndertoneServerClient GetClient()
+    {
+        lock (_gate) return GetClientLocked();
+    }
+
+    private UndertoneServerClient GetClientLocked()
+    {
+        var account = _account ?? throw new UndertoneServerException(UndertoneErrorKind.SignedOut, "Not signed in.");
+        return _client ??= new UndertoneServerClient(_handlerFactory, account.ServerUrl, account.Fingerprint, account.DeviceKey)
+        {
+            StallTimeout = DownloadStallTimeout,
+        };
+    }
+
+    // ── Sync ─────────────────────────────────────────────────────────────
+
+    public Task<UndertoneSyncResult> SyncNowAsync(CancellationToken ct = default)
+    {
+        lock (_gate)
+        {
+            if (_syncTask is { IsCompleted: false } running) return running;
+            if (_account is null) return Task.FromException<UndertoneSyncResult>(new UndertoneServerException(UndertoneErrorKind.SignedOut, "Not signed in."));
+            _syncCts?.Dispose();
+            _syncCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var token = _syncCts.Token;
+            _isSyncing = true;
+            _syncTask = Task.Run(() => RunSyncAsync(token), CancellationToken.None);
+            return _syncTask;
+        }
+    }
+
+    private async Task<UndertoneSyncResult> RunSyncAsync(CancellationToken ct)
+    {
+        RaiseStateChanged();
+        try
+        {
+            var result = await SyncCoreAsync(ct).ConfigureAwait(false);
+            RaiseSyncProgress(UndertoneSyncStage.Done, 1, 1);
+            DebugLog.Write("Account", $"sync done: {result.Songs} songs, {result.Playlists} playlists, " +
+                $"{result.StateChangesPulled} pulled, {result.StateChangesPushed} pushed, {result.PlaysSent} plays");
+            return result;
+        }
+        catch (Exception ex)
+        {
+            // Sync switched off on the computer still ran to the end (catalog, covers, plays):
+            // it reads as finished, not as "didn't finish, try again".
+            RaiseSyncProgress(ex is UndertoneServerException { Kind: UndertoneErrorKind.SyncDisabled } ? UndertoneSyncStage.Done : UndertoneSyncStage.Failed, 0, 0);
+            if (ex is UndertoneServerException { Kind: UndertoneErrorKind.SignedOut }) ForgetAccountLocally();
+            DebugLog.Write("Account", $"sync failed: {(ex is UndertoneServerException n ? n.Kind.ToString() : ex.GetType().Name)}");
+            throw;
+        }
+        finally
+        {
+            _isSyncing = false;
+            RaiseStateChanged();
+        }
+    }
+
+    private async Task<UndertoneSyncResult> SyncCoreAsync(CancellationToken ct)
+    {
+        var client = GetClient();
+
+        // 1. Catalog → the library.
+        RaiseSyncProgress(UndertoneSyncStage.Catalog, 0, 0);
+        await LibraryReady.WaitAsync(ct).ConfigureAwait(false);
+        var albumArtists = await client.GetAlbumArtistsAsync(ct).ConfigureAwait(false);
+        var (songs, settled) = await FetchCatalogAsync(client, ct).ConfigureAwait(false);
+        var tracks = await ImportCatalogAsync(songs, albumArtists, keepUnlisted: !settled, ct).ConfigureAwait(false);
+        RaiseSyncProgress(UndertoneSyncStage.Catalog, tracks.Count, tracks.Count);
+
+        // 2. Covers.
+        await SyncCoversAsync(client, tracks, ct).ConfigureAwait(false);
+
+        // 3–4. Ledger: pull, push favorite/rating edits, playlists. Sync can be off on the
+        // desktop (error 50): the catalog and plays still go through, then the caller hears it.
+        var pulled = 0;
+        var pushed = 0;
+        var playlistCount = 0;
+        UndertoneServerException? syncOff = null;
+        try
+        {
+            RaiseSyncProgress(UndertoneSyncStage.State, 0, 0);
+            var pulledPlaylists = new Dictionary<Guid, PlaylistSyncState>();
+            long checkpoint;
+            (pulled, checkpoint) = await PullAsync(client, pulledPlaylists, ct).ConfigureAwait(false);
+            pushed = await PushTrackStatesAsync(client, ct).ConfigureAwait(false);
+            RaiseSyncProgress(UndertoneSyncStage.Playlists, 0, pulledPlaylists.Count);
+            (playlistCount, var playlistsPushed) = await SyncPlaylistsAsync(client, pulledPlaylists, ct).ConfigureAwait(false);
+            pushed += playlistsPushed;
+            // The checkpoint moves only once every pulled item (playlists too) is applied, so a
+            // sync that fails midway re-pulls rather than loses anything.
+            lock (_gate) _sync.Seq = checkpoint;
+            SaveSyncState();
+        }
+        catch (UndertoneServerException ex) when (ex.Kind == UndertoneErrorKind.SyncDisabled)
+        {
+            syncOff = ex;
+        }
+
+        // 5. Plays.
+        var plays = await SendPlaysAsync(client, ct).ConfigureAwait(false);
+
+        // 6. The desktop's profile picture and name (best effort: never fail the sync).
+        await RefreshAvatarAsync(ct).ConfigureAwait(false);
+        var (nameKnown, displayName, serverName, scrobbling) = await FetchDisplayNameAsync(client, ct).ConfigureAwait(false);
+
+        UndertoneAccount? updated;
+        lock (_gate)
+        {
+            // An unanswered ask keeps the name shown; an answer without one clears it (the desktop's was removed).
+            // The computer's name follows a rename in its Settings (sign-in only had the old one).
+            updated = _account is null ? null
+                : _account with
+                {
+                    LastSyncUtc = UtcNow,
+                    DisplayName = nameKnown ? displayName : _account.DisplayName,
+                    // Where the computer sends the phone's plays: an answer without it is a computer
+                    // that sends them nowhere (an older one), so it clears too.
+                    ComputerScrobbling = nameKnown ? scrobbling : _account.ComputerScrobbling,
+                    ServerName = serverName ?? _account.ServerName,
+                };
+            if (updated is not null)
+            {
+                _store.SaveAccount(updated);
+                _account = updated;
+            }
+        }
+        RaiseStateChanged();
+
+        // 7. Lyrics for downloaded songs that have none saved (after LastSyncUtc, so they count as current).
+        await PrefetchDownloadedLyricsAsync(ct).ConfigureAwait(false);
+        if (syncOff is not null) throw syncOff;
+        return new UndertoneSyncResult(tracks.Count, playlistCount, pulled, pushed, plays);
+    }
+
+    /// <summary>
+    /// search3 pages between two getScanStatus reads. Settled = neither read saw a scan and both
+    /// counted exactly the songs listed: only then is a song missing from the list really gone.
+    /// While the desktop scans it lists only what the scan has reached (it publishes partial
+    /// lists every 1.5 s), so an unsettled catalog must never remove anything. Re-read once when
+    /// the library merely changed between pages; not during a scan, which outlasts a re-read.
+    /// </summary>
+    private async Task<(List<RemoteSong> Songs, bool Settled)> FetchCatalogAsync(UndertoneServerClient client, CancellationToken ct)
+    {
+        var progress = new InlineProgress(n => RaiseSyncProgress(UndertoneSyncStage.Catalog, n, 0));
+        List<RemoteSong> songs = new();
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            var before = await client.GetScanStatusAsync(ct).ConfigureAwait(false);
+            songs = await client.GetAllSongsAsync(progress, ct).ConfigureAwait(false);
+            var after = await client.GetScanStatusAsync(ct).ConfigureAwait(false);
+            var scanning = before.Scanning || after.Scanning;
+            if (!scanning && before.Count >= 0 && before.Count == after.Count && songs.Count == after.Count) return (songs, true);
+            var retry = attempt == 0 && !scanning;
+            DebugLog.Write("Account", $"catalog: {songs.Count} songs listed, the desktop counts {before.Count}, then {after.Count}" +
+                $"{(scanning ? " (scanning)" : "")}; {(retry ? "re-reading" : "adding only, nothing removed")}");
+            if (!retry) break;
+        }
+        return (songs, false);
+    }
+
+    /// <param name="keepUnlisted">The catalog may be partial (desktop scanning or changing): desktop
+    /// songs already here that it does not list stay, instead of leaving (and dropping out of the
+    /// queue) until the next sync brings them back as new songs.</param>
+    private async Task<List<Track>> ImportCatalogAsync(List<RemoteSong> songs, Dictionary<Guid, string> albumArtists,
+        bool keepUnlisted, CancellationToken ct)
+    {
+        var known = new HashSet<Guid>(_library.Tracks.Where(t => t.SourceType == SourceType.UndertoneServer).Select(t => t.Id));
+        if (songs.Count == 0 && known.Count > 0)
+        {
+            // Same rule as a scan: an empty answer never wipes a populated set. A desktop that is
+            // still loading its library at startup lists nothing for a moment.
+            DebugLog.Write("Account", $"catalog: the desktop listed no songs; keeping the {known.Count} already here");
+            return _library.Tracks.Where(t => t.SourceType == SourceType.UndertoneServer).ToList();
+        }
+        var now = UtcNow;
+        var tracks = new List<Track>(songs.Count);
+        lock (_gate)
+        {
+            foreach (var song in songs)
+            {
+                var track = MapSong(song, albumArtists, now);
+                _suffixes[song.Id] = song.Suffix;
+                if (song.Size > 0) _sizes[song.Id] = song.Size;
+                if (!known.Contains(song.Id))
+                {
+                    // New to the phone: the catalog's state (an unsent phone edit wins).
+                    var hex = song.Id.ToString("N");
+                    if (_pending.Tracks.TryGetValue(hex, out var p))
+                    {
+                        track.IsFavorite = p.Favorite;
+                        if (p.Favorite && p.FavoritedAt is { } at) track.FavoritedAt = at;
+                        track.Rating = p.Rating;
+                        track.IsDisliked = p.Disliked;
+                    }
+                    else
+                    {
+                        track.IsFavorite = song.Starred;
+                        track.Rating = song.UserRating;
+                        SetBaselineLocked(hex, song.Starred, song.UserRating, false);
+                    }
+                    track.PlayCount = song.PlayCount;
+                }
+                tracks.Add(track);
+            }
+        }
+        if (keepUnlisted)
+        {
+            var listed = new HashSet<Guid>(songs.Select(s => s.Id));
+            var unlisted = _library.Tracks.Where(t => t.SourceType == SourceType.UndertoneServer && !listed.Contains(t.Id)).ToList();
+            if (unlisted.Count > 0) DebugLog.Write("Account", $"catalog: keeping {unlisted.Count} songs the desktop did not list this time");
+            tracks.AddRange(unlisted);
+        }
+        SaveSyncState();
+        await _library.ReplaceRemoteTracksAsync(tracks, ct).ConfigureAwait(false);
+
+        // Known songs: the catalog's favorite/rating (unless an edit is pending); counts only grow.
+        var updates = new List<(Track Track, bool Favorite, int Rating, int PlayCount, bool Preferences)>();
+        lock (_gate)
+        {
+            foreach (var song in songs)
+            {
+                if (!known.Contains(song.Id)) continue;
+                var lib = _library.GetTrackById(song.Id);
+                if (lib is null || lib.SourceType != SourceType.UndertoneServer) continue;
+                var hex = song.Id.ToString("N");
+                var preferences = !_pending.Tracks.ContainsKey(hex);
+                if (preferences) SetBaselineLocked(hex, song.Starred, song.UserRating, lib.IsDisliked);
+                if ((preferences && (lib.IsFavorite != song.Starred || lib.Rating != song.UserRating)) || song.PlayCount > lib.PlayCount)
+                    updates.Add((lib, song.Starred, song.UserRating, song.PlayCount, preferences));
+            }
+        }
+        if (updates.Count > 0)
+        {
+            SaveSyncState();
+            var favoriteChanged = new List<Track>();
+            await OnUiAsync(() =>
+            {
+                foreach (var (t, fav, rating, count, preferences) in updates)
+                {
+                    if (preferences)
+                    {
+                        if (t.IsFavorite != fav) { t.IsFavorite = fav; favoriteChanged.Add(t); }
+                        t.Rating = rating;
+                    }
+                    if (count > t.PlayCount) t.PlayCount = count;
+                }
+            }).ConfigureAwait(false);
+            await _library.SaveTrackUserStateAsync(updates.Select(u => u.Track).ToList()).ConfigureAwait(false);
+            if (favoriteChanged.Count > 0) await OnUiAsync(() => _library.NotifyFavoritesChanged(favoriteChanged)).ConfigureAwait(false);
+        }
+        return tracks;
+    }
+
+    private static Track MapSong(RemoteSong s, Dictionary<Guid, string> albumArtists, DateTime now)
+    {
+        var artist = string.IsNullOrWhiteSpace(s.Artist) ? "Unknown Artist" : s.Artist;
+        var album = string.IsNullOrWhiteSpace(s.Album) ? "Unknown Album" : s.Album;
+        var albumArtist = s.AlbumId is { } a && albumArtists.TryGetValue(a, out var aa) && !string.IsNullOrWhiteSpace(aa) ? aa : artist;
+        var created = s.Created is { } c && c <= now ? c : now;
+        return new Track
+        {
+            Id = s.Id,
+            FilePath = UndertoneRemoteIds.ToPath(s.Id),
+            SourceType = SourceType.UndertoneServer,
+            SourceTrackId = UndertoneRemoteIds.ToServerTrackId(s.Id),
+            Title = string.IsNullOrWhiteSpace(s.Title) ? "Unknown Title" : s.Title,
+            Artist = artist,
+            AlbumArtist = albumArtist,
+            Album = album,
+            // The desktop's own album id, so its albums group (and their covers file) the same way here.
+            AlbumId = s.AlbumId ?? Track.ComputeAlbumId(albumArtist, album),
+            Duration = TimeSpan.FromSeconds(s.DurationSeconds),
+            TrackNumber = s.Track,
+            DiscNumber = s.Disc > 0 ? s.Disc : 1,
+            Year = s.Year,
+            Genre = s.Genre,
+            Bitrate = s.BitRate,
+            SampleRate = s.SamplingRate,
+            FileSize = s.Size,
+            Codec = CodecFor(s.Suffix, s.BitRate),
+            DateAdded = created,
+            LastModified = created,
+        };
+    }
+
+    /// <summary>A codec label Track's badge logic understands (it cannot look at a remote path's extension).</summary>
+    internal static string CodecFor(string suffix, int bitrate) => suffix switch
+    {
+        "flac" => "FLAC",
+        "mp3" => "MP3",
+        // The server does not say whether an MP4 holds ALAC or AAC; ALAC runs far above AAC's rates.
+        "m4a" or "mp4" or "m4b" => bitrate > 600 ? "ALAC" : "AAC",
+        "alac" => "ALAC",
+        "aac" => "AAC",
+        "ogg" or "oga" => "Vorbis",
+        "opus" => "Opus",
+        "wav" => "PCM",
+        "aiff" or "aif" => "AIFF (PCM)",
+        "wma" => "WMA",
+        "ape" => "Monkey's Audio",
+        "wv" => "WavPack",
+        "dsf" or "dff" => "DSD",
+        _ => suffix.ToUpperInvariant(),
+    };
+
+    private async Task SyncCoversAsync(UndertoneServerClient client, List<Track> tracks, CancellationToken ct)
+    {
+        var now = UtcNow;
+        var due = tracks.Select(t => t.AlbumId).Distinct()
+            .Where(id => id != Track.UnknownAlbumBucketId && !_coverMisses.ContainsKey(id))
+            .Where(id => CoverIsDue(_persistence.GetArtworkPath(id), now))
+            .ToList();
+        RaiseSyncProgress(UndertoneSyncStage.Covers, 0, due.Count);
+        if (due.Count == 0) return;
+
+        var done = 0;
+        var written = 0;
+        var failed = 0;
+        var full = false;
+        // The catalog decides how many covers are written (one per album, each capped on its
+        // own), so they keep the downloads' reserve too, or a desktop could fill the phone with them.
+        var coverDir = Path.GetDirectoryName(_persistence.GetArtworkPath(due[0])) ?? _offlineDir;
+        // Covers are not worth a sync: a cover that fails (a timeout, a dropped connection) is
+        // skipped and asked again next sync, and the favourites, playlists and plays still go.
+        // Many failures mean the desktop is gone; stop asking and let the next stage say so.
+        using var stage = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        try
+        {
+            await Parallel.ForEachAsync(due, new ParallelOptions { MaxDegreeOfParallelism = CoverConcurrency, CancellationToken = stage.Token },
+                async (albumId, token) =>
+                {
+                    if (FreeSpace(coverDir) < StorageReserveBytes)
+                    {
+                        full = true;
+                        stage.Cancel();
+                        return;
+                    }
+                    try
+                    {
+                        if (await client.DownloadCoverAsync(albumId, _persistence.GetArtworkPath(albumId), token).ConfigureAwait(false))
+                            Interlocked.Increment(ref written);
+                        else
+                            _coverMisses.TryAdd(albumId, 0);
+                    }
+                    catch (UndertoneServerException ex) when (ex.Kind == UndertoneErrorKind.Server)
+                    {
+                        _coverMisses.TryAdd(albumId, 0);
+                    }
+                    catch (UndertoneServerException ex) when (ex.Kind is not (UndertoneErrorKind.SignedOut or UndertoneErrorKind.CertificateChanged))
+                    {
+                        if (Interlocked.Increment(ref failed) >= CoverFailureLimit) stage.Cancel();
+                    }
+                    RaiseSyncProgress(UndertoneSyncStage.Covers, Interlocked.Increment(ref done), due.Count);
+                }).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { /* gave up after CoverFailureLimit, or the phone is full */ }
+        finally
+        {
+            if (full) DebugLog.Write("Account", $"covers: {written} saved, then stopped: the phone is too full (the reserve stays free)");
+            else if (failed > 0) DebugLog.Write("Account", $"covers: {written} saved, {failed} failed{(stage.IsCancellationRequested && !ct.IsCancellationRequested ? ", stopped asking" : "")}");
+            // Rebuild so albums pick the new files up.
+            if (written > 0) _library.NotifyMetadataChanged();
+        }
+    }
+
+    /// <summary>The desktop's profile name for the header and the computer's name (getUndertoneSyncStatus).
+    /// Known = false when the ask failed (unreachable, a desktop without it): the names shown stay.</summary>
+    private static async Task<(bool Known, string? Name, string? ServerName, ComputerScrobbling? Scrobbling)> FetchDisplayNameAsync(UndertoneServerClient client, CancellationToken ct)
+    {
+        try
+        {
+            var (name, server, scrobbling) = await client.GetDisplayNameAsync(ct).ConfigureAwait(false);
+            return (true, name, server, scrobbling);
+        }
+        catch (UndertoneServerException ex)
+        {
+            DebugLog.Write("Account", $"profile name not fetched: {ex.Kind}");
+            return (false, null, null, null);
+        }
+    }
+
+    private static bool CoverIsDue(string path, DateTime now)
+    {
+        try
+        {
+            return !File.Exists(path) || now - File.GetLastWriteTimeUtc(path) > CoverMaxAge;
+        }
+        catch { return true; }
+    }
+
+    /// <summary>Pulls the ledger after the checkpoint (looping while the server says there is
+    /// more), applies song states, collects playlist states. Returns the applied count and the
+    /// new checkpoint (not yet saved).</summary>
+    private async Task<(int Applied, long Checkpoint)> PullAsync(UndertoneServerClient client, Dictionary<Guid, PlaylistSyncState> playlists,
+        CancellationToken ct)
+    {
+        long since;
+        lock (_gate) since = _sync.Seq;
+        // From the start (first sign-in, or again after a sign-out removed the desktop's songs
+        // and playlists): our own entries are the only copy of what this phone last edited, so
+        // they apply too. Later pulls skip them: the phone already has what it pushed.
+        var fromStart = since == 0;
+        var applied = 0;
+        for (var round = 0; round < 1000; round++)
+        {
+            var page = await client.GetSyncChangesAsync(since, _deviceId, DeviceName, ct).ConfigureAwait(false);
+            var trackItems = new List<(Guid Id, PulledItem Item)>();
+            var maxSeq = since;
+            foreach (var item in page.Items)
+            {
+                maxSeq = Math.Max(maxSeq, item.Seq);
+                // Our own pushes echo back: nothing to apply.
+                if (!fromStart && string.Equals(item.Device, _deviceId, StringComparison.Ordinal)) continue;
+                if (!UndertoneRemoteIds.TryParseSyncId(item.Id, out var id)) continue;
+                switch (item.Kind)
+                {
+                    case SyncKinds.Track:
+                        trackItems.Add((id, item));
+                        break;
+                    case SyncKinds.Playlist when ParsePlaylistState(item.Payload, item.UpdatedUtc) is { } state:
+                        playlists[id] = state; // pages are in seq order: the later one is newer
+                        break;
+                }
+            }
+            applied += await ApplyTrackItemsAsync(trackItems).ConfigureAwait(false);
+            RaiseSyncProgress(UndertoneSyncStage.State, applied, 0);
+
+            var next = page.Items.Count > 0 ? maxSeq : since;
+            // "more" comes from servers that page the ledger; an older server truncates silently,
+            // which shows as a last item below the reported sequence.
+            var more = page.More || (page.Items.Count > 0 && maxSeq < page.Seq);
+            if (!more || next <= since) return (applied, next);
+            since = next;
+        }
+        return (applied, since);
+    }
+
+    private async Task<int> ApplyTrackItemsAsync(List<(Guid Id, PulledItem Item)> items)
+    {
+        if (items.Count == 0) return 0;
+        var now = UtcNow;
+        var updates = new List<(Track Track, TrackSyncState State, bool Preferences)>();
+        var pendingChanged = false;
+        lock (_gate)
+        {
+            foreach (var (id, item) in items)
+            {
+                var lib = _library.GetTrackById(id);
+                if (lib is null || lib.SourceType != SourceType.UndertoneServer) continue;
+                var state = ParseTrackState(item.Payload, now);
+                var hex = id.ToString("N");
+                var preferences = true;
+                if (_pending.Tracks.TryGetValue(hex, out var p))
+                {
+                    // An unsent phone edit newer than this item wins (it is pushed next).
+                    if (p.UpdatedUtc >= item.UpdatedUtc) preferences = false;
+                    else { _pending.Tracks.Remove(hex); pendingChanged = true; }
+                }
+                // Echo guard first: the library save below must not look like a phone edit.
+                if (preferences) SetBaselineLocked(hex, state.Favorite, state.Rating, state.Disliked);
+                updates.Add((lib, state, preferences));
+            }
+        }
+        if (pendingChanged) SchedulePendingSave();
+        if (updates.Count == 0) return 0;
+        SaveSyncState();
+
+        var changed = new List<Track>();
+        var favoriteChanged = new List<Track>();
+        await OnUiAsync(() =>
+        {
+            foreach (var (t, s, preferences) in updates)
+            {
+                var any = false;
+                if (preferences)
+                {
+                    if (t.IsFavorite != s.Favorite) { t.IsFavorite = s.Favorite; favoriteChanged.Add(t); any = true; }
+                    if (s.Favorite && s.FavoritedAt is { } at && t.FavoritedAt != at) { t.FavoritedAt = at; any = true; }
+                    if (t.Rating != s.Rating) { t.Rating = s.Rating; any = true; }
+                    if (t.IsDisliked != s.Disliked) { t.IsDisliked = s.Disliked; any = true; }
+                }
+                // Counts only grow (the desktop's rule): a device that missed plays never rolls them back.
+                if (s.PlayCount > t.PlayCount) { t.PlayCount = s.PlayCount; any = true; }
+                if (s.LastPlayed is { } lp && (t.LastPlayed is null || lp > t.LastPlayed)) { t.LastPlayed = lp; any = true; }
+                if (any) changed.Add(t);
+            }
+        }).ConfigureAwait(false);
+        if (changed.Count > 0) await _library.SaveTrackUserStateAsync(changed).ConfigureAwait(false);
+        if (favoriteChanged.Count > 0) await OnUiAsync(() => _library.NotifyFavoritesChanged(favoriteChanged)).ConfigureAwait(false);
+        return changed.Count;
+    }
+
+    /// <summary>Untrusted payload → a clamped state (rating 0..5, counts ≥ 0, times not in the future).</summary>
+    internal static TrackSyncState ParseTrackState(JsonElement p, DateTime now)
+    {
+        static DateTime? NotFuture(DateTime? d, DateTime now) => d is { } v ? (v > now ? now : v) : null;
+        return new TrackSyncState(
+            UndertoneServerClient.Bool(p, "favorite"),
+            Math.Clamp(UndertoneServerClient.Int(p, "rating"), 0, 5),
+            UndertoneServerClient.Bool(p, "disliked"),
+            Math.Max(0, UndertoneServerClient.Int(p, "playCount")),
+            NotFuture(UndertoneServerClient.Date(p, "lastPlayed"), now),
+            NotFuture(UndertoneServerClient.Date(p, "favoritedAt"), now));
+    }
+
+    /// <summary>Untrusted payload → a playlist state: capped strings, only valid non-empty track Guids.</summary>
+    internal PlaylistSyncState? ParsePlaylistState(JsonElement p, DateTime updatedUtc)
+    {
+        if (p.ValueKind != JsonValueKind.Object) return null;
+        var now = UtcNow;
+        var ids = new List<Guid>();
+        if (p.TryGetProperty("trackIds", out var arr) && arr.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var e in arr.EnumerateArray())
+            {
+                if (ids.Count >= MaxPlaylistTracks) break;
+                if (e.ValueKind != JsonValueKind.String) continue;
+                var s = e.GetString();
+                if ((Guid.TryParseExact(s, "D", out var g) || Guid.TryParseExact(s, "N", out g)) && g != Guid.Empty) ids.Add(g);
+            }
+        }
+        var modified = UndertoneServerClient.Date(p, "modifiedAt") ?? updatedUtc;
+        if (modified > now) modified = now;
+        return new PlaylistSyncState(
+            UndertoneServerClient.Cap(UndertoneServerClient.Str(p, "name"), MaxPlaylistName) ?? string.Empty,
+            UndertoneServerClient.Cap(UndertoneServerClient.Str(p, "description"), MaxPlaylistDescription) ?? string.Empty,
+            UndertoneServerClient.Cap(UndertoneServerClient.Str(p, "color"), 32) ?? string.Empty,
+            ids, modified, UndertoneServerClient.Bool(p, "deleted"));
+    }
+
+    private async Task<int> PushTrackStatesAsync(UndertoneServerClient client, CancellationToken ct)
+    {
+        List<KeyValuePair<string, PendingTrackState>> pending;
+        lock (_gate) pending = _pending.Tracks.Where(kv => UndertoneRemoteIds.TryParseSyncId(kv.Key, out _)).ToList();
+        if (pending.Count == 0) return 0;
+        var now = UtcNow;
+        var sent = 0;
+        var all = pending.Select(kv => (Entry: kv, Item: new PushItem(SyncKinds.Track, kv.Key.ToLowerInvariant(),
+            new TrackSyncState(kv.Value.Favorite, Math.Clamp(kv.Value.Rating, 0, 5), kv.Value.Disliked,
+                // Plays travel as scrobbles: 0 and no date leave the desktop's max-merge untouched.
+                PlayCount: 0, LastPlayed: null,
+                FavoritedAt: kv.Value.Favorite ? NotAfter(kv.Value.FavoritedAt, now) : null),
+            NotAfter(kv.Value.UpdatedUtc, now) ?? now)));
+        foreach (var batch in PushChunks(all, x => x.Item))
+        {
+            var items = batch.Select(x => x.Item).ToList();
+            var chunk = batch.Select(x => x.Entry).ToList();
+            await client.PushSyncChangesAsync(_deviceId, DeviceName, items, ct).ConfigureAwait(false);
+            lock (_gate)
+            {
+                foreach (var (hex, state) in chunk)
+                {
+                    // Only if untouched since the snapshot: a newer edit stays queued.
+                    if (_pending.Tracks.TryGetValue(hex, out var current) && ReferenceEquals(current, state))
+                        _pending.Tracks.Remove(hex);
+                    SetBaselineLocked(hex, state.Favorite, state.Rating, state.Disliked);
+                }
+            }
+            sent += items.Count;
+            SchedulePendingSave();
+            SaveSyncState();
+        }
+        return sent;
+    }
+
+    /// <summary>
+    /// Desktop playlists on the phone: pulled states apply unless the phone edited that playlist
+    /// later (ModifiedAt, last writer wins); a synced playlist missing or older on the phone is
+    /// restored from the last agreed copy (the phone has no playlist delete, so "missing" means a
+    /// stale in-memory save dropped it); phone edits of synced playlists are pushed. Playlists
+    /// created on the phone stay on the phone. Returns (desktop playlists on the phone, pushed).
+    /// </summary>
+    private async Task<(int Count, int Pushed)> SyncPlaylistsAsync(UndertoneServerClient client, Dictionary<Guid, PlaylistSyncState> pulled,
+        CancellationToken ct)
+    {
+        var phone = await _persistence.LoadPlaylistsAsync().ConfigureAwait(false);
+        Dictionary<string, PlaylistSyncState> agreed;
+        Dictionary<string, DateTime> deleted;
+        lock (_gate)
+        {
+            agreed = new Dictionary<string, PlaylistSyncState>(_sync.Playlists, StringComparer.OrdinalIgnoreCase);
+            deleted = new Dictionary<string, DateTime>(_pending.DeletedPlaylists, StringComparer.OrdinalIgnoreCase);
+        }
+        var now = UtcNow;
+        var changed = false;
+
+        // Deleted on the phone: gone from the phone's list even if a stale save brought it back,
+        // unless the computer edited it after the delete (last writer wins, the edit is newer).
+        var resolved = new List<string>();
+        foreach (var (hex, at) in deleted)
+        {
+            if (!UndertoneRemoteIds.TryParseSyncId(hex, out var id) || !agreed.ContainsKey(hex)) { resolved.Add(hex); continue; }
+            if (pulled.TryGetValue(id, out var state) && (state.Deleted || Newer(state.ModifiedAt, at))) { resolved.Add(hex); continue; }
+            pulled.Remove(id);
+            if (phone.RemoveAll(p => p.Id == id) > 0) changed = true;
+        }
+        foreach (var hex in resolved) deleted.Remove(hex);
+
+        foreach (var (id, state) in pulled)
+        {
+            var hex = id.ToString("N");
+            var local = phone.FirstOrDefault(p => p.Id == id);
+            var phoneEdited = local is not null && agreed.TryGetValue(hex, out var last) && Newer(local.ModifiedAt, last.ModifiedAt);
+            if (phoneEdited && !Newer(state.ModifiedAt, local!.ModifiedAt)) continue;
+            if (state.Deleted)
+            {
+                if (local is not null) { phone.Remove(local); changed = true; }
+                agreed.Remove(hex);
+                continue;
+            }
+            if (local is null)
+            {
+                local = new Playlist { Id = id, CreatedAt = state.ModifiedAt };
+                phone.Add(local);
+            }
+            ApplyPlaylistState(local, state);
+            agreed[hex] = state;
+            changed = true;
+        }
+
+        foreach (var (hex, state) in agreed.ToList())
+        {
+            if (!UndertoneRemoteIds.TryParseSyncId(hex, out var id) || state.Deleted) { agreed.Remove(hex); continue; }
+            if (pulled.ContainsKey(id) || deleted.ContainsKey(hex)) continue;
+            var local = phone.FirstOrDefault(p => p.Id == id);
+            if (local is null)
+            {
+                local = new Playlist { Id = id, CreatedAt = state.ModifiedAt };
+                phone.Add(local);
+                ApplyPlaylistState(local, state);
+                changed = true;
+            }
+            else if (Newer(state.ModifiedAt, local.ModifiedAt))
+            {
+                ApplyPlaylistState(local, state);
+                changed = true;
+            }
+        }
+
+        var toPush = new List<(string Hex, PlaylistSyncState State)>();
+        foreach (var (hex, at) in deleted)
+            toPush.Add((hex, PlaylistSyncState.Tombstone(Guid.Empty, NotAfter(Utc(at), now) ?? now)));
+        foreach (var (hex, state) in agreed)
+        {
+            if (deleted.ContainsKey(hex)) continue;
+            var local = phone.FirstOrDefault(p => UndertoneRemoteIds.TryParseSyncId(hex, out var id) && p.Id == id);
+            if (local is null || !Newer(local.ModifiedAt, state.ModifiedAt)) continue;
+            var modified = NotAfter(Utc(local.ModifiedAt), now) ?? now;
+            // Within the server's limits, or it drops the whole item: name ≤ 200, description
+            // ≤ 2000, ≤ 10000 songs, colour #RRGGBB[AA] or none (none keeps the desktop's).
+            toPush.Add((hex, new PlaylistSyncState(
+                UndertoneServerClient.Cap(local.Name ?? string.Empty, MaxPlaylistName)!,
+                UndertoneServerClient.Cap(local.Description ?? string.Empty, MaxPlaylistDescription)!,
+                IsSyncColor(local.Color) ? local.Color! : string.Empty,
+                local.TrackIds.Where(g => g != Guid.Empty).Take(MaxPlaylistTracks).ToList(),
+                modified, Deleted: false)));
+        }
+
+        if (changed)
+        {
+            await _persistence.SavePlaylistsAsync(phone).ConfigureAwait(false);
+            RaisePlaylistsChanged();
+        }
+
+        foreach (var chunk in PushChunks(toPush, p => new PushItem(SyncKinds.Playlist, p.Hex.ToLowerInvariant(), p.State, p.State.ModifiedAt)))
+        {
+            var items = chunk.Select(p => new PushItem(SyncKinds.Playlist, p.Hex.ToLowerInvariant(), p.State, p.State.ModifiedAt)).ToList();
+            await client.PushSyncChangesAsync(_deviceId, DeviceName, items, ct).ConfigureAwait(false);
+            var tombstones = false;
+            foreach (var (hex, state) in chunk)
+            {
+                if (!state.Deleted)
+                {
+                    agreed[hex] = state;
+                    continue;
+                }
+                // Deleted on the computer now: no longer one of the playlists the phone keeps in step.
+                agreed.Remove(hex);
+                lock (_gate)
+                {
+                    if (_pending.DeletedPlaylists.TryGetValue(hex, out var at) && at == deleted[hex])
+                        _pending.DeletedPlaylists.Remove(hex);
+                }
+                tombstones = true;
+            }
+            if (tombstones) SchedulePendingSave();
+        }
+
+        lock (_gate)
+        {
+            _sync.Playlists = agreed;
+            // Settled without a push (the computer deleted or re-edited it first): not asked again.
+            foreach (var hex in resolved) _pending.DeletedPlaylists.Remove(hex);
+        }
+        if (resolved.Count > 0) SchedulePendingSave();
+        return (agreed.Count, toPush.Count);
+    }
+
+    private static bool IsSyncColor(string? color) =>
+        color is { Length: 7 or 9 } && color[0] == '#' && color.AsSpan(1).ContainsAnyExcept("0123456789abcdefABCDEF") == false;
+
+    /// <summary>
+    /// Splits a push into requests the server accepts: at most <see cref="PushChunk"/> items and
+    /// well under its 4 MB body limit (a playlist can carry 10000 ids, ~400 KB).
+    /// </summary>
+    internal static IEnumerable<List<T>> PushChunks<T>(IEnumerable<T> source, Func<T, PushItem> item)
+    {
+        var chunk = new List<T>();
+        long bytes = 0;
+        foreach (var entry in source)
+        {
+            var size = System.Text.Encoding.UTF8.GetByteCount(SyncJson.Serialize(item(entry).Payload)) + 200L;
+            if (chunk.Count > 0 && (chunk.Count >= PushChunk || bytes + size > MaxPushBytes))
+            {
+                yield return chunk;
+                chunk = new List<T>();
+                bytes = 0;
+            }
+            chunk.Add(entry);
+            bytes += size;
+        }
+        if (chunk.Count > 0) yield return chunk;
+    }
+
+    private static void ApplyPlaylistState(Playlist local, PlaylistSyncState state)
+    {
+        if (!string.IsNullOrWhiteSpace(state.Name)) local.Name = state.Name;
+        local.Description = state.Description ?? string.Empty;
+        if (IsSyncColor(state.Color)) local.Color = state.Color;
+        local.TrackIds = state.TrackIds?.Where(g => g != Guid.Empty).Take(MaxPlaylistTracks).ToList() ?? new List<Guid>();
+        local.ModifiedAt = Utc(state.ModifiedAt);
+    }
+
+    private async Task<int> SendPlaysAsync(UndertoneServerClient client, CancellationToken ct)
+    {
+        List<PendingPlay> plays;
+        // A play still waiting for its verdict (the song is playing) stays for a later sync.
+        lock (_gate) plays = _pending.Plays.Where(p => p.Scrobble != PlayScrobbleWire.Pending).ToList();
+        if (plays.Count == 0) return 0;
+        RaiseSyncProgress(UndertoneSyncStage.Plays, 0, plays.Count);
+        var nowMs = _time.GetUtcNow().ToUnixTimeMilliseconds();
+        var sent = 0;
+        foreach (var batch in plays.Chunk(ScrobbleBatch))
+        {
+            var valid = batch
+                .Select(p => (Ok: UndertoneRemoteIds.TryParseSyncId(p.Id, out var id), Id: id, Time: Math.Clamp(p.Time, 0, nowMs), p.Scrobble))
+                .Where(p => p.Ok).Select(p => (p.Id, p.Time, p.Scrobble)).ToList();
+            if (valid.Count > 0) await client.ScrobbleAsync(valid, ct).ConfigureAwait(false);
+            var sentSet = new HashSet<PendingPlay>(batch, ReferenceEqualityComparer.Instance);
+            lock (_gate) _pending.Plays.RemoveAll(p => sentSet.Contains(p));
+            sent += valid.Count;
+            SchedulePendingSave();
+            RaiseSyncProgress(UndertoneSyncStage.Plays, sent, plays.Count);
+        }
+        return sent;
+    }
+
+    // ── Phone-side changes ───────────────────────────────────────────────
+
+    public void RecordPlay(Track track, DateTime playedUtc) => Record(track, playedUtc, null);
+
+    public void RecordStartedPlay(Track track, DateTime playedUtc) => Record(track, playedUtc, PlayScrobbleWire.Pending);
+
+    private void Record(Track track, DateTime playedUtc, string? scrobble)
+    {
+        if (!IsRemote(track)) return;
+        var utc = playedUtc.Kind == DateTimeKind.Local ? playedUtc.ToUniversalTime() : DateTime.SpecifyKind(playedUtc, DateTimeKind.Utc);
+        var ms = Math.Clamp(new DateTimeOffset(utc).ToUnixTimeMilliseconds(), 0, _time.GetUtcNow().ToUnixTimeMilliseconds());
+        lock (_gate)
+        {
+            // One song plays at a time: a play still held when the next starts never counted.
+            if (scrobble == PlayScrobbleWire.Pending) DecideHeld(_ => true, PlayScrobble.No);
+            _pending.Plays.Add(new PendingPlay(track.Id.ToString("N"), ms, scrobble));
+            if (_pending.Plays.Count > MaxQueuedPlays) _pending.Plays.RemoveRange(0, _pending.Plays.Count - MaxQueuedPlays);
+        }
+        SchedulePendingSave();
+    }
+
+    public void DecidePlay(Track track, PlayScrobble verdict)
+    {
+        if (!IsRemote(track)) return;
+        var id = track.Id.ToString("N");
+        bool decided;
+        lock (_gate) decided = DecideHeld(p => p.Id == id, verdict, latestOnly: true);
+        if (decided) SchedulePendingSave();
+    }
+
+    /// <summary>Gives held plays matching <paramref name="match"/> their verdict (the latest only, or
+    /// all of them). Under _gate.</summary>
+    private bool DecideHeld(Func<PendingPlay, bool> match, PlayScrobble verdict, bool latestOnly = false)
+    {
+        var any = false;
+        for (var i = _pending.Plays.Count - 1; i >= 0; i--)
+        {
+            var p = _pending.Plays[i];
+            if (p.Scrobble != PlayScrobbleWire.Pending || !match(p)) continue;
+            _pending.Plays[i] = p with { Scrobble = PlayScrobbleWire.Of(verdict) };
+            any = true;
+            if (latestOnly) break;
+        }
+        return any;
+    }
+
+    public ComputerScrobbling? ComputerScrobbling
+    {
+        get { lock (_gate) return _account?.ComputerScrobbling; }
+    }
+
+    public Task SavePlayQueueAsync(PlayQueueShare share, CancellationToken ct = default)
+    {
+        lock (_gate)
+        {
+            if (_account is null) return Task.CompletedTask;
+        }
+        return GetClient().SavePlayQueueAsync(share, ct);
+    }
+
+    public bool IsSyncedPlaylist(Guid playlistId)
+    {
+        lock (_gate) return _account is not null && _sync.Playlists.ContainsKey(playlistId.ToString("N"));
+    }
+
+    /// <summary>A playlist the phone deleted: one of the computer's is queued for a tombstone on
+    /// the next sync (SyncPlaylistsAsync), which otherwise restored it as a stale save's loss.</summary>
+    public void RecordPlaylistDeleted(Guid playlistId)
+    {
+        var hex = playlistId.ToString("N");
+        lock (_gate)
+        {
+            if (_account is null || !_sync.Playlists.ContainsKey(hex)) return;
+            _pending.DeletedPlaylists[hex] = UtcNow;
+        }
+        SchedulePendingSave();
+    }
+
+    /// <summary>The library saved user state (from <see cref="UndertoneStateRecorder"/>, on a worker
+    /// thread): a desktop song whose favorite/rating/dislike differs from the last agreed state is
+    /// queued for the next sync. Anything else (play-position saves, our own applied pulls) is not.</summary>
+    void ITrackStateRecorder.RecordTrackStates(IEnumerable<Track> tracks)
+    {
+        var now = UtcNow;
+        var changed = false;
+        foreach (var t in tracks)
+        {
+            if (t is null || !IsRemote(t)) continue;
+            var hex = t.Id.ToString("N");
+            var fav = t.IsFavorite;
+            var rating = Math.Clamp(t.Rating, 0, 5);
+            var disliked = t.IsDisliked;
+            lock (_gate)
+            {
+                var agreed = _sync.Baseline.TryGetValue(hex, out var b) ? b : Default;
+                if (agreed.Favorite == fav && agreed.Rating == rating && agreed.Disliked == disliked)
+                {
+                    if (_pending.Tracks.Remove(hex)) changed = true;
+                    continue;
+                }
+                if (_pending.Tracks.TryGetValue(hex, out var p) && p.Favorite == fav && p.Rating == rating && p.Disliked == disliked)
+                    continue;
+                _pending.Tracks[hex] = new PendingTrackState(fav, rating, disliked, fav ? t.FavoritedAt : null, now);
+                changed = true;
+            }
+        }
+        if (changed) SchedulePendingSave();
+    }
+
+    private static readonly SyncedTrackState Default = new(false, 0, false);
+
+    private void SetBaselineLocked(string hex, bool favorite, int rating, bool disliked)
+    {
+        if (!favorite && rating == 0 && !disliked) _sync.Baseline.Remove(hex);
+        else _sync.Baseline[hex] = new SyncedTrackState(favorite, rating, disliked);
+    }
+
+    private void SchedulePendingSave() => _ = Task.Run(SavePendingNow);
+
+    private void SavePendingNow()
+    {
+        lock (_saveGate)
+        {
+            UndertonePendingState copy;
+            lock (_gate)
+            {
+                copy = new UndertonePendingState
+                {
+                    ServerUrl = _pending.ServerUrl,
+                    UserName = _pending.UserName,
+                    Tracks = new Dictionary<string, PendingTrackState>(_pending.Tracks),
+                    Plays = _pending.Plays.ToList(),
+                    DeletedPlaylists = new Dictionary<string, DateTime>(_pending.DeletedPlaylists),
+                };
+            }
+            try
+            {
+                _store.SavePending(copy);
+                _pendingSaveFailures = 0;
+            }
+            catch (Exception ex)
+            {
+                DebugLog.Write("Account", $"pending save failed ({ex.GetType().Name})");
+                // Until a save lands the queued plays live only in memory, so try again shortly
+                // instead of waiting for the next change (a process kill in between loses them).
+                if (++_pendingSaveFailures <= PendingSaveRetries)
+                    _ = Task.Delay(TimeSpan.FromSeconds(_pendingSaveFailures)).ContinueWith(_ => SavePendingNow(), TaskScheduler.Default);
+            }
+        }
+    }
+
+    private const int PendingSaveRetries = 5;
+    private int _pendingSaveFailures; // under _saveGate
+
+    private void SaveSyncState()
+    {
+        lock (_saveGate)
+        {
+            UndertoneSyncState copy;
+            lock (_gate)
+            {
+                copy = new UndertoneSyncState
+                {
+                    ServerUrl = _sync.ServerUrl,
+                    UserName = _sync.UserName,
+                    Seq = _sync.Seq,
+                    Baseline = new Dictionary<string, SyncedTrackState>(_sync.Baseline),
+                    Playlists = new Dictionary<string, PlaylistSyncState>(_sync.Playlists),
+                };
+            }
+            try { _store.SaveSyncState(copy); }
+            catch (Exception ex) { DebugLog.Write("Account", $"sync state save failed ({ex.GetType().Name})"); }
+        }
+    }
+
+    // ── Downloads ────────────────────────────────────────────────────────
+
+    public bool IsRemote(Track track) =>
+        track is not null && track.SourceType == SourceType.UndertoneServer
+        && UndertoneRemoteIds.TryParsePath(track.FilePath, out var id) && id == track.Id;
+
+    public bool IsDownloaded(Track track) => IsRemote(track) && _downloaded.ContainsKey(track.Id);
+
+    public long DownloadedBytes => _downloaded.Values.Sum(f => f.Size);
+
+    public int DownloadedCount => _downloaded.Count;
+
+    /// <summary>Whether the phone is on an unmetered network (Wi-Fi). Null = unknown, which never blocks
+    /// a download. With Settings → Downloads → Wi-Fi only on, a download asked for on mobile data is refused.</summary>
+    public Func<bool>? IsOnWifi { get; init; }
+
+    public async Task DownloadAsync(IEnumerable<Track> tracks, CancellationToken ct = default)
+    {
+        var ids = tracks.Where(IsRemote).Select(t => t.Id).Distinct().Where(id => !_downloaded.ContainsKey(id)).ToList();
+        if (ids.Count > 0 && IsOnWifi is { } onWifi && !onWifi()
+            && (await _persistence.LoadSettingsAsync().ConfigureAwait(false)).MobileDownloadWifiOnly)
+            throw new UndertoneServerException(UndertoneErrorKind.WifiRequired, "Downloads are set to Wi-Fi only.");
+        foreach (var id in ids) _withdrawn.TryRemove(id, out _);   // asked for again: no longer removed
+        await RunDownloadsAsync(ids, ct).ConfigureAwait(false);
+    }
+
+    public Task DownloadAllAsync(CancellationToken ct = default) => DownloadAsync(_library.Tracks.ToList(), ct);
+
+    private Task RunDownloadsAsync(List<Guid> ids, CancellationToken ct)
+    {
+        if (ids.Count == 0) return Task.CompletedTask;
+        UndertoneServerClient client;
+        try { client = GetClient(); }
+        catch (UndertoneServerException ex) { return Task.FromException(ex); }
+
+        Task run;
+        lock (_downloadRuns)
+        {
+            var stop = _downloadCts.Token;
+            run = Task.Run(() => DownloadBatchAsync(client, ids, ct, stop), CancellationToken.None);
+            _downloadRuns.Add(run);
+        }
+        _ = run.ContinueWith(t => { lock (_downloadRuns) _downloadRuns.Remove(t); }, TaskScheduler.Default);
+        // New downloads get their lyrics saved too, so they show with the desktop off.
+        _ = run.ContinueWith(_ => PrefetchDownloadedLyricsAsync(CancellationToken.None), TaskScheduler.Default).Unwrap();
+        return run;
+    }
+
+    private async Task DownloadBatchAsync(UndertoneServerClient client, List<Guid> ids, CancellationToken ct, CancellationToken stop)
+    {
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, stop);
+        var token = linked.Token;
+        // Wi-Fi only holds for the whole batch, not only when it was asked for: a Download All
+        // that loses Wi-Fi stops rather than carrying on over mobile data.
+        var onWifi = IsOnWifi;
+        var wifiOnly = onWifi != null && (await _persistence.LoadSettingsAsync().ConfigureAwait(false)).MobileDownloadWifiOnly;
+        var queue = new ConcurrentQueue<Guid>(ids);
+        // With no other batch running, this one counts from zero: "Downloading 3 of 22" and
+        // "1 failed" are about this run, not every run since the app started.
+        if (Interlocked.Add(ref _dlPending, ids.Count) == ids.Count)
+        {
+            Interlocked.Exchange(ref _dlCompleted, 0);
+            Interlocked.Exchange(ref _dlFailed, 0);
+            Interlocked.Exchange(ref _dlMissing, 0);
+        }
+        RaiseDownloadProgress();
+        UndertoneServerException? fatal = null;
+        int done = 0, failed = 0, missing = 0;
+
+        async Task Worker()
+        {
+            while (queue.TryDequeue(out var id))
+            {
+                try
+                {
+                    // Removed while it waited in this batch's queue: skipped, not downloaded anyway.
+                    if (token.IsCancellationRequested || _downloaded.ContainsKey(id) || _withdrawn.ContainsKey(id)) continue;
+                    using var song = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    if (!_inFlight.TryAdd(id, song)) continue;
+                    try
+                    {
+                        if (_withdrawn.ContainsKey(id)) continue;   // removed just before it was marked in flight
+                        await _downloadSlots.WaitAsync(song.Token).ConfigureAwait(false);
+                        try
+                        {
+                            if (wifiOnly && !onWifi!())
+                                throw new UndertoneServerException(UndertoneErrorKind.WifiRequired, "Downloads are set to Wi-Fi only.");
+                            await DownloadOneAsync(client, id, song.Token).ConfigureAwait(false);
+                            Interlocked.Increment(ref _dlCompleted);
+                            Interlocked.Increment(ref done);
+                        }
+                        finally { _downloadSlots.Release(); }
+                    }
+                    catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+                    // Remove Download on this song mid-transfer: stopped, neither done nor failed.
+                    catch (Exception) when (song.IsCancellationRequested || _withdrawn.ContainsKey(id)) { }
+                    catch (UndertoneServerException ex) when (ex.Kind is UndertoneErrorKind.SignedOut or UndertoneErrorKind.CertificateChanged or UndertoneErrorKind.StorageFull or UndertoneErrorKind.WifiRequired)
+                    {
+                        // Every other song would fail the same way.
+                        Interlocked.CompareExchange(ref fatal, ex, null);
+                        Interlocked.Increment(ref _dlFailed);
+                        Interlocked.Increment(ref failed);
+                        try { linked.Cancel(); } catch (ObjectDisposedException) { }
+                    }
+                    catch (UndertoneServerException ex) when (ex.Kind == UndertoneErrorKind.FileMissing)
+                    {
+                        // The desktop lists the song but its file is gone: nothing to retry here,
+                        // and the page says so apart from failures that a retry may fix.
+                        Interlocked.Increment(ref _dlMissing);
+                        Interlocked.Increment(ref _dlFailed);
+                        Interlocked.Increment(ref missing);
+                        Interlocked.Increment(ref failed);
+                    }
+                    catch (Exception ex)
+                    {
+                        Interlocked.Increment(ref _dlFailed);
+                        Interlocked.Increment(ref failed);
+                        DebugLog.Write("Account", $"download failed: {(ex is UndertoneServerException n ? n.Kind.ToString() : ex.GetType().Name)}");
+                    }
+                    finally { _inFlight.TryRemove(new KeyValuePair<Guid, CancellationTokenSource>(id, song)); }
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref _dlPending);
+                    RaiseDownloadProgress();
+                }
+            }
+        }
+
+        await Task.WhenAll(Enumerable.Range(0, DownloadConcurrency).Select(_ => Worker())).ConfigureAwait(false);
+        // Once more with every worker done: two workers' last reports can arrive out of order, the
+        // later one read before the other finished (a test saw Pending = 1 as the last report of a
+        // finished batch), and the page takes Pending > 0 as "still downloading".
+        RaiseDownloadProgress();
+        // One line per batch, so a download that silently did nothing is visible in the log.
+        var missingNote = Volatile.Read(ref missing) is > 0 and var m ? $" ({m} missing on the computer)" : "";
+        DebugLog.Write("Account", $"downloads: {ids.Count} asked, {Volatile.Read(ref done)} done, " +
+            $"{Volatile.Read(ref failed)} failed{missingNote}{(token.IsCancellationRequested ? ", cancelled" : "")}");
+        RaiseStateChanged();
+        if (fatal is not null)
+        {
+            if (fatal.Kind == UndertoneErrorKind.SignedOut) ForgetAccountLocally();
+            throw fatal;
+        }
+        ct.ThrowIfCancellationRequested();
+    }
+
+    private async Task DownloadOneAsync(UndertoneServerClient client, Guid id, CancellationToken ct)
+    {
+        Directory.CreateDirectory(_offlineDir);
+        var need = _sizes.GetValueOrDefault(id) + StorageReserveBytes;
+        if (FreeSpace(_offlineDir) < need)
+            throw new UndertoneServerException(UndertoneErrorKind.StorageFull, "The phone is too full to download more.");
+        var hex = id.ToString("N");
+        var part = InsideOffline(hex + ".part");
+        try
+        {
+            var flac = WantsFlac(id);
+            // The reserve holds for what arrives too, not only for the size the catalog gave.
+            var contentType = await client.DownloadTrackAsync(id, part, ct, flac,
+                hasRoom: () => FreeSpace(_offlineDir) >= StorageReserveBytes).ConfigureAwait(false);
+            var final = InsideOffline(hex + "." + ExtensionFor(id, contentType, flac));
+            if (_downloaded.TryGetValue(id, out var old) && old.Path != final) UndertoneServerClient.TryDelete(old.Path);
+            File.Move(part, final, overwrite: true);
+            bool removed;
+            lock (_downloadCommit)
+            {
+                removed = _withdrawn.ContainsKey(id);
+                if (!removed) _downloaded[id] = new DownloadedFile(final, new FileInfo(final).Length);
+            }
+            if (removed)
+            {
+                // Remove Download came as the last bytes landed: the file goes, as it asked.
+                UndertoneServerClient.TryDelete(final);
+                throw new OperationCanceledException("The download was removed.");
+            }
+        }
+        finally
+        {
+            UndertoneServerClient.TryDelete(part);
+        }
+    }
+
+    /// <summary>The download's extension: "flac" when FLAC was asked for and the desktop sent it
+    /// (audio/flac), else the catalog's suffix when allow-listed, else the content type's, else
+    /// "bin". Never anything the server names (Content-Disposition, path).</summary>
+    private string ExtensionFor(Guid id, string? contentType, bool askedFlac = false)
+    {
+        var type = (contentType ?? string.Empty).ToLowerInvariant();
+        if (askedFlac && type is "audio/flac" or "audio/x-flac") return "flac";
+        if (_suffixes.TryGetValue(id, out var s) && AllowedExtensions.Contains(s)) return s;
+        var ext = type switch
+        {
+            "audio/mpeg" or "audio/mp3" => "mp3",
+            "audio/flac" or "audio/x-flac" => "flac",
+            "audio/mp4" or "audio/x-m4a" or "audio/m4a" => "m4a",
+            "audio/aac" or "audio/x-aac" => "aac",
+            "audio/ogg" or "application/ogg" => "ogg",
+            "audio/opus" => "opus",
+            "audio/wav" or "audio/x-wav" or "audio/wave" => "wav",
+            "audio/aiff" or "audio/x-aiff" => "aiff",
+            "audio/x-ms-wma" => "wma",
+            "audio/x-ape" => "ape",
+            "audio/x-wavpack" => "wv",
+            "audio/x-dsf" => "dsf",
+            "audio/x-dff" => "dff",
+            _ => "bin",
+        };
+        return ext;
+    }
+
+    /// <summary>A path in the offline folder; throws if it would land anywhere else.</summary>
+    private string InsideOffline(string fileName)
+    {
+        var full = Path.GetFullPath(Path.Combine(_offlineDir, fileName));
+        var root = _offlineDir.EndsWith(Path.DirectorySeparatorChar) ? _offlineDir : _offlineDir + Path.DirectorySeparatorChar;
+        if (!full.StartsWith(root, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal)
+            || Path.GetDirectoryName(full) != Path.TrimEndingDirectorySeparator(_offlineDir))
+            throw new InvalidOperationException("Download path escapes the offline folder.");
+        return full;
+    }
+
+    public Task RemoveDownloadsAsync(IEnumerable<Track> tracks)
+    {
+        var ids = tracks.Where(IsRemote).Select(t => t.Id).ToList();
+        return Task.Run(() =>
+        {
+            foreach (var id in ids)
+            {
+                // A running batch that holds the song skips it, or stops it mid-transfer; removing
+                // only the finished file left both to download it anyway.
+                DownloadedFile? f;
+                lock (_downloadCommit)
+                {
+                    _withdrawn[id] = 0;
+                    _downloaded.TryRemove(id, out f);
+                }
+                if (f != null) UndertoneServerClient.TryDelete(f.Path);
+                if (_inFlight.TryGetValue(id, out var song))
+                {
+                    try { song.Cancel(); }
+                    catch (ObjectDisposedException) { /* it just finished */ }
+                }
+            }
+            RaiseDownloadProgress();
+            RaiseStateChanged();
+        });
+    }
+
+    public async Task RemoveAllDownloadsAsync()
+    {
+        await StopDownloadsAsync().ConfigureAwait(false);
+        await Task.Run(DeleteAllDownloadFiles).ConfigureAwait(false);
+        RaiseDownloadProgress();
+        RaiseStateChanged();
+    }
+
+    /// <summary>Cancels running downloads and waits for them to wind down.</summary>
+    private async Task StopDownloadsAsync()
+    {
+        Task[] runs;
+        lock (_downloadRuns)
+        {
+            _downloadCts.Cancel();
+            _downloadCts = new CancellationTokenSource();
+            runs = _downloadRuns.ToArray();
+        }
+        try { await Task.WhenAll(runs).ConfigureAwait(false); } catch { /* cancelled */ }
+        Interlocked.Exchange(ref _dlCompleted, 0);
+        Interlocked.Exchange(ref _dlFailed, 0);
+        Interlocked.Exchange(ref _dlMissing, 0);
+    }
+
+    private void DeleteAllDownloadFiles()
+    {
+        _downloaded.Clear();
+        try
+        {
+            if (!Directory.Exists(_offlineDir)) return;
+            foreach (var f in Directory.EnumerateFiles(_offlineDir)) UndertoneServerClient.TryDelete(f);
+        }
+        catch (Exception ex) { DebugLog.Write("Account", $"removing downloads failed ({ex.GetType().Name})"); }
+    }
+
+    private void DeletePartFiles()
+    {
+        try
+        {
+            if (!Directory.Exists(_offlineDir)) return;
+            foreach (var f in Directory.EnumerateFiles(_offlineDir, "*.part")) UndertoneServerClient.TryDelete(f);
+        }
+        catch { /* best effort */ }
+    }
+
+    /// <summary>What is on disk: "&lt;32 hex&gt;.&lt;allowed ext|bin&gt;" files; leftover .part files are removed.</summary>
+    private void IndexDownloads()
+    {
+        try
+        {
+            Directory.CreateDirectory(_offlineDir);
+            foreach (var file in Directory.EnumerateFiles(_offlineDir))
+            {
+                var name = Path.GetFileName(file);
+                if (name.EndsWith(".part", StringComparison.Ordinal)) { UndertoneServerClient.TryDelete(file); continue; }
+                var dot = name.IndexOf('.');
+                if (dot != 32) continue;
+                var ext = name[(dot + 1)..];
+                if (!(AllowedExtensions.Contains(ext) || ext == "bin")) continue;
+                if (!UndertoneRemoteIds.IsLowerHex32(name.AsSpan(0, 32)) || !Guid.TryParseExact(name.AsSpan(0, 32), "N", out var id)) continue;
+                _downloaded[id] = new DownloadedFile(Path.GetFullPath(file), new FileInfo(file).Length);
+            }
+        }
+        catch (Exception ex) { DebugLog.Write("Account", $"offline folder unreadable ({ex.GetType().Name})"); }
+    }
+
+    // ── Playback ─────────────────────────────────────────────────────────
+
+    public string? ResolvePlaybackUri(string filePath)
+    {
+        if (!UndertoneRemoteIds.TryParsePath(filePath, out var id)) return null;
+        if (_downloaded.TryGetValue(id, out var local) && File.Exists(local.Path)) return local.Path;
+        var account = _account;
+        if (account is null) return null;
+        // No key here: the player sends it as the X-Undertone-Key header.
+        var url = $"{account.ServerUrl}/rest/stream?id={UndertoneRemoteIds.ToServerTrackId(id)}&c={UndertoneServerClient.ClientName}&v={UndertoneServerClient.ApiVersion}";
+        return WantsFlac(id) ? url + "&format=" + UndertoneServerClient.FlacFormat : url;
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────
+
+    private Task OnUiAsync(Action action)
+    {
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _marshal(() =>
+        {
+            try { action(); tcs.TrySetResult(); }
+            catch (Exception ex) { tcs.TrySetException(ex); }
+        });
+        return tcs.Task;
+    }
+
+    private static DateTime Utc(DateTime d) =>
+        d.Kind == DateTimeKind.Local ? d.ToUniversalTime() : DateTime.SpecifyKind(d, DateTimeKind.Utc);
+
+    private static DateTime? NotAfter(DateTime? d, DateTime now) => d is { } v ? (Utc(v) > now ? now : Utc(v)) : null;
+
+    /// <summary>a is later than b by more than serializer rounding.</summary>
+    private static bool Newer(DateTime a, DateTime b) => Utc(a) - Utc(b) > TimeSpan.FromMilliseconds(1);
+
+    private static string SanitizeDeviceName(string? name)
+    {
+        var clean = new string((name ?? string.Empty).Where(c => !char.IsControl(c)).ToArray()).Trim();
+        if (clean.Length > 64) clean = clean[..64];
+        return clean.Length == 0 ? "Android phone" : clean;
+    }
+
+    private void RaiseStateChanged() => StateChanged?.Invoke(this, EventArgs.Empty);
+
+    private void RaisePlaylistsChanged() => PlaylistsChanged?.Invoke(this, EventArgs.Empty);
+
+    private void RaiseSyncProgress(UndertoneSyncStage stage, int done, int total) =>
+        SyncProgress?.Invoke(this, new UndertoneSyncProgress(stage, done, total));
+
+    private void RaiseDownloadProgress() =>
+        DownloadProgress?.Invoke(this, new UndertoneDownloadProgress(Math.Max(0, Volatile.Read(ref _dlPending)),
+            Volatile.Read(ref _dlCompleted), Volatile.Read(ref _dlFailed), DownloadedBytes, Volatile.Read(ref _dlMissing)));
+
+    private sealed class InlineProgress(Action<int> report) : IProgress<int>
+    {
+        public void Report(int value) => report(value);
+    }
+}

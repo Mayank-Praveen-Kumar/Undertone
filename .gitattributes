@@ -1,0 +1,12 @@
+# GitHub Linguist overrides for the Languages bar.
+
+# The Lottie equalizer animation is a 700 KB exported asset, not handwritten
+# JSON — exclude it so it doesn't inflate the JSON bucket.
+src/Undertone/Assets/Icons/*.json  linguist-vendored
+
+# Generated Avalonia build-tasks output isn't authored code.
+src/Undertone/.avalonia-build-tasks/  linguist-generated
+
+# Plugin packages are reproducible (samples/PluginPackage.targets) and plugin.json goes into
+# the zip as checked out, so keep its line endings the same on every OS.
+plugins/*/plugin.json  text eol=lf

@@ -1,0 +1,121 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="using:Undertone"
+             xmlns:vm="using:Undertone.ViewModels"
+             xmlns:views="using:Undertone.Views"
+             xmlns:ctrl="using:Undertone.Controls"
+             x:Class="Undertone.App"
+             Name="Undertone"
+             RequestedThemeVariant="Dark">
+
+    <!-- Custom Font Support Section
+         To add custom fonts to Undertone:
+
+         1. Add font files to the Assets/Fonts directory (create if it doesn't exist)
+            Supported formats: .ttf, .otf
+
+         2. Set Build Action to "AvaloniaResource" for each font file
+
+         3. Define FontFamily resources in this section:
+            <Application.Resources>
+                <FontFamily x:Key="CustomFont">avares://Undertone.UI/Assets/Fonts/YourFont.ttf#Font Name</FontFamily>
+                <FontFamily x:Key="IconFont">avares://Undertone.UI/Assets/Fonts/Icons.ttf#Icons</FontFamily>
+            </Application.Resources>
+
+         4. Use the font in XAML:
+            <TextBlock FontFamily="{StaticResource CustomFont}" Text="Sample Text" />
+
+         5. Or use directly:
+            <TextBlock FontFamily="avares://Undertone.UI/Assets/Fonts/YourFont.ttf#Font Name" />
+
+         Note: The #Font Name part should match the PostScript name of the font.
+         You can find this in the font file properties or using font inspection tools.
+    -->
+
+    <!-- Font + Icon Resources -->
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceInclude Source="avares://Undertone.UI/Assets/Icons.axaml" />
+                <ResourceInclude Source="avares://Undertone.UI/Assets/IconsPages.axaml" />
+                <ResourceInclude Source="avares://Undertone.UI/Assets/IconsLine.axaml" />
+                <ResourceInclude Source="avares://Undertone.UI/Assets/IconsMenuExtra.axaml" />
+            </ResourceDictionary.MergedDictionaries>
+            <FontFamily x:Key="InterSemiBold">avares://Undertone.UI/Assets/Fonts/Inter-SemiBold.ttf#Inter SemiBold</FontFamily>
+            <!-- Do NOT declare fallbacks for accent-overlay keys here. A ResourceDictionary
+                 resolves its OWN entries before its merged dictionaries, so a literal in
+                 Application.Resources permanently shadows the entry App.SetAccent merges on
+                 top and the accent never reaches the UI. Accent fallbacks belong in the
+                 per-theme Styles.Resources blocks of Assets/Styles.axaml, which sit below
+                 Application.Resources in the lookup chain. -->
+        </ResourceDictionary>
+    </Application.Resources>
+
+    <Application.Styles>
+        <FluentTheme />
+
+        <!-- Global style overrides -->
+        <StyleInclude Source="avares://Undertone.UI/Assets/Styles.axaml" />
+
+        <!-- Custom controls -->
+        <StyleInclude Source="avares://Undertone/Controls/EqVisualizer.axaml" />
+
+        <!-- Grid tile covers are drawn from the width bucket just above the tile, so bilinear
+             is exact enough and a scroll repaints every one per frame (CachedImage.FastDownscale). -->
+        <Style Selector="Button.album-tile ctrl|CachedImage, Button.artist-tile ctrl|CachedImage">
+            <Setter Property="FastDownscale" Value="True" />
+        </Style>
+    </Application.Styles>
+
+    <!-- Map ViewModels to Views for ContentControl binding -->
+    <Application.DataTemplates>
+        <DataTemplate DataType="{x:Type vm:HomeViewModel}">
+            <views:HomeView />
+        </DataTemplate>
+        <!-- Songs and Albums views are cached by CachedViewLocator (App.axaml.cs) -->
+<DataTemplate DataType="{x:Type vm:AlbumDetailViewModel}">
+            <views:AlbumDetailView />
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type vm:MoreByArtistViewModel}">
+            <views:MoreByArtistView />
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type vm:ArtistDetailViewModel}">
+            <views:ArtistDetailView />
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type vm:LibraryArtistsViewModel}">
+            <views:LibraryArtistsView />
+        </DataTemplate>
+
+        <DataTemplate DataType="{x:Type vm:LibraryPlaylistsViewModel}">
+            <views:LibraryPlaylistsView />
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type vm:FavoritesViewModel}">
+            <views:FavoritesView />
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type vm:QueueViewModel}">
+            <views:QueueView />
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type vm:PlaylistViewModel}">
+            <views:PlaylistView />
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type vm:PlaylistFeaturedArtistsViewModel}">
+            <views:PlaylistFeaturedArtistsView />
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type vm:LyricsViewModel}">
+            <views:LyricsView />
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type vm:StatisticsViewModel}">
+            <views:StatisticsView />
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type vm:CoverFlowViewModel}">
+            <views:CoverFlowView />
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type vm:SettingsViewModel}">
+            <views:SettingsView />
+        </DataTemplate>
+        <DataTemplate DataType="{x:Type vm:LibraryFoldersViewModel}">
+            <views:LibraryFoldersView />
+        </DataTemplate>
+    </Application.DataTemplates>
+
+</Application>

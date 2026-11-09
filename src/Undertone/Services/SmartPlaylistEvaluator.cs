@@ -1,0 +1,271 @@
+using Undertone.Models;
+
+namespace Undertone.Services;
+
+/// <summary>
+/// Evaluates smart playlist rules against a set of tracks.
+/// Stateless helper — all methods are static.
+/// </summary>
+public static class SmartPlaylistEvaluator
+{
+    /// <summary>
+    /// Filters tracks based on smart playlist configuration.
+    /// </summary>
+    public static List<Track> Evaluate(Playlist playlist, IReadOnlyList<Track> allTracks)
+    {
+        if (!playlist.IsSmartPlaylist || playlist.Rules.Count == 0)
+            return new List<Track>();
+
+        var filtered = allTracks.Where(track =>
+        {
+            if (playlist.MatchAll)
+                return playlist.Rules.All(rule => EvaluateRule(rule, track));
+            else
+                return playlist.Rules.Any(rule => EvaluateRule(rule, track));
+        });
+
+        if (playlist.LimitCount is > 0)
+        {
+            var sorted = ApplySort(filtered, playlist.SortBy ?? SmartPlaylistSortBy.MostPlayed,
+                seed: playlist.Id.GetHashCode());
+            return sorted.Take(playlist.LimitCount.Value).ToList();
+        }
+
+        return filtered.ToList();
+    }
+
+    /// <summary>
+    /// Returns the set of valid operators for a given rule field.
+    /// </summary>
+    public static RuleOperator[] GetOperatorsForField(RuleField field)
+    {
+        return field switch
+        {
+            RuleField.Title or RuleField.Artist or RuleField.Album or
+            RuleField.Genre or RuleField.Composer or RuleField.Codec
+                => [RuleOperator.Contains, RuleOperator.Equals, RuleOperator.StartsWith,
+                    RuleOperator.EndsWith, RuleOperator.DoesNotContain],
+
+            RuleField.Year or RuleField.PlayCount or RuleField.Duration or RuleField.Rating
+                => [RuleOperator.Equals, RuleOperator.GreaterThan,
+                    RuleOperator.LessThan, RuleOperator.Between],
+
+            // IsFalse maps to the null check EvaluateRule already implements for a null
+            // LastPlayed — it just wasn't offered here, so the branch was unreachable and
+            // "songs I've never played", the most common smart playlist there is, could
+            // not be expressed at all.
+            RuleField.DateAdded or RuleField.LastPlayed
+                => [RuleOperator.Before, RuleOperator.After, RuleOperator.InLastNDays,
+                    RuleOperator.IsFalse],
+
+            RuleField.IsFavorite or RuleField.IsLossless or RuleField.IsExplicit or RuleField.IsDisliked
+                => [RuleOperator.IsTrue, RuleOperator.IsFalse],
+
+            _ => [RuleOperator.Equals]
+        };
+    }
+
+    /// <summary>
+    /// Returns a friendly display name for a RuleField enum value.
+    /// </summary>
+    public static string GetFieldDisplayName(RuleField field) => field switch
+    {
+        RuleField.Title => "Title",
+        RuleField.Artist => "Artist",
+        RuleField.Album => "Album",
+        RuleField.Genre => "Genre",
+        RuleField.Composer => "Composer",
+        RuleField.Codec => "Codec",
+        RuleField.Year => "Year",
+        RuleField.PlayCount => "Play Count",
+        RuleField.Duration => "Duration (sec)",
+        RuleField.DateAdded => "Date Added",
+        RuleField.LastPlayed => "Last Played",
+        RuleField.IsFavorite => "Is Favorite",
+        RuleField.IsLossless => "Is Lossless",
+        RuleField.IsExplicit => "Is Explicit",
+        RuleField.Rating => "Rating (stars)",
+        RuleField.IsDisliked => "Is Not Liked",
+        _ => field.ToString()
+    };
+
+    /// <summary>
+    /// Returns a friendly display name for a RuleOperator enum value.
+    /// </summary>
+    public static string GetOperatorDisplayName(RuleOperator op) => op switch
+    {
+        RuleOperator.Contains => "Contains",
+        RuleOperator.Equals => "Equals",
+        RuleOperator.StartsWith => "Starts with",
+        RuleOperator.EndsWith => "Ends with",
+        RuleOperator.DoesNotContain => "Does not contain",
+        RuleOperator.GreaterThan => "Greater than",
+        RuleOperator.LessThan => "Less than",
+        RuleOperator.Between => "Between",
+        RuleOperator.IsTrue => "Is true",
+        RuleOperator.IsFalse => "Is false",
+        RuleOperator.Before => "Before",
+        RuleOperator.After => "After",
+        RuleOperator.InLastNDays => "In last N days",
+        _ => op.ToString()
+    };
+
+    /// <summary>
+    /// Returns a friendly display name for a SmartPlaylistSortBy enum value.
+    /// </summary>
+    public static string GetSortDisplayName(SmartPlaylistSortBy sort) => sort switch
+    {
+        SmartPlaylistSortBy.MostPlayed => "Most Played",
+        SmartPlaylistSortBy.LeastPlayed => "Least Played",
+        SmartPlaylistSortBy.RecentlyAdded => "Recently Added",
+        SmartPlaylistSortBy.RecentlyPlayed => "Recently Played",
+        SmartPlaylistSortBy.Title => "Title",
+        SmartPlaylistSortBy.Artist => "Artist",
+        SmartPlaylistSortBy.Random => "Random",
+        SmartPlaylistSortBy.ReleaseDateOldest => "Oldest Release",
+        SmartPlaylistSortBy.ReleaseDateNewest => "Newest Release",
+        _ => sort.ToString()
+    };
+
+    private static bool EvaluateRule(SmartPlaylistRule rule, Track track)
+    {
+        return rule.Field switch
+        {
+            RuleField.Title => EvaluateString(track.Title ?? "", rule),
+            RuleField.Artist => EvaluateString(track.Artist ?? "", rule),
+            RuleField.Album => EvaluateString(track.Album ?? "", rule),
+            // A multi-genre track ("Rock; Pop", GitHub #123 follow-up) matches "is Pop" too.
+            RuleField.Genre => EvaluateString(track.Genre ?? "", rule)
+                               || (rule.Operator != RuleOperator.DoesNotContain
+                                   && Track.SplitGenres(track.Genre).Any(g => EvaluateString(g, rule))),
+            RuleField.Composer => EvaluateString(track.Composer ?? "", rule),
+            RuleField.Codec => EvaluateString(track.Codec ?? "", rule),
+            RuleField.Year => EvaluateNumeric(track.Year, rule),
+            RuleField.PlayCount => EvaluateNumeric(track.PlayCount, rule),
+            RuleField.Duration => EvaluateNumeric((int)track.Duration.TotalSeconds, rule),
+            RuleField.DateAdded => EvaluateDate(track.DateAdded, rule),
+            RuleField.LastPlayed => track.LastPlayed.HasValue
+                ? EvaluateDate(track.LastPlayed.Value, rule)
+                : rule.Operator == RuleOperator.IsFalse,
+            RuleField.IsFavorite => EvaluateBoolean(track.IsFavorite, rule),
+            RuleField.IsLossless => EvaluateBoolean(track.IsLossless, rule),
+            RuleField.IsExplicit => EvaluateBoolean(track.IsExplicit, rule),
+            RuleField.Rating => EvaluateNumeric(track.Rating, rule),
+            RuleField.IsDisliked => EvaluateBoolean(track.IsDisliked, rule),
+            _ => false
+        };
+    }
+
+    private static bool EvaluateString(string fieldValue, SmartPlaylistRule rule)
+    {
+        var value = rule.Value ?? "";
+        return rule.Operator switch
+        {
+            RuleOperator.Contains => fieldValue.Contains(value, StringComparison.OrdinalIgnoreCase),
+            RuleOperator.Equals => fieldValue.Equals(value, StringComparison.OrdinalIgnoreCase),
+            RuleOperator.StartsWith => fieldValue.StartsWith(value, StringComparison.OrdinalIgnoreCase),
+            RuleOperator.EndsWith => fieldValue.EndsWith(value, StringComparison.OrdinalIgnoreCase),
+            RuleOperator.DoesNotContain => !fieldValue.Contains(value, StringComparison.OrdinalIgnoreCase),
+            _ => false
+        };
+    }
+
+    private static bool EvaluateNumeric(int fieldValue, SmartPlaylistRule rule)
+    {
+        if (!int.TryParse(rule.Value, out var target)) return false;
+
+        return rule.Operator switch
+        {
+            RuleOperator.Equals => fieldValue == target,
+            RuleOperator.GreaterThan => fieldValue > target,
+            RuleOperator.LessThan => fieldValue < target,
+            RuleOperator.Between => int.TryParse(rule.Value2, out var upper)
+                                    && fieldValue >= target && fieldValue <= upper,
+            _ => false
+        };
+    }
+
+    private static bool EvaluateDate(DateTime fieldValue, SmartPlaylistRule rule)
+    {
+        return rule.Operator switch
+        {
+            RuleOperator.Before => TryParseRuleDate(rule.Value, out var before) && fieldValue < before,
+            RuleOperator.After => TryParseRuleDate(rule.Value, out var after) && fieldValue > after,
+            RuleOperator.InLastNDays => int.TryParse(rule.Value, out var days)
+                                        && fieldValue >= DateTime.UtcNow.AddDays(-days),
+            _ => false
+        };
+    }
+
+    // Invariant-first (ISO "2026-07-23" means the same thing on every locale),
+    // current-culture fallback so locally-typed formats keep working. The rule
+    // date is a local calendar day; DateAdded/LastPlayed are UTC, so convert —
+    // the old local-vs-UTC tick comparison was off by the timezone offset.
+    private static bool TryParseRuleDate(string? value, out DateTime utc)
+    {
+        if (DateTime.TryParse(value, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeLocal, out var parsed) ||
+            DateTime.TryParse(value, System.Globalization.CultureInfo.CurrentCulture,
+                System.Globalization.DateTimeStyles.AssumeLocal, out parsed))
+        {
+            utc = parsed.ToUniversalTime();
+            return true;
+        }
+        utc = default;
+        return false;
+    }
+
+    private static bool EvaluateBoolean(bool fieldValue, SmartPlaylistRule rule)
+    {
+        return rule.Operator switch
+        {
+            RuleOperator.IsTrue => fieldValue,
+            RuleOperator.IsFalse => !fieldValue,
+            _ => false
+        };
+    }
+
+    /// <param name="seed">
+    /// Stable seed for <see cref="SmartPlaylistSortBy.Random"/>. Evaluate is called from
+    /// ApplyFilter, OnSortModeChanged and OnLibraryUpdated, so an unseeded shuffle
+    /// re-sampled the playlist on every reload — typing in the search box replaced the 25
+    /// songs the playlist contained, and clearing it replaced them again. Seeding per
+    /// playlist keeps the selection stable until its rules or the library change.
+    /// </param>
+    private static IEnumerable<Track> ApplySort(IEnumerable<Track> tracks, SmartPlaylistSortBy sortBy,
+        int seed = 0)
+    {
+        if (sortBy == SmartPlaylistSortBy.Random)
+        {
+            var rng = new Random(seed);
+            return tracks.OrderBy(_ => rng.Next());
+        }
+
+        return sortBy switch
+        {
+            SmartPlaylistSortBy.MostPlayed => tracks.OrderByDescending(t => t.PlayCount),
+            SmartPlaylistSortBy.LeastPlayed => tracks.OrderBy(t => t.PlayCount),
+            SmartPlaylistSortBy.RecentlyAdded => tracks.OrderByDescending(t => t.DateAdded),
+            SmartPlaylistSortBy.RecentlyPlayed => tracks.OrderByDescending(t => t.LastPlayed ?? DateTime.MinValue),
+            SmartPlaylistSortBy.Title => tracks.OrderBy(t => t.Title, StringComparer.OrdinalIgnoreCase),
+            SmartPlaylistSortBy.Artist => tracks.OrderBy(t => t.Artist, StringComparer.OrdinalIgnoreCase),
+            // Undated tracks last either way — Year 0 means untagged, so an ascending
+            // sort would otherwise fill an "oldest 25" list with files that have no year.
+            SmartPlaylistSortBy.ReleaseDateOldest => tracks
+                .OrderBy(t => t.Year <= 0).ThenBy(ReleaseKey),
+            SmartPlaylistSortBy.ReleaseDateNewest => tracks
+                .OrderBy(t => t.Year <= 0).ThenByDescending(ReleaseKey),
+            _ => tracks
+        };
+    }
+
+    /// <summary>
+    /// Release instant for sorting: the tagged date when it parses, otherwise the start
+    /// of the tagged year. Mirrors PlaylistViewModel's release-date sort so a smart
+    /// playlist and the view it opens in agree on what "oldest" means.
+    /// </summary>
+    private static DateTime ReleaseKey(Track track) =>
+        Track.TryParseReleaseDate(track.ReleaseDate, out var exact) ? exact
+        : track.Year > 0 ? new DateTime(track.Year, 1, 1)
+        : DateTime.MinValue;
+}

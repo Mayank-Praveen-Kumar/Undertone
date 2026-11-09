@@ -1,0 +1,592 @@
+using System.Net;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Avalonia.Threading;
+using Undertone.Services.LocalApi;
+using Undertone.ViewModels;
+
+namespace Undertone.Services;
+
+/// <summary>Which audience a <see cref="WebRemoteServer"/> instance serves.</summary>
+public enum WebRemoteMode
+{
+    /// <summary>Phone remote page on the local network (0.0.0.0, private addresses only,
+    /// per-session "k" token in the URL). Behaviour unchanged since before the Local API.</summary>
+    Lan,
+
+    /// <summary>Local automation API: /api/v1 JSON + SSE, bound to 127.0.0.1 only,
+    /// persistent Bearer/?token= token from local-api.json. See docs/LOCAL-API.md.</summary>
+    LocalApi,
+}
+
+/// <summary>Dependencies and limits of the Local API mode.</summary>
+public sealed class LocalApiOptions
+{
+    public ILibraryService? Library { get; init; }
+
+    /// <summary>Resolves album artwork files; null serves only per-track embedded covers.</summary>
+    public IPersistenceService? Persistence { get; init; }
+
+    public ILocalApiLyricsSource? Lyrics { get; init; }
+
+    /// <summary>Runs an action on the UI thread. Default: Avalonia's dispatcher.</summary>
+    public Func<Action, Task>? Marshal { get; init; }
+
+    public TimeSpan Heartbeat { get; init; } = TimeSpan.FromSeconds(15);
+    public int MaxEventStreams { get; init; } = 8;
+    public int MaxBodyBytes { get; init; } = 16 * 1024;
+    public int AuthFailureLimit { get; init; } = 10;
+    public TimeSpan AuthFailureWindow { get; init; } = TimeSpan.FromMinutes(1);
+    public TimeSpan AuthLockout { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Reported by /api/v1/status; defaults to the running build's version.</summary>
+    public string? AppVersion { get; init; }
+}
+
+/// <summary>
+/// Small hand-rolled HTTP server (TcpListener, no admin URL-ACL needed, no extra
+/// dependencies). One class, two modes — see <see cref="WebRemoteMode"/>. Settings runs
+/// up to two instances side by side: the LAN phone remote and the loopback Local API.
+/// They share the socket plumbing and hardening (bounded reads, slot cap, timeouts)
+/// but differ in bind address, audience check, token and routes, so a LAN user's
+/// remote keeps working exactly as before and turning on the Local API never exposes
+/// the automation surface to the network.
+///
+/// LAN security posture:
+/// - Off by default; started only from the Settings toggle.
+/// - Requests from non-private remote addresses are rejected outright.
+/// - Every route requires the per-session access token (the "k" query value
+///   baked into the URL shown in Settings). This blocks other LAN devices
+///   that don't have the link, and CSRF/DNS-rebinding pages that can reach
+///   the port but can't know the token. A new token is minted on each start.
+/// - Only fixed routes are served; no filesystem paths are exposed.
+///
+/// Local API posture: listens on 127.0.0.1 only and drops non-loopback peers; rejects
+/// Host headers that aren't a loopback name (DNS rebinding); every /api/v1 route needs
+/// the token (constant-time compare, failures rate-limited); bodies are capped; no
+/// route reads a caller-supplied path or runs anything.
+/// </summary>
+public sealed partial class WebRemoteServer : IDisposable
+{
+    private readonly PlayerViewModel _player;
+    private readonly LocalApiOptions? _local;
+    private readonly LocalApiEventHub? _hub;
+    private readonly Func<Action, Task> _marshal;
+    private TcpListener? _listener;
+    private CancellationTokenSource? _cts;
+    private volatile string _token = string.Empty;
+
+    public WebRemoteMode Mode { get; }
+    public int Port { get; private set; }
+    public bool IsRunning => _listener != null;
+
+    /// <summary>Access token required on every request. LAN: regenerated on each Start.
+    /// Local API: supplied by the caller (persisted in local-api.json).</summary>
+    public string Token => _token;
+
+    /// <summary>Open SSE streams (Local API mode; 0 otherwise).</summary>
+    public int ActiveEventStreams => _hub?.ActiveStreams ?? 0;
+
+    /// <summary>Raised on every authorized request, from a worker thread. The first one
+    /// proves a phone actually reached this PC — Settings turns it into connection
+    /// feedback, so "scanned but nothing loaded" is diagnosable from the card.</summary>
+    public event EventHandler? ClientConnected;
+
+    public WebRemoteServer(PlayerViewModel player)
+    {
+        _player = player;
+        Mode = WebRemoteMode.Lan;
+        _marshal = DefaultMarshal;
+    }
+
+    /// <summary>Local API instance (loopback only, /api/v1).</summary>
+    public WebRemoteServer(PlayerViewModel player, LocalApiOptions options)
+    {
+        _player = player;
+        Mode = WebRemoteMode.LocalApi;
+        _local = options;
+        _marshal = options.Marshal ?? DefaultMarshal;
+        _hub = new LocalApiEventHub(player, options.Lyrics, _marshal, options.Heartbeat, options.MaxEventStreams);
+    }
+
+    private static Task DefaultMarshal(Action action)
+    {
+        if (Dispatcher.UIThread.CheckAccess())
+        {
+            action();
+            return Task.CompletedTask;
+        }
+        return Dispatcher.UIThread.InvokeAsync(action).GetTask();
+    }
+
+    /// <summary>Binds the remote. Pass 0 to let the OS pick a free port; read
+    /// <see cref="Port"/> afterwards for what was actually bound — it is no longer the
+    /// requested value, because the requested one may have been in use.
+    /// LAN mode mints a fresh token; Local API mode needs <see cref="Start(int, string)"/>.</summary>
+    public void Start(int port)
+    {
+        if (Mode == WebRemoteMode.LocalApi)
+            throw new InvalidOperationException("The Local API is started with its persisted token.");
+        StartCore(port, Convert.ToHexString(RandomNumberGenerator.GetBytes(8)).ToLowerInvariant());
+    }
+
+    /// <summary>Starts the Local API on 127.0.0.1 with the given token.</summary>
+    public void Start(int port, string token)
+    {
+        if (Mode != WebRemoteMode.LocalApi)
+            throw new InvalidOperationException("The LAN remote mints its own per-session token.");
+        if (string.IsNullOrEmpty(token)) throw new ArgumentException("A token is required.", nameof(token));
+        StartCore(port, token);
+    }
+
+    /// <summary>Test seam: tests bind the LAN remote to loopback so Windows Firewall never prompts
+    /// for the test runner (a listener on all interfaces does).</summary>
+    internal IPAddress? BindAddressOverride { get; set; }
+
+    private void StartCore(int port, string token)
+    {
+        Stop();
+        _token = token;
+        _cts = new CancellationTokenSource();
+        var bind = BindAddressOverride ?? (Mode == WebRemoteMode.LocalApi ? IPAddress.Loopback : IPAddress.Any);
+        _listener = new TcpListener(bind, port);
+        _listener.Start();
+        Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
+        _ = AcceptLoopAsync(_listener, _cts.Token);
+        DebugLogger.Info(DebugLogger.Category.State, Mode == WebRemoteMode.LocalApi ? "LocalApi.Start" : "WebRemote.Start",
+            $"port={Port}");
+    }
+
+    /// <summary>Swaps the Local API token in place (Regenerate). Open event streams were
+    /// authorized with the old one, so they are closed.</summary>
+    public void SetToken(string token)
+    {
+        if (string.IsNullOrEmpty(token)) throw new ArgumentException("A token is required.", nameof(token));
+        _token = token;
+        _hub?.DisconnectAll();
+    }
+
+    public void Stop()
+    {
+        try
+        {
+            _hub?.DisconnectAll();
+            _cts?.Cancel();
+            _listener?.Stop();
+        }
+        catch { /* shutdown is best-effort */ }
+        // Dispose, not just null out: the source's registrations leaked on every
+        // enable/disable toggle of the Web Remote setting.
+        try { _cts?.Dispose(); } catch { }
+        _listener = null;
+        _cts = null;
+    }
+
+    public void Dispose() => Stop();
+
+    /// <summary>Best local LAN IPv4 for displaying the remote URL in Settings.</summary>
+    public static string? GetLocalAddress()
+    {
+        try
+        {
+            // Connect-less UDP trick: routes without sending a packet. The probe target
+            // must be a PUBLIC address: a private one (192.168.1.1 previously) can land
+            // inside a virtual adapter's subnet (Hyper-V/WSL/VirtualBox host networks
+            // are commonly 192.168.x), which advertised an IP no phone could reach.
+            using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            socket.Connect("8.8.8.8", 65530);
+            return (socket.LocalEndPoint as IPEndPoint)?.Address.ToString();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>True for loopback, RFC1918 private ranges, and link-local addresses.</summary>
+    public static bool IsPrivateAddress(IPAddress? address)
+    {
+        if (address == null) return false;
+        if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
+        if (IPAddress.IsLoopback(address)) return true;
+        if (address.AddressFamily == AddressFamily.InterNetworkV6)
+            return address.IsIPv6LinkLocal || address.IsIPv6UniqueLocal;
+        if (address.AddressFamily != AddressFamily.InterNetwork) return false;
+
+        var b = address.GetAddressBytes();
+        return b[0] == 10
+            || (b[0] == 172 && b[1] >= 16 && b[1] <= 31)
+            || (b[0] == 192 && b[1] == 168)
+            || (b[0] == 169 && b[1] == 254);
+    }
+
+    /// <summary>True only for 127.0.0.0/8 and ::1 (IPv4-mapped forms included).</summary>
+    public static bool IsLoopbackAddress(IPAddress? address)
+    {
+        if (address == null) return false;
+        if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
+        return IPAddress.IsLoopback(address);
+    }
+
+    // Bounds simultaneous request handlers so a LAN host can't exhaust
+    // threads/sockets by holding connections open; excess connections are
+    // dropped immediately. A phone remote uses 1-2 at a time.
+    private const int MaxConcurrentClients = 16;
+    private readonly SemaphoreSlim _clientSlots = new(MaxConcurrentClients, MaxConcurrentClients);
+
+    private async Task AcceptLoopAsync(TcpListener listener, CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            TcpClient client;
+            try
+            {
+                client = await listener.AcceptTcpClientAsync(ct);
+            }
+            catch (Exception) when (ct.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                DebugLogger.Error(DebugLogger.Category.Error, "WebRemote.Accept", ex.Message);
+                continue;
+            }
+
+            if (!_clientSlots.Wait(0))
+            {
+                client.Dispose();
+                continue;
+            }
+            _ = HandleClientAsync(client, ct)
+                .ContinueWith(_ => _clientSlots.Release(), TaskScheduler.Default);
+        }
+    }
+
+    private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
+    {
+        using (client)
+        {
+            try
+            {
+                var remote = (client.Client.RemoteEndPoint as IPEndPoint)?.Address;
+                var allowed = Mode == WebRemoteMode.LocalApi ? IsLoopbackAddress(remote) : IsPrivateAddress(remote);
+                if (!allowed)
+                    return; // fail closed: drop non-LAN (or, for the Local API, non-loopback) callers without a response
+
+                client.ReceiveTimeout = 5000;
+                client.SendTimeout = 5000;
+                var stream = client.GetStream();
+
+                // ReceiveTimeout only applies to *synchronous* socket reads — NetworkStream
+                // .ReadAsync ignores it entirely. A LAN host that connected and then sent
+                // nothing (or trickled header lines forever into the unbounded drain below)
+                // parked a handler indefinitely, and there are only MaxConcurrentClients of
+                // them: 16 idle sockets from any device on the network permanently killed
+                // the web remote, with no token needed because authorization happens after
+                // the whole request has been read.
+                using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                readCts.CancelAfter(TimeSpan.FromSeconds(5));
+                var readCt = readCts.Token;
+
+                var reader = new LineReader(stream);
+                var requestLine = await reader.ReadLineAsync(readCt);
+                if (requestLine == null) return;
+                var parts = requestLine.Split(' ');
+                if (parts.Length < 2) return;
+                var method = parts[0];
+                var target = parts[1];
+
+                // Headers: the LAN remote ignores them (no bodies are accepted); the Local
+                // API reads Authorization / Host / Content-Length. Bounded so a peer can't
+                // stream header lines forever inside the timeout window.
+                const int MaxHeaderLines = 64;
+                var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                for (var i = 0; i < MaxHeaderLines; i++)
+                {
+                    if (await reader.ReadLineAsync(readCt) is not { Length: > 0 } line) break;
+                    if (i == MaxHeaderLines - 1) return; // too many headers — drop
+                    var colon = line.IndexOf(':');
+                    if (colon > 0) headers[line[..colon].Trim()] = line[(colon + 1)..].Trim();
+                }
+
+                if (Mode == WebRemoteMode.LocalApi)
+                {
+                    await HandleLocalApiAsync(stream, reader, method, target, headers, readCt, ct);
+                    return;
+                }
+
+                var (status, contentType, body) = await RouteAsync(method, target);
+                var payload = Encoding.UTF8.GetBytes(body);
+                var header =
+                    $"HTTP/1.1 {status}\r\n" +
+                    $"Content-Type: {contentType}; charset=utf-8\r\n" +
+                    $"Content-Length: {payload.Length}\r\n" +
+                    "Cache-Control: no-store\r\n" +
+                    "X-Content-Type-Options: nosniff\r\n" +
+                    "Referrer-Policy: no-referrer\r\n" +
+                    "Connection: close\r\n\r\n";
+                await stream.WriteAsync(Encoding.ASCII.GetBytes(header), ct);
+                await stream.WriteAsync(payload, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                DebugLogger.Error(DebugLogger.Category.Error, "WebRemote.Client", ex.Message);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Buffered line reader over the request stream — the previous implementation
+    /// awaited one ReadAsync per byte (thousands of awaits per request). One reader
+    /// per connection; over-read bytes stay buffered for the next line (or the body).
+    /// </summary>
+    private sealed class LineReader
+    {
+        private readonly NetworkStream _stream;
+        private readonly byte[] _buf = new byte[4096];
+        private int _len;
+        private int _pos;
+
+        public LineReader(NetworkStream stream) => _stream = stream;
+
+        public async Task<string?> ReadLineAsync(CancellationToken ct)
+        {
+            var sb = new StringBuilder();
+            while (sb.Length < 4096)
+            {
+                if (_pos == _len)
+                {
+                    _len = await _stream.ReadAsync(_buf, ct);
+                    _pos = 0;
+                    if (_len == 0) return sb.Length > 0 ? sb.ToString() : null;
+                }
+                char c = (char)_buf[_pos++];
+                if (c == '\n')
+                    return sb.ToString().TrimEnd('\r');
+                sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>Exactly <paramref name="count"/> body bytes (buffered ones first), or
+        /// null if the peer closed early.</summary>
+        public async Task<byte[]?> ReadBytesAsync(int count, CancellationToken ct)
+        {
+            var result = new byte[count];
+            var filled = 0;
+            var buffered = Math.Min(_len - _pos, count);
+            if (buffered > 0)
+            {
+                Buffer.BlockCopy(_buf, _pos, result, 0, buffered);
+                _pos += buffered;
+                filled = buffered;
+            }
+            while (filled < count)
+            {
+                var n = await _stream.ReadAsync(result.AsMemory(filled, count - filled), ct);
+                if (n == 0) return null;
+                filled += n;
+            }
+            return result;
+        }
+    }
+
+    private async Task<(string Status, string ContentType, string Body)> RouteAsync(string method, string target)
+    {
+        var path = target.Split('?')[0];
+        var query = ParseQuery(target);
+
+        // Every route — including the page itself — requires the session token,
+        // so LAN devices without the link and cross-origin pages get nothing.
+        if (!IsAuthorized(query))
+            return ("403 Forbidden", "text/plain", "forbidden");
+
+        ClientConnected?.Invoke(this, EventArgs.Empty);
+
+        switch (method, path)
+        {
+            case ("GET", "/"):
+                return ("200 OK", "text/html", RemotePageHtml);
+
+            case ("GET", "/api/status"):
+                var status = await OnUiThread(BuildStatus);
+                return ("200 OK", "application/json", status);
+
+            case ("POST", "/api/playpause"):
+                await OnUiThread(() => { _player.PlayPauseCommand.Execute(null); return ""; });
+                return ("200 OK", "application/json", "{}");
+
+            case ("POST", "/api/next"):
+                await OnUiThread(() => { _player.NextCommand.Execute(null); return ""; });
+                return ("200 OK", "application/json", "{}");
+
+            case ("POST", "/api/prev"):
+                await OnUiThread(() => { _player.PreviousCommand.Execute(null); return ""; });
+                return ("200 OK", "application/json", "{}");
+
+            case ("POST", "/api/volume") when query.TryGetValue("value", out var v)
+                                              && int.TryParse(v, out var vol):
+                await OnUiThread(() => { _player.Volume = Math.Clamp(vol, 0, 100); return ""; });
+                return ("200 OK", "application/json", "{}");
+
+            case ("POST", "/api/seek") when query.TryGetValue("fraction", out var f)
+                                            && double.TryParse(f, System.Globalization.CultureInfo.InvariantCulture, out var fraction):
+                await OnUiThread(() => { _player.SeekToPositionCommand.Execute(Math.Clamp(fraction, 0, 1)); return ""; });
+                return ("200 OK", "application/json", "{}");
+
+            default:
+                return ("404 Not Found", "text/plain", "not found");
+        }
+    }
+
+    /// <summary>Constant-time check of the "k" query value against the session token.</summary>
+    private bool IsAuthorized(Dictionary<string, string> query) =>
+        Token.Length > 0
+        && query.TryGetValue("k", out var k)
+        && CryptographicOperations.FixedTimeEquals(
+            Encoding.UTF8.GetBytes(k), Encoding.UTF8.GetBytes(Token));
+
+    private static Dictionary<string, string> ParseQuery(string target)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var qIndex = target.IndexOf('?');
+        if (qIndex < 0) return result;
+        foreach (var pair in target[(qIndex + 1)..].Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var eq = pair.IndexOf('=');
+            if (eq <= 0) continue;
+            result[WebUtility.UrlDecode(pair[..eq])] = WebUtility.UrlDecode(pair[(eq + 1)..]);
+        }
+        return result;
+    }
+
+    private Task<string> OnUiThread(Func<string> action) => OnUi(action);
+
+    /// <summary>Runs <paramref name="func"/> on the UI thread (via the marshal) and returns its result.</summary>
+    private async Task<T> OnUi<T>(Func<T> func)
+    {
+        T result = default!;
+        await _marshal(() => result = func());
+        return result;
+    }
+
+    private string BuildStatus()
+    {
+        var track = _player.CurrentTrack;
+        var queue = _player.UpNext.Take(20)
+            .Select(t => new { title = t.Title, artist = t.Artist })
+            .ToArray();
+
+        return JsonSerializer.Serialize(new
+        {
+            title = track?.Title ?? "Nothing playing",
+            artist = track?.Artist ?? "",
+            album = track?.Album ?? "",
+            isPlaying = _player.State == Models.PlaybackState.Playing,
+            positionMs = (long)_player.Position.TotalMilliseconds,
+            durationMs = (long)_player.Duration.TotalMilliseconds,
+            volume = _player.Volume,
+            queue,
+        });
+    }
+
+    /// <summary>Single-file mobile control page (vanilla JS, polls /api/status).</summary>
+    private const string RemotePageHtml = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Undertone Remote</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; font-family:system-ui,-apple-system,sans-serif; background:#0d1018; color:#fff;
+         display:flex; flex-direction:column; align-items:center; min-height:100vh; }
+  .wrap { width:100%; max-width:430px; padding:28px 22px; box-sizing:border-box; }
+  h1 { font-size:14px; letter-spacing:3px; opacity:.5; text-align:center; margin:0 0 26px; }
+  #title { font-size:22px; font-weight:700; text-align:center; margin:0; min-height:28px; }
+  #artist { font-size:15px; opacity:.6; text-align:center; margin:6px 0 24px; min-height:18px; }
+  .seekrow { display:flex; align-items:center; gap:10px; font-size:11px; opacity:.8; }
+  input[type=range] { flex:1; accent-color:#7c8cff; }
+  .controls { display:flex; justify-content:center; gap:18px; margin:26px 0; }
+  button { background:#1b2030; color:#fff; border:0; border-radius:50%; width:64px; height:64px;
+           font-size:22px; cursor:pointer; }
+  button.play { width:80px; height:80px; background:#7c8cff; color:#0d1018; font-size:28px; }
+  .volrow { display:flex; align-items:center; gap:12px; margin-bottom:28px; }
+  .volrow span { font-size:18px; }
+  h2 { font-size:12px; letter-spacing:2px; opacity:.5; margin:0 0 10px; }
+  #queue { list-style:none; margin:0; padding:0; }
+  #queue li { padding:9px 4px; border-bottom:1px solid #1c2233; font-size:14px; }
+  #queue li small { display:block; opacity:.5; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>UNDERTONE REMOTE</h1>
+  <p id="title">—</p>
+  <p id="artist"></p>
+  <div class="seekrow">
+    <span id="pos">0:00</span>
+    <input id="seek" type="range" min="0" max="1000" value="0">
+    <span id="dur">0:00</span>
+  </div>
+  <div class="controls">
+    <button onclick="post('prev')">&#9198;</button>
+    <button class="play" id="playBtn" onclick="post('playpause')">&#9654;</button>
+    <button onclick="post('next')">&#9197;</button>
+  </div>
+  <div class="volrow">
+    <span>&#128264;</span>
+    <input id="vol" type="range" min="0" max="100" value="50">
+    <span>&#128266;</span>
+  </div>
+  <h2>UP NEXT</h2>
+  <ul id="queue"></ul>
+</div>
+<script>
+let seeking = false, voling = false;
+const KEY = new URLSearchParams(location.search).get('k') || '';
+function withKey(qs) { return (qs ? qs + '&' : '?') + 'k=' + encodeURIComponent(KEY); }
+function fmt(ms) {
+  const s = Math.floor(ms / 1000);
+  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+function post(action, qs) { fetch('/api/' + action + withKey(qs), { method: 'POST' }).then(refresh); }
+function refresh() {
+  fetch('/api/status' + withKey()).then(r => r.json()).then(s => {
+    document.getElementById('title').textContent = s.title;
+    document.getElementById('artist').textContent = s.artist;
+    document.getElementById('playBtn').innerHTML = s.isPlaying ? '&#10074;&#10074;' : '&#9654;';
+    document.getElementById('pos').textContent = fmt(s.positionMs);
+    document.getElementById('dur').textContent = fmt(s.durationMs);
+    if (!seeking && s.durationMs > 0)
+      document.getElementById('seek').value = Math.round(1000 * s.positionMs / s.durationMs);
+    if (!voling) document.getElementById('vol').value = s.volume;
+    const q = document.getElementById('queue');
+    q.innerHTML = '';
+    for (const t of s.queue) {
+      const li = document.createElement('li');
+      li.textContent = t.title;
+      const sm = document.createElement('small');
+      sm.textContent = t.artist;
+      li.appendChild(sm);
+      q.appendChild(li);
+    }
+  }).catch(() => {});
+}
+const seek = document.getElementById('seek');
+seek.addEventListener('pointerdown', () => seeking = true);
+seek.addEventListener('change', () => { post('seek', '?fraction=' + (seek.value / 1000)); seeking = false; });
+const vol = document.getElementById('vol');
+vol.addEventListener('pointerdown', () => voling = true);
+vol.addEventListener('change', () => { post('volume', '?value=' + vol.value); voling = false; });
+setInterval(refresh, 2000);
+refresh();
+</script>
+</body>
+</html>
+""";
+}

@@ -1,0 +1,22 @@
+{
+  "id": "dev.undertone.plugins.mixxx",
+  "name": "Mixxx",
+  "version": "1.0.1",
+  "author": "Undertone",
+  "description": "Brings BPM and key from Mixxx into Undertone.",
+  "type": "dotnet",
+  "entry": "Undertone.Plugins.Mixxx.dll",
+  "apiVersion": "1.2",
+  "minAppVersion": "1.5.9",
+  "platforms": ["windows", "macos", "linux"],
+  "permissions": ["library.read", "library.write.analysis", "menu.commands", "notifications"],
+  "settings": [
+    { "key": "databasePath", "label": "Mixxx library file (mixxxdb.sqlite)", "type": "string", "default": "",
+      "placeholder": "Default Mixxx location",
+      "description": "Leave empty to use Mixxx's usual location." },
+    { "key": "overwrite", "label": "Replace BPM and key Undertone already has", "type": "bool", "default": false,
+      "description": "Off: only fills in songs that have none." }
+  ],
+  "homepage": "https://github.com/Mayank-Praveen-Kumar/Undertone/tree/main/plugins/Undertone.Plugins.Mixxx",
+  "icon": "icon.png"
+}

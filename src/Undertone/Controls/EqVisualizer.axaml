@@ -1,0 +1,36 @@
+<Styles xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:ctrl="using:Undertone.Controls">
+    <Style Selector="ctrl|EqVisualizer">
+        <Setter Property="Width" Value="34" />
+        <Setter Property="Height" Value="22" />
+        <Setter Property="Foreground" Value="{DynamicResource AccentColorBrush}" />
+        <Setter Property="Template">
+            <ControlTemplate>
+                <Grid ClipToBounds="True">
+                    <!-- Each bar draws itself centred in the 12px row (EqBar), so a height change
+                         repaints without a layout pass. -->
+                    <StackPanel x:Name="BarsPanel"
+                                Orientation="Horizontal"
+                                Spacing="1.75"
+                                HorizontalAlignment="Center"
+                                VerticalAlignment="Center"
+                                Height="12">
+                        <ctrl:EqBar x:Name="Bar1" Width="1.75" Fill="{TemplateBinding Foreground}" />
+                        <ctrl:EqBar x:Name="Bar2" Width="1.75" Fill="{TemplateBinding Foreground}" />
+                        <ctrl:EqBar x:Name="Bar3" Width="1.75" Fill="{TemplateBinding Foreground}" />
+                        <ctrl:EqBar x:Name="Bar4" Width="1.75" Fill="{TemplateBinding Foreground}" />
+                        <ctrl:EqBar x:Name="Bar5" Width="1.75" Fill="{TemplateBinding Foreground}" />
+                    </StackPanel>
+                </Grid>
+            </ControlTemplate>
+        </Setter>
+    </Style>
+    <!-- On the now-playing row the bars take the row foreground: this control defaults
+         its Foreground to AccentColorBrush, which would be accent-on-accent there, and
+         the bars are only ever visible on that row. Lived in the shared Styles.axaml
+         until that moved to Undertone.UI, which cannot name this desktop-only control. -->
+    <Style Selector="Border.now-playing ctrl|EqVisualizer">
+        <Setter Property="Foreground" Value="{DynamicResource NowPlayingRowForegroundBrush}" />
+    </Style>
+</Styles>

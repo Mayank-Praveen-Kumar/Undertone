@@ -1,0 +1,11 @@
+{
+  "profiles": {
+    "Undertone (Dev)": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "UNDERTONE_DATA_DIR": "%LOCALAPPDATA%\\Undertone-Dev",
+        "UNDERTONE_PLUGIN_INDEX": "%LOCALAPPDATA%\\Undertone-Dev\\plugin-test\\index.json"
+      }
+    }
+  }
+}

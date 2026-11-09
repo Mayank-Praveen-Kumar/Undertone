@@ -1,0 +1,958 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+using NAudio.CoreAudioApi;
+using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
+
+namespace Undertone.Services;
+
+// Persistent shared-mode WASAPI stream for the true-gapless splice engine
+// (UNDERTONE_GAPLESS_ENGINE=1). One WasapiOut opened at the device mix format
+// runs for the player's lifetime (stopped only after a long idle, see
+// CheckIdle); GaplessSpliceProvider feeds it per-track
+// segments rendered back-to-back, so the track boundary is crossed inside a
+// single render read — zero inserted samples. The stream lives in the process
+// audio session, so the existing WindowsSessionVolume machinery keeps owning
+// the user's volume/mute unchanged.
+//
+// The stream does NOT survive its endpoint: unplugging the device (or moving
+// the app to another output in Windows' sound panel) kills WasapiOut's render
+// thread with AUDCLNT_E_DEVICE_INVALIDATED and nothing restarts it — VLC keeps
+// decoding into a sink nobody drains (field log: endless "buffer too late" +
+// PtsGap after KeepAlive.DeviceChanged, silence until app restart). The sink
+// therefore self-heals: PlaybackStopped-with-error and a default-device watch
+// both rebuild the output on the current default endpoint, reusing the same
+// provider chain (NAudio inserts a DMO resampler when the new device's mix
+// format differs, so the VLC-facing format stays fixed).
+//
+// Linux (GitHub #127) runs the same chain into one PulseAudio stream
+// (PulseSimpleWavePlayer) at a fixed engine rate. There is no session handle on
+// that stream, so the user's volume is applied in the chain (OutputLevelProvider,
+// see LevelControl), and the sound server follows default-sink changes itself.
+public sealed class GaplessSink : IDisposable
+{
+    private readonly object _gate = new();
+    private IWavePlayer _out; // WasapiOut, or NullWavePlayer in silent test mode
+    private string? _deviceId; // endpoint the current output was opened against
+    private MMDevice? _outDevice; // endpoint owned by _out (NAudio never disposes a supplied device)
+    // Settings → Output Device pin; null/empty = follow the Windows default. The
+    // watch and every rebuild resolve against this, so a pinned stream ignores
+    // default-device changes until the pin is cleared or the endpoint disappears.
+    private volatile string? _pinnedDeviceId;
+    private readonly WaveFileWriter? _tap; // UNDERTONE_ENGINE_TAP diagnostic capture
+    private readonly ISampleProvider _renderSource;
+    private readonly MuteGateProvider _muteGate;
+    private readonly OutputLevelProvider _level;
+
+    /// <summary>User mute, applied post-buffer in the render chain (instant, click-free).
+    /// Survives output rebuilds: the gate is upstream of the WasapiOut that gets replaced.</summary>
+    public bool IsMuted
+    {
+        get => _muteGate.IsMuted;
+        set => _muteGate.IsMuted = value;
+    }
+    private readonly StallProbe _probe;
+    private readonly Timer _deviceWatch;
+    private volatile bool _desiredPlaying = true;
+    private volatile bool _disposed;
+    private int _rebuilding; // interlocked 0/1
+
+    private const int DeviceCheckIntervalMs = 2000;
+    private const int StartThresholdMs = 200;
+
+    // Idle park. A running render stream holds Windows' "audio stream in use" power
+    // request even while it renders only silence, so a paused, stopped or never-started
+    // player kept the PC from auto-sleeping for as long as Undertone stayed open (the reason
+    // the keep-alive parks too). After the idle timeout without track audio the stream is
+    // stopped; the client stays open, so the session and its volume stay. Resume, or audio
+    // due again, restarts it. UNDERTONE_ENGINE_IDLE_MS overrides the timeout (0 = never park).
+    private const int DefaultIdleStopMs = 10 * 60 * 1000;
+    private readonly int _idleStopMs;
+    private readonly IdleWatch _idle;
+    private readonly object _parkGate = new(); // serializes idle park/wake; never taken on the render thread
+    private bool _streamParked; // _out stopped by the idle park and unsubscribed (guarded by _gate)
+
+    public GaplessSpliceProvider Provider { get; }
+    public int SampleRate { get; }
+    public int Channels { get; }
+
+    /// <summary>
+    /// Raised after the output was rebuilt on a (new) device. The fresh WASAPI
+    /// stream registers a brand-new audio session at Windows' default level —
+    /// the owner must re-assert the user volume or playback jumps to 100%. The
+    /// new output renders silence until the owner calls <see cref="ReleaseRebuildHold"/>
+    /// (at most <see cref="RebuildHoldMaxMs"/>).
+    /// </summary>
+    public event Action? Rebuilt;
+
+    // Fail-safe for the rebuild hold: past it the audio plays at whatever level the
+    // new session has rather than not at all. The owner's re-assert gives up at 1.5 s.
+    private const int RebuildHoldMaxMs = 2000;
+    private long _rebuildHoldStart; // Stopwatch timestamp of the pending hold
+
+    /// <summary>Ends the silence a rebuild put on the new output (see <see cref="Rebuilt"/>),
+    /// once the user volume is on the new session or the owner gave up on it.</summary>
+    public void ReleaseRebuildHold()
+    {
+        if (_muteGate.ReleaseHold())
+            DebugLogger.Info(DebugLogger.Category.Playback, "GaplessEngine.RebuildHoldReleased",
+                $"heldMs={Stopwatch.GetElapsedTime(Interlocked.Read(ref _rebuildHoldStart)).TotalMilliseconds:0}");
+    }
+
+    public static GaplessSink? TryCreate(string? deviceId = null)
+    {
+        try
+        {
+            return new GaplessSink(deviceId);
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.Warn(DebugLogger.Category.Playback, "GaplessEngine.SinkFailed", $"{ex.GetType().Name}: {ex.Message}");
+            return null;
+        }
+    }
+
+    private GaplessSink(string? pinnedDeviceId)
+    {
+        var openStart = Stopwatch.GetTimestamp();
+        WaveFormat mix;
+        if (OperatingSystem.IsWindows())
+        {
+            _pinnedDeviceId = NormalizePin(pinnedDeviceId);
+            var device = ResolveDesiredDevice(out var id) ?? throw new InvalidOperationException("no render endpoint available");
+            using (device)
+            {
+                mix = device.AudioClient.MixFormat;
+                _deviceId = id;
+            }
+        }
+        else
+        {
+            // Linux: the PulseAudio / PipeWire server mixes and resamples for whatever
+            // sink is current (and moves the stream when the default sink changes), so
+            // the engine runs at a fixed rate instead of reading a device format.
+            mix = WaveFormat.CreateIeeeFloatWaveFormat(LinuxEngineSampleRate, 2);
+        }
+        (SampleRate, Channels) = EngineFormat(mix.SampleRate);
+        // 200ms pre-buffer before a FRESH segment renders (kills the input-start
+        // buzz of chopping ramping delivery against silence); the gapless splice
+        // is unaffected — a staged segment holds seconds and passes instantly.
+        // 5ms fade-in whenever audio resumes after silence (start, post-seek,
+        // underrun recovery) masks decoder warm-up garble at segment heads; the
+        // seam is never preceded by silence, so true gapless stays bit-exact.
+        Provider = new GaplessSpliceProvider(SampleRate, Channels, startThresholdMs: StartThresholdMs, startFadeMs: 5);
+        _idleStopMs = int.TryParse(Environment.GetEnvironmentVariable("UNDERTONE_ENGINE_IDLE_MS"), out var idleMs) && idleMs >= 0
+            ? idleMs : DefaultIdleStopMs;
+        _idle = new IdleWatch(_idleStopMs, SampleRate * Channels * StartThresholdMs / 1000, Environment.TickCount64);
+        // UNDERTONE_ENGINE_TAP=1 (or =<path>): capture exactly what the engine
+        // renders to a WAV so glitches can be inspected sample-by-sample
+        // instead of by ear. Diagnostic only — never breaks rendering. It wraps the
+        // provider, ahead of the chain below: it used to replace the finished chain
+        // with a tap on the bare provider, so with the tap on, mute and the Linux
+        // volume did nothing (harness 10-27: a muted, volume-10 sine stayed at full
+        // level on the pulse null sink).
+        ISampleProvider renderSource = Provider;
+        var tap = Environment.GetEnvironmentVariable("UNDERTONE_ENGINE_TAP");
+        if (!string.IsNullOrEmpty(tap))
+        {
+            try
+            {
+                var tapPath = tap == "1" ? Path.Combine(Path.GetTempPath(), "undertone-engine-tap.wav") : tap;
+                _tap = new WaveFileWriter(tapPath, Provider.WaveFormat);
+                renderSource = new TapProvider(Provider, _tap);
+                DebugLogger.Info(DebugLogger.Category.Playback, "GaplessEngine.TapOpen", tapPath);
+            }
+            catch (Exception ex)
+            {
+                DebugLogger.Warn(DebugLogger.Category.Playback, "GaplessEngine.TapFailed", ex.Message);
+            }
+        }
+        // Mute lives HERE, after the staged ring, not in LibVLC: VLC's mute is software
+        // gain on the blocks it hands us, so with seconds staged ahead it was heard ~2 s
+        // late (and unmute ~2 s late again, the ring being full of zeros by then). The
+        // gate ramps over a few ms and is a pure pass-through when open.
+        // Mono Audio, Balance and the sleep timer's fade-out (ChannelMixSettings.Shared):
+        // after the splice and the tap, so the whole engine output follows them on every
+        // platform the engine runs on, and upstream of the upmix (built per output in
+        // CreateOutput), which then spreads the already-mixed stereo. A pass-through at
+        // stereo, centre and no fade.
+        renderSource = new ChannelMixProvider(renderSource, ChannelMixSettings.Shared);
+        _muteGate = new MuteGateProvider(renderSource);
+        renderSource = _muteGate;
+        // Beat pulse for the flowing-artwork lyrics background: tapped post-mute so a
+        // muted player shows a still backdrop, stamped with this sink's output depth
+        // so the visual beat lands when the audible one does.
+        renderSource = new BeatTapProvider(renderSource, RequestedOutputLatencyMs);
+        // The user's volume where no OS session carries it (Linux, see LevelControl).
+        // After the beat tap, like the Windows session level, so the visuals do not
+        // follow the slider. A pass-through at level 1, which Windows never leaves.
+        _level = new OutputLevelProvider(renderSource);
+        renderSource = _level;
+        // Always-on stall probe: the render thread is MANAGED — a scheduler
+        // stall freezes it, the device buffer underruns, and the glitch is
+        // audible in the air but invisible to any PCM tap. Logging inter-read
+        // gaps turns those into session-log lines with timestamps. It also
+        // boosts the render thread on first read (see StallProbe).
+        _probe = new StallProbe(renderSource, StallThresholdMs(RequestedOutputLatencyMs),
+            () => !Provider.Parked && Provider.ActiveSegment != null);
+        _renderSource = _probe;
+        (_out, _outDevice, _) = CreateOutput();
+        // Render immediately: the provider always returns full buffers (silence
+        // when idle), so the stream never stops between tracks — the property
+        // true gapless depends on. Only a long idle parks it (see CheckIdle).
+        _out.Play();
+        DebugLogger.Info(DebugLogger.Category.Playback, "GaplessEngine.SinkOpened",
+            $"elapsedMs={Stopwatch.GetElapsedTime(openStart).TotalMilliseconds:0}, {DescribeFormats(mix)}, " +
+            $"output={OutputName}");
+        // Straight to the session log, whatever Developer Mode says: a report of choppy audio
+        // needs the device rate, and Ardhito's 10-08 log only let it be inferred from the gaps.
+        DebugLog.Write("Audio", $"engine output: {DescribeFormats(mix)}");
+        // Never let the callback throw: an unhandled Timer exception kills the process.
+        _deviceWatch = new Timer(_ =>
+        {
+            try { CheckDesiredDevice(); } catch { /* next tick retries */ }
+            try { CheckIdle(); } catch { /* next tick retries */ }
+        }, null, DeviceCheckIntervalMs, DeviceCheckIntervalMs);
+    }
+
+    // 100ms buffer: enough margin for the 31-47ms scheduler-quantum stalls
+    // the field logs showed, while keeping click-to-ear latency low — at
+    // 200ms every timeline click played the OLD position for 200ms first,
+    // which read as a skip/pause. (The old "buzz at 50ms" was actually the
+    // Array.Clear pad bug, not buffer starvation; an underrun now renders a
+    // clean declicked pad, not stale audio.)
+    /// <summary>Requested WasapiOut buffer depth. Also the lead of the segment's
+    /// consumed-frame position over the speaker (see VlcAudioPlayer.OutputLatency).</summary>
+    public const int OutputLatencyMs = 100;
+
+    /// <summary>
+    /// Requested pulse stream latency on Linux (GitHub #139 follow-up: "skips a beat"). The
+    /// pulse server does not hold all of it as buffer: pa_simple connects with
+    /// ADJUST_LATENCY, and PipeWire's pulse server then keeps only (tlength - 2·minreq)/2 +
+    /// 2·minreq queued, so 100 ms bought a 60 ms buffer (granted tlength 21168 bytes) in front
+    /// of a 21 ms graph quantum. Harness on PipeWire 1.0.5: render stalls of 50-60 ms already
+    /// cut out (repeated 50 ms stalls: 3 cuts in 10; real blocking GCs of 75-82 ms: 21 ms
+    /// cuts), the size of the user's GC and scheduler stalls (27-73 ms). At 200 ms (the
+    /// GStreamer pulsesink default) the server keeps 110 ms: ten 80 ms stalls in a row
+    /// played without a cut. The lyrics clock follows the server-reported latency.
+    /// </summary>
+    internal const int LinuxOutputLatencyMs = 200;
+
+    // The buffer depth the current platform's output is opened with (silent test mode
+    // keeps the WASAPI figure).
+    private static int RequestedOutputLatencyMs =>
+        !OperatingSystem.IsWindows() && !NullWavePlayer.SilentMode ? LinuxOutputLatencyMs : OutputLatencyMs;
+
+    /// <summary>
+    /// Engine rate on Linux, where no device mix format is read. CD rate, the rate of nearly
+    /// every MP3 and CD rip: LibVLC resamples each input on its own, so at any other rate
+    /// every track boundary carried a resampler restart (harness: a 7-sample step at each
+    /// seam at 48 kHz). The sound server resamples the one continuous stream to its sink.
+    /// </summary>
+    internal const int LinuxEngineSampleRate = 44100;
+
+    /// <summary>
+    /// The output's latency now: the sound server's figure for the Linux stream (it
+    /// includes the sink, a Bluetooth one too), the requested buffer depth otherwise.
+    /// </summary>
+    public int CurrentOutputLatencyMs
+    {
+        get
+        {
+            IWavePlayer current;
+            lock (_gate) current = _out;
+            return current is PulseSimpleWavePlayer { LatencyMs: { } ms } ? ms : RequestedOutputLatencyMs;
+        }
+    }
+
+    /// <summary>
+    /// Read gap the stall probe logs, for an output of <paramref name="latencyMs"/>: 25 ms on
+    /// the 100 ms WASAPI stream (2+ missed 10 ms periods). The 200 ms pulse stream runs its
+    /// PipeWire graph at a 2048-frame quantum (harness: node.latency 90 ms, quantum 2048 at
+    /// 48 kHz), and the blocking write waits up to one quantum, 46 ms at 44.1 kHz, every
+    /// cycle; 60 ms stays above that and well inside the 110 ms the server holds. Pure;
+    /// internal for tests.
+    /// </summary>
+    internal static int StallThresholdMs(int latencyMs) => latencyMs > OutputLatencyMs ? 60 : 25;
+
+    private static string OutputName =>
+        NullWavePlayer.SilentMode ? "null" : OperatingSystem.IsWindows() ? "wasapi" : "pulse";
+
+    /// <summary>
+    /// The user's volume as an <see cref="IOutputLevel"/> applied in this sink's render
+    /// chain, for platforms without an OS session handle on the engine's stream (Linux).
+    /// </summary>
+    internal IOutputLevel LevelControl => new SinkLevel(_level);
+
+    private sealed class SinkLevel(OutputLevelProvider level) : IOutputLevel
+    {
+        // The stage is always the one rendering, rebuilds included (it sits upstream
+        // of the output that gets replaced).
+        public bool HoldsActiveSession => true;
+
+        public bool SetLevel(double value)
+        {
+            level.Level = (float)Math.Clamp(value, 0.0, 1.0);
+            return true;
+        }
+
+        public void Invalidate() { }
+
+        public void Dispose() { }
+    }
+
+    /// <summary>
+    /// The engine (VLC-facing) format for the startup device's mix rate. It stays fixed for the
+    /// session (rebuilds reuse the provider chain), so it must not inherit a mono or telephone-rate
+    /// endpoint such as a Bluetooth hands-free "Headset": every track would stay downmixed and
+    /// band-limited until restart, even after moving to stereo speakers. Always stereo, and 48 kHz
+    /// below 44.1 kHz; shared mode's AUTOCONVERTPCM (NAudio passes it) matrixes and resamples for
+    /// such a device, while a normal device keeps its own rate. Above <see cref="AmemRate.Max"/>
+    /// the rate is halved into range (a 384 kHz device runs the engine at 192 kHz): LibVLC's
+    /// callbacks deliver the wrong amount of audio there (see <see cref="AmemRate"/>).
+    /// </summary>
+    internal static (int SampleRate, int Channels) EngineFormat(int mixSampleRate) =>
+        (mixSampleRate < 44100 ? 48000 : AmemRate.Fit(mixSampleRate), 2);
+
+    // ── Multi-channel upmix (Settings → Audio) ──
+    // Read at output creation, so a change takes effect through the same rebuild
+    // path a device swap uses. Static because the sink is created before any
+    // settings object reaches the player and recreated on device changes.
+    private static int s_upmixMode = (int)Services.UpmixMode.Off;
+
+    /// <summary>Speaker-fill mode for 5.1/7.1 devices; changing it needs <see cref="RequestRebuild"/> on a live sink.</summary>
+    public static UpmixMode UpmixMode
+    {
+        get => (UpmixMode)Volatile.Read(ref s_upmixMode);
+        set => Volatile.Write(ref s_upmixMode, (int)value);
+    }
+
+    /// <summary>Parses the persisted setting name; unknown values mean Off.</summary>
+    public static UpmixMode ParseUpmixMode(string? name) =>
+        Enum.TryParse<UpmixMode>(name, ignoreCase: true, out var mode) ? mode : Services.UpmixMode.Off;
+
+    /// <summary>Recreates the WASAPI output (same device) so a new upmix mode applies. Playback continues from the staged ring.</summary>
+    public void RequestRebuild()
+    {
+        if (_disposed) return;
+        if (Interlocked.Exchange(ref _rebuilding, 1) == 0)
+            Task.Run(RebuildLoop);
+    }
+
+    /// <summary>Settings → Output Device changed: re-pins the endpoint and rebuilds the
+    /// output on it (the same machinery a default-device change rides). Null/empty
+    /// follows the Windows default again. No-op when the pin already matches.</summary>
+    public void SetDevice(string? deviceId)
+    {
+        if (_disposed || !OperatingSystem.IsWindows()) return;
+        var pin = NormalizePin(deviceId);
+        if (pin == _pinnedDeviceId) return;
+        _pinnedDeviceId = pin;
+        DebugLogger.Info(DebugLogger.Category.Playback, "GaplessEngine.DevicePinned",
+            pin == null ? "follow default" : pin);
+        if (Interlocked.Exchange(ref _rebuilding, 1) == 0)
+            Task.Run(RebuildLoop);
+    }
+
+    private static string? NormalizePin(string? deviceId) =>
+        string.IsNullOrEmpty(deviceId) ? null : deviceId;
+
+    /// <summary>
+    /// The endpoint to render to: the pinned device (Settings → Output Device) while it
+    /// still exists, otherwise the Windows default. Null (id null too) when neither
+    /// resolves — callers retry on their own schedules.
+    /// </summary>
+    private MMDevice? ResolveDesiredDevice(out string? id)
+    {
+        id = null;
+        if (!OperatingSystem.IsWindows()) return null;
+        try
+        {
+            using var enumerator = new MMDeviceEnumerator();
+            var pin = _pinnedDeviceId;
+            // Unplugged/disabled pins resolve too (GetDevice succeeds), so only an
+            // ACTIVE pin counts; anything else falls back to the default below.
+            var pinned = AudioOutputDeviceCatalog.TryGetActive(enumerator, pin);
+            if (pinned != null)
+            {
+                id = pin;
+                return pinned;
+            }
+            var def = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+            id = def.ID;
+            return def;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Id-only resolution for the watch tick: the pinned device's id while it
+    /// is active, else the default's. An unplugged pin therefore moves the stream to the
+    /// default, and a replugged one moves it back. Null when nothing resolves.</summary>
+    private string? ResolveDesiredDeviceId()
+    {
+        if (!OperatingSystem.IsWindows()) return null;
+        try
+        {
+            using var enumerator = new MMDeviceEnumerator();
+            var pin = _pinnedDeviceId;
+            using (var pinned = AudioOutputDeviceCatalog.TryGetActive(enumerator, pin))
+            {
+                if (pinned != null) return pin;
+            }
+            using var def = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+            return def.ID;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Channels in a device's mix format, or 2 when it cannot be read.</summary>
+    private static int MixChannelsOf(MMDevice device)
+    {
+        try { return device.AudioClient.MixFormat.Channels; }
+        catch { return 2; }
+    }
+
+    private (IWavePlayer Output, MMDevice? Device, string? DeviceId) CreateOutput()
+    {
+        // Silent test mode (UNDERTONE_AOUT=dummy): the same chain, pulled in real time by a
+        // player with no device behind it (see NullWavePlayer).
+        MMDevice? device = null;
+        string? id = null;
+        IWavePlayer wasapiOut;
+        if (NullWavePlayer.SilentMode)
+        {
+            wasapiOut = new NullWavePlayer();
+        }
+        else if (OperatingSystem.IsWindows())
+        {
+            device = ResolveDesiredDevice(out id)
+                     ?? throw new InvalidOperationException("no render endpoint available");
+            wasapiOut = new WasapiOut(device, AudioClientShareMode.Shared, useEventSync: true, latency: OutputLatencyMs);
+        }
+        else
+        {
+            wasapiOut = new PulseSimpleWavePlayer(LinuxOutputLatencyMs);
+        }
+        try
+        {
+            ISampleProvider render = _renderSource;
+            var mode = UpmixMode;
+            if (mode != Services.UpmixMode.Off)
+            {
+                // device == null on the silent/Linux paths: stereo either way.
+                var deviceChannels = device != null ? MixChannelsOf(device) : 2;
+                if (deviceChannels > Channels)
+                {
+                    // Shared mode takes IEEE float at the mix format's channel count natively,
+                    // so the upmixed stream needs no resampler and stays sample-accurate.
+                    render = new UpmixSampleProvider(_renderSource, deviceChannels, mode);
+                    DebugLogger.Info(DebugLogger.Category.Playback, "GaplessEngine.Upmix", $"mode={mode}, channels={deviceChannels}");
+                }
+            }
+            wasapiOut.Init(new SampleToWaveProvider(render));
+        }
+        catch
+        {
+            try { wasapiOut.Dispose(); } catch { }
+            try { device?.Dispose(); } catch { }
+            throw;
+        }
+        wasapiOut.PlaybackStopped += OnPlaybackStopped;
+        return (wasapiOut, device, id);
+    }
+
+    // The render thread died. With an exception the endpoint is gone (unplug,
+    // per-app reroute, driver reset) — rebuild on whatever the default endpoint
+    // is now. Runs on the dying render thread, so new lines go off-thread.
+    private void OnPlaybackStopped(object? sender, StoppedEventArgs e)
+    {
+        if (_disposed) return;
+        // A stopped event can arrive queued (sync-context post) after its
+        // output was already replaced — never rebuild a healthy sink over it.
+        IWavePlayer current;
+        lock (_gate) current = _out;
+        var stale = !ReferenceEquals(sender, current);
+        if (e.Exception == null)
+        {
+            // Every Stop/Dispose of ours unsubscribes first, so a clean stop of the
+            // live output is the render thread ending on its own (NAudio's 0-read
+            // end-of-stream path): the engine is silent from here and nothing rebuilds it.
+            if (!stale)
+                DebugLogger.LogOffThread(DebugLogger.Category.Playback, DebugLogger.Level.Warn,
+                    "GaplessEngine.StoppedUnexpectedly", $"rebuilding={Volatile.Read(ref _rebuilding) == 1}");
+            return;
+        }
+        if (stale)
+        {
+            DebugLogger.LogOffThread(DebugLogger.Category.Playback, DebugLogger.Level.Warn,
+                "GaplessEngine.StopIgnored", $"reason=staleSender, {e.Exception.GetType().Name}: {e.Exception.Message}");
+            return;
+        }
+        DebugLogger.Warn(DebugLogger.Category.Playback, "GaplessEngine.DeviceLost",
+            $"{e.Exception.GetType().Name}: {e.Exception.Message}");
+        if (Interlocked.Exchange(ref _rebuilding, 1) == 0)
+            Task.Run(RebuildLoop);
+        else
+            DebugLogger.LogOffThread(DebugLogger.Category.Playback, DebugLogger.Level.Warn,
+                "GaplessEngine.StopIgnored", $"reason=rebuilding, {e.Exception.GetType().Name}: {e.Exception.Message}");
+    }
+
+    /// <summary>A device mix format against the fixed engine format. NAudio resamples when
+    /// they differ, so a device stuck at mono or a low rate shows up in the device lines.</summary>
+    private string DescribeFormats(WaveFormat mix) =>
+        $"mix={mix.SampleRate}Hz/{mix.Channels}ch/{mix.Encoding}, engine={SampleRate}Hz/{Channels}ch";
+
+    /// <summary>The desired endpoint's mix format against the fixed engine format. NAudio
+    /// resamples when they differ, so a device stuck at mono or a low rate shows up in the
+    /// device lines.</summary>
+    private string DesiredDeviceFormats()
+    {
+        if (!OperatingSystem.IsWindows())
+            return $"mix=server, engine={SampleRate}Hz/{Channels}ch";
+        try
+        {
+            using var device = ResolveDesiredDevice(out _);
+            if (device == null) return $"mix=?, engine={SampleRate}Hz/{Channels}ch";
+            using var client = device.AudioClient; // a fresh IAudioClient per access
+            return DescribeFormats(client.MixFormat);
+        }
+        catch
+        {
+            return $"mix=?, engine={SampleRate}Hz/{Channels}ch";
+        }
+    }
+
+    // Desired render endpoint moved while our stream is still alive on another one
+    // (the Windows default changed with the old device still present, or the user
+    // re-pinned the sink from Settings). WASAPI streams never migrate on their own;
+    // VLC's native mmdevice aout follows the default, so the engine must follow the
+    // desired endpoint — pinned when set, default otherwise.
+    private void CheckDesiredDevice()
+    {
+        // Silent test mode has no device to follow; on Linux the sound server moves the
+        // stream to a new default sink itself.
+        if (_disposed || NullWavePlayer.SilentMode || !OperatingSystem.IsWindows() ||
+            Volatile.Read(ref _rebuilding) == 1) return;
+        string? desiredId;
+        try
+        {
+            desiredId = ResolveDesiredDeviceId();
+        }
+        catch
+        {
+            return; // no endpoint right now — the PlaybackStopped path owns recovery
+        }
+        if (desiredId == null) return;
+        string? boundId;
+        lock (_gate) boundId = _deviceId;
+        if (boundId == null || desiredId == boundId) return;
+        // Guarded: the format read is COM work that would otherwise run with logging off.
+        if (DebugLogger.IsEnabled)
+            DebugLogger.Info(DebugLogger.Category.Playback, "GaplessEngine.DeviceChanged", DesiredDeviceFormats());
+        if (Interlocked.Exchange(ref _rebuilding, 1) == 0)
+            Task.Run(RebuildLoop);
+    }
+
+    private void RebuildLoop()
+    {
+        try
+        {
+            IWavePlayer oldOut;
+            MMDevice? oldDevice;
+            lock (_gate) { oldOut = _out; oldDevice = _outDevice; _outDevice = null; }
+            oldOut.PlaybackStopped -= OnPlaybackStopped;
+            try { oldOut.Stop(); } catch { }
+            try { oldOut.Dispose(); } catch { }
+            try { oldDevice?.Dispose(); } catch { }
+
+            var attempt = 0;
+            while (!_disposed)
+            {
+                attempt++;
+                (IWavePlayer newOut, MMDevice? newDevice, string? id) = (null!, null, null);
+                try
+                {
+                    (newOut, newDevice, id) = CreateOutput();
+                    // New render thread: re-apply priority + MMCSS on first read.
+                    _probe.RearmBoost();
+                    // The new session opens at its own level, not the user's: render silence
+                    // from the first sample until the owner re-asserted the volume. Without a
+                    // subscriber nothing would release it.
+                    if (Rebuilt != null)
+                    {
+                        Interlocked.Exchange(ref _rebuildHoldStart, Stopwatch.GetTimestamp());
+                        _muteGate.Hold(RebuildHoldMaxMs);
+                    }
+                    if (_desiredPlaying) newOut.Play();
+                    lock (_gate)
+                    {
+                        if (_disposed)
+                        {
+                            newOut.PlaybackStopped -= OnPlaybackStopped;
+                            try { newOut.Stop(); } catch { }
+                            try { newOut.Dispose(); } catch { }
+                            try { newDevice?.Dispose(); } catch { }
+                            return;
+                        }
+                        _out = newOut;
+                        _outDevice = newDevice;
+                        _deviceId = id;
+                        // The new output is subscribed and started per _desiredPlaying;
+                        // if the player is still idle, the next watch tick parks it again.
+                        _streamParked = false;
+                    }
+                    try { Rebuilt?.Invoke(); } catch { /* subscriber's problem, not the sink's */ }
+                    // After the volume re-assert is kicked off: the format read is COM work
+                    // that must not widen the fresh session's 100% window.
+                    if (DebugLogger.IsEnabled)
+                        DebugLogger.Info(DebugLogger.Category.Playback, "GaplessEngine.SinkRebuilt",
+                            $"attempt={attempt}, playing={_desiredPlaying}, {DesiredDeviceFormats()}");
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    if (newOut != null)
+                    {
+                        newOut.PlaybackStopped -= OnPlaybackStopped;
+                        try { newOut.Dispose(); } catch { }
+                    }
+                    DebugLogger.Warn(DebugLogger.Category.Playback, "GaplessEngine.SinkRebuildRetry",
+                        $"attempt={attempt}, {ex.GetType().Name}: {ex.Message}");
+                }
+                // 250ms → 4s backoff, then keep trying every 4s: "unplugged the
+                // only device" stays recoverable whenever one comes back.
+                Thread.Sleep(Math.Min(4000, 250 * (1 << Math.Min(attempt - 1, 4))));
+            }
+        }
+        finally
+        {
+            Volatile.Write(ref _rebuilding, 0);
+        }
+    }
+
+    // Pause parks the provider, not the stream (the WasapiGainOutput pattern).
+    // WasapiOut.Pause() only stops FILLING: the device played its queued ~100ms,
+    // then starved mid-waveform (a click), and Play() read the ring back in at
+    // full level (another). Parked, the provider ramps to silence, renders zeros
+    // without consuming the ring, and fades the held audio back in on resume.
+    public void Pause()
+    {
+        _desiredPlaying = false;
+        Provider.Parked = true;
+    }
+
+    public void Resume()
+    {
+        // The render thread sat idle through the pause; that is not a render stall.
+        if (!_desiredPlaying) _probe.ForgetLastRead();
+        _desiredPlaying = true;
+        Provider.Parked = false;
+        lock (_parkGate) WakeStreamLocked("resume");
+    }
+
+    // Watch tick: park the stream after the idle timeout, or restart a parked one
+    // whose provider has audio due (anything that queued audio without Resume).
+    private void CheckIdle()
+    {
+        if (_disposed || Volatile.Read(ref _rebuilding) == 1) return;
+        lock (_parkGate)
+        {
+            bool streamParked;
+            lock (_gate) streamParked = _streamParked;
+            var step = _idle.Observe(Environment.TickCount64, Provider.ActiveSegment, Provider.Parked, streamParked);
+            if (step == IdleStep.Park)
+                ParkStreamLocked();
+            else if (step == IdleStep.Wake)
+                WakeStreamLocked("audio");
+        }
+    }
+
+    // Caller holds _parkGate. Stop() stops the audio client (releasing the power
+    // request) and joins the render thread; the output stays initialized for Play().
+    private void ParkStreamLocked()
+    {
+        IWavePlayer current;
+        lock (_gate)
+        {
+            if (_disposed) return;
+            current = _out;
+            _streamParked = true;
+        }
+        // Unsubscribed first like every stop of ours: this clean stop is not the
+        // render thread dying on its own.
+        current.PlaybackStopped -= OnPlaybackStopped;
+        try { current.Stop(); } catch { }
+        DebugLogger.Info(DebugLogger.Category.Playback, "GaplessEngine.IdlePark",
+            $"idleMs={_idleStopMs}, paused={Provider.Parked}, segment={Provider.ActiveSegment != null}");
+    }
+
+    // Caller holds _parkGate. Play() is a no-op on the running stream; it starts an
+    // output rebuilt while paused, or one the idle park stopped.
+    private void WakeStreamLocked(string reason)
+    {
+        _idle.Touch(Environment.TickCount64);
+        IWavePlayer current;
+        bool wasParked;
+        lock (_gate)
+        {
+            if (_disposed) return;
+            current = _out;
+            wasParked = _streamParked;
+            _streamParked = false;
+        }
+        if (wasParked)
+        {
+            current.PlaybackStopped += OnPlaybackStopped;
+            // New render thread: re-apply priority + MMCSS on first read, and the
+            // parked gap is not a render stall.
+            _probe.RearmBoost();
+        }
+        try { current.Play(); }
+        catch (Exception ex)
+        {
+            // Device transitional.
+            DebugLogger.Warn(DebugLogger.Category.Playback, "GaplessEngine.ResumeFailed", $"{ex.GetType().Name}: {ex.Message}");
+        }
+        if (wasParked)
+            DebugLogger.Info(DebugLogger.Category.Playback, "GaplessEngine.IdleWake", $"reason={reason}");
+    }
+
+    public void Dispose()
+    {
+        _disposed = true;
+        try { _deviceWatch.Dispose(); } catch { }
+        try { Provider.Clear(); } catch { }
+        lock (_parkGate) // no idle park/wake in flight on the output being torn down
+        {
+            IWavePlayer current;
+            MMDevice? device;
+            lock (_gate) { current = _out; device = _outDevice; _outDevice = null; }
+            current.PlaybackStopped -= OnPlaybackStopped;
+            try { current.Stop(); } catch { }
+            try { current.Dispose(); } catch { }
+            try { device?.Dispose(); } catch { }
+        }
+        try { _tap?.Dispose(); } catch { }
+    }
+
+    /// <summary>What a watch tick does with the stream.</summary>
+    internal enum IdleStep { None, Park, Wake }
+
+    /// <summary>
+    /// The idle-park decision of the watch tick, kept free of the device so it is testable.
+    /// Track audio is flowing while the active segment was consumed, flushed or replaced
+    /// since the last tick, or while it holds a start gate's worth of audio the un-parked
+    /// provider would render now (due). The stream parks after the idle timeout without
+    /// either, and a parked stream wakes once audio is due again. A paused provider is
+    /// never due: its held audio waits for Resume.
+    /// </summary>
+    internal sealed class IdleWatch
+    {
+        private readonly int _idleStopMs;
+        private readonly int _dueSamples;
+        private GaplessTrackSegment? _segment;
+        private long _positionMs = -1;
+        private long _busyMs;
+
+        /// <param name="idleStopMs">Park after this long without track audio; 0 never parks.</param>
+        /// <param name="dueSamples">Buffered samples that make a segment's audio due.</param>
+        public IdleWatch(int idleStopMs, int dueSamples, long nowMs)
+        {
+            _idleStopMs = idleStopMs;
+            _dueSamples = Math.Max(1, dueSamples);
+            _busyMs = nowMs;
+        }
+
+        /// <summary>Activity outside the ticks (a resume): the idle timeout starts over.</summary>
+        public void Touch(long nowMs) => _busyMs = nowMs;
+
+        public IdleStep Observe(long nowMs, GaplessTrackSegment? active, bool providerParked, bool streamParked)
+        {
+            var positionMs = active?.PositionMs ?? -1;
+            var moved = !ReferenceEquals(active, _segment) || positionMs != _positionMs;
+            _segment = active;
+            _positionMs = positionMs;
+            var due = !providerParked && active != null && active.BufferedSamples >= _dueSamples;
+            if (moved || due)
+                _busyMs = nowMs;
+            if (streamParked)
+                return due ? IdleStep.Wake : IdleStep.None;
+            return _idleStopMs > 0 && nowMs - _busyMs >= _idleStopMs ? IdleStep.Park : IdleStep.None;
+        }
+    }
+
+    // Tee for the diagnostic tap: forwards renders and appends them to the WAV,
+    // flushing about once a second so the file stays readable even if the app
+    // is killed instead of closed. TapClock lines anchor file-time to wall-time.
+    private sealed class TapProvider : ISampleProvider
+    {
+        private readonly ISampleProvider _inner;
+        private readonly WaveFileWriter _writer;
+        private int _sinceFlush;
+        private long _totalSamples;
+        private long _sinceClock;
+        public WaveFormat WaveFormat => _inner.WaveFormat;
+
+        public TapProvider(ISampleProvider inner, WaveFileWriter writer)
+        {
+            _inner = inner;
+            _writer = writer;
+        }
+
+        private readonly ReplayDetector? _outDetector = ReplayDetector.CreateIfEnabled("Out");
+        // Sentinel canary: pre-fill the (WasapiOut-reused) buffer with an
+        // inaudible magic value before the provider fills it. Any surviving
+        // sentinel = the provider left that region unwritten — the previous
+        // period's stale samples would otherwise play again (the 10ms replay).
+        private const float GapSentinel = 3.0e-38f;
+        private long _lastGapLogTick;
+
+        public int Read(float[] buffer, int offset, int count)
+        {
+            for (var i = 0; i < count; i++) buffer[offset + i] = GapSentinel;
+            var n = _inner.Read(buffer, offset, count);
+            var leaked = 0; var firstAt = -1;
+            for (var i = 0; i < count; i++)
+            {
+                if (buffer[offset + i] == GapSentinel)
+                {
+                    leaked++;
+                    if (firstAt < 0) firstAt = i;
+                    buffer[offset + i] = 0f; // don't play the canary
+                }
+            }
+            if (leaked > 0 && Environment.TickCount64 - _lastGapLogTick > 250)
+            {
+                _lastGapLogTick = Environment.TickCount64;
+                DebugLogger.Warn(DebugLogger.Category.Playback, "GaplessEngine.GapLeak",
+                    $"samples={leaked}, firstAt={firstAt}, n={n}, offset={offset}, count={count}, bufLen={buffer.Length}");
+            }
+            _outDetector?.Observe(buffer, offset, n);
+            try
+            {
+                _writer.WriteSamples(buffer, offset, n);
+                _sinceFlush += n;
+                _totalSamples += n;
+                _sinceClock += n;
+                if (_sinceFlush >= WaveFormat.SampleRate)
+                {
+                    _writer.Flush();
+                    _sinceFlush = 0;
+                }
+                if (_sinceClock >= (long)WaveFormat.SampleRate * WaveFormat.Channels * 10)
+                {
+                    _sinceClock = 0;
+                    DebugLogger.Info(DebugLogger.Category.Playback, "GaplessEngine.TapClock",
+                        $"fileMs={_totalSamples * 1000 / ((long)WaveFormat.SampleRate * WaveFormat.Channels)}");
+                }
+            }
+            catch { /* diagnostic only */ }
+            return n;
+        }
+    }
+
+    // Runs ON the render thread. First read: boost the thread the way VLC's
+    // native aout is boosted — highest CLR priority plus MMCSS "Pro Audio" —
+    // so UI/decoder/artwork bursts can't preempt rendering into an underrun.
+    // Afterwards: log any read gap that eats a meaningful share of the buffer;
+    // the log write also runs here, but only after the damage is already done.
+    private sealed class StallProbe : ISampleProvider
+    {
+        [System.Runtime.InteropServices.DllImport("avrt.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private static extern IntPtr AvSetMmThreadCharacteristics(string taskName, ref uint taskIndex);
+
+        private readonly ISampleProvider _inner;
+        private readonly int _thresholdMs;
+        private readonly Func<bool> _audible;
+        private long _lastReadTick;
+        private TimeSpan _lastGcPause;
+        private int _lastGen0, _lastGen1, _lastGen2;
+        private bool _boosted;
+        public WaveFormat WaveFormat => _inner.WaveFormat;
+
+        public StallProbe(ISampleProvider inner, int thresholdMs, Func<bool> audible)
+        {
+            _inner = inner;
+            _thresholdMs = thresholdMs;
+            _audible = audible;
+        }
+
+        // The boost latches per render thread; a rebuilt WasapiOut spins up a
+        // fresh thread that must boost itself again on its first read.
+        public void RearmBoost()
+        {
+            _boosted = false;
+            _lastReadTick = 0; // don't count the dead-sink gap as a render stall
+        }
+
+        public void ForgetLastRead() => _lastReadTick = 0;
+
+        public int Read(float[] buffer, int offset, int count)
+        {
+            if (!_boosted)
+            {
+                _boosted = true;
+                try
+                {
+                    System.Threading.Thread.CurrentThread.Priority = System.Threading.ThreadPriority.Highest;
+                    if (OperatingSystem.IsWindows())
+                    {
+                        uint taskIndex = 0;
+                        var handle = AvSetMmThreadCharacteristics("Pro Audio", ref taskIndex);
+                        DebugLogger.Info(DebugLogger.Category.Playback, "GaplessEngine.RenderBoost",
+                            $"mmcss={(handle != IntPtr.Zero ? "ok" : "failed")}");
+                    }
+                }
+                catch { /* boost is best-effort */ }
+            }
+
+            // Stopwatch, not TickCount64: the 15.6ms system tick cannot resolve a
+            // ~10ms read cadence (a "47ms" gap was a 3-tick quantization artifact).
+            // 25ms threshold on WASAPI: 2+ missed engine periods — the priority-inversion
+            // stalls behind the buzz are 31-47ms and were invisible at 120ms. The pulse
+            // output's own cadence is a graph quantum (see StallThresholdMs).
+            var now = Stopwatch.GetTimestamp();
+            var last = _lastReadTick;
+            _lastReadTick = now;
+            // GC counters over the same gap. A collection suspends every managed thread,
+            // this one included, whatever its priority or MMCSS class, so a stall line
+            // must say whether a GC sat inside it (09-24: stalls clustered while the
+            // artist page realized hundreds of rows; with this the next log proves or
+            // clears the GC). "gcs=a/b/c" is CollectionCount(0/1/2) over the gap, and
+            // CollectionCount(n) counts every GC of generation n or higher. Plain counter
+            // reads, cheap at the ~10ms cadence.
+            var gcPause = GC.GetTotalPauseDuration();
+            int gen0 = GC.CollectionCount(0), gen1 = GC.CollectionCount(1), gen2 = GC.CollectionCount(2);
+            var gapMs = (now - last) * 1000.0 / Stopwatch.Frequency;
+            if (last != 0 && gapMs > _thresholdMs)
+            {
+                // Logged off this thread: with Developer Mode on the line goes through
+                // DebugLog's lock into CrashJournal's AutoFlush file write, and that time
+                // landed inside the NEXT gap — one stall could log its way into the next.
+                var meta = $"gapMs={gapMs:F1}, gcPauseMs={(gcPause - _lastGcPause).TotalMilliseconds:F1}, " +
+                           $"gcs={gen0 - _lastGen0}/{gen1 - _lastGen1}/{gen2 - _lastGen2}, " +
+                           // A gap while the provider renders zeros (paused, nothing loaded,
+                           // the idle stream after startup) is not heard; say which it was
+                           // (11-03: a startup trim's 120 ms gap read as an audible stall).
+                           $"audible={_audible()}";
+                ThreadPool.QueueUserWorkItem(static m =>
+                {
+                    try { DebugLogger.Warn(DebugLogger.Category.Playback, "GaplessEngine.RenderStall", m); }
+                    catch { /* diagnostic only */ }
+                }, meta, preferLocal: false);
+            }
+            _lastGcPause = gcPause;
+            _lastGen0 = gen0; _lastGen1 = gen1; _lastGen2 = gen2;
+            return _inner.Read(buffer, offset, count);
+        }
+    }
+}
