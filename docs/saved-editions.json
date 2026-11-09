@@ -1,0 +1,242 @@
+[
+  {
+    "edition": "mit-sound-auto-queue",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-auto-queue-ready",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-browser-search",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-build",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-direct-torrents",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-download-panel",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-download-panel-ready",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-ext-build",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-ext-ready",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-import-lyrics-build",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-library-shuffle",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-lyrics-build",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-show-native",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-show-native-ready",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-source-lyrics-build",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-taskbar-build",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-torrent-build",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-torrent-details",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-torrent-ready",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  },
+  {
+    "edition": "mit-sound-torrent-results",
+    "kind": "rebranded historical binary",
+    "common_changes": [
+      "Internal branding renamed",
+      "About page removed",
+      "Audio settings reduced to Output Device",
+      "Equalizer controls disabled",
+      "Automatic random library queue refill enabled"
+    ],
+    "source_history": "Preserved compiled edition; the exact original source snapshot was not recorded."
+  }
+]
