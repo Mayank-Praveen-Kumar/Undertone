@@ -10,6 +10,12 @@ The original MIT copyright and license are preserved in [LICENSE](LICENSE).
 
 ## Added capabilities
 
+- **Settings → Diagnostics**: library health, disk/cache controls and low-power mode. **Settings → Player**: named listening sessions. Undo history is also in **Settings → Diagnostics**.
+- Low-power mode reduces flowing-artwork/visualizer refresh, uses one library scan worker, and defers background BPM/key analysis. Appearance preferences are preserved.
+- Named sessions retain the current song, position, upcoming queue, shuffle and repeat modes. Missing songs are skipped on resume.
+- Library health checks missing local files, possible duplicates, missing artwork/lyrics and incomplete tags without modifying music files.
+- Undo queue additions, removals, clear/reorder operations, removed playlist songs, and deleted sessions from Undo history or Ctrl+Z outside text fields. History is limited to 20 actions per run; queue undo expires when the current song changes.
+
 - Lower-impact library scans use two workers by default; the two-line lyrics pill avoids the per-frame word-animation loop.
 
 - Single-click the player island's Lyrics button for a rounded, two-line lyrics pill attached to the button, with a softly blurred backdrop; click inside the pill or double-click the button to use the full lyrics page.

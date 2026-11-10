@@ -1958,6 +1958,7 @@ public partial class PlayerViewModel : ViewModelBase
     /// <summary>Inserts a track at the front of the UpNext queue ("Play Next").</summary>
     public void AddNext(Track track, bool announce = true)
     {
+        if (announce) RememberQueueEdit("Add song next");
         AddNextCore(track);
         if (announce) AnnounceQueued(new[] { track }, null, playNext: true);
     }
@@ -1991,6 +1992,7 @@ public partial class PlayerViewModel : ViewModelBase
     /// <summary>Appends a track to the end of the UpNext queue ("Add to Queue").</summary>
     public void AddToQueue(Track track, bool announce = true)
     {
+        if (announce) RememberQueueEdit("Add song to queue");
         DebugLogger.Info(DebugLogger.Category.Queue, "AddToQueue", $"track={track.Title}, newLen={UpNext.Count + 1}");
         CancelAutoMixTransition("queue changed");
         MarkQueueChanged();
@@ -2004,6 +2006,7 @@ public partial class PlayerViewModel : ViewModelBase
     /// <param name="sourceName">Album / playlist / folder name the confirmation shows.</param>
     public void AddRangeToQueue(IList<Track> tracks, string? sourceName = null, bool announce = true)
     {
+        if (announce && tracks.Count > 0) RememberQueueEdit("Add songs to queue");
         if (tracks.Count == 0) return;
         DebugLogger.Info(DebugLogger.Category.Queue, "AddRangeToQueue", $"count={tracks.Count}, newLen={UpNext.Count + tracks.Count}");
         CancelAutoMixTransition("queue changed");
@@ -2024,6 +2027,7 @@ public partial class PlayerViewModel : ViewModelBase
     {
         if (index >= 0 && index < UpNext.Count)
         {
+            RememberQueueEdit("Remove song from queue");
             DebugLogger.Info(DebugLogger.Category.Queue, "RemoveFromQueue", $"idx={index}, track={UpNext[index].Title}");
             CancelAutoMixTransition("queue changed");
             MarkQueueChanged();
@@ -2035,6 +2039,7 @@ public partial class PlayerViewModel : ViewModelBase
     /// <summary>Clears all upcoming tracks.</summary>
     public void ClearQueue()
     {
+        if (UpNext.Count > 0) RememberQueueEdit("Clear queue");
         DebugLogger.Info(DebugLogger.Category.Queue, "ClearQueue", $"cleared={UpNext.Count} tracks");
         CancelAutoMixTransition("queue changed");
         MarkQueueChanged();
@@ -2052,6 +2057,7 @@ public partial class PlayerViewModel : ViewModelBase
     /// </summary>
     public void ReplaceUpNext(IList<Track> tracks)
     {
+         RememberQueueEdit("Replace upcoming queue");
         DebugLogger.Info(DebugLogger.Category.Queue, "ReplaceUpNext", $"tracks={tracks.Count}, was={UpNext.Count}");
         CancelAutoMixTransition("queue replaced");
         MarkQueueChanged();
@@ -2141,6 +2147,8 @@ public partial class PlayerViewModel : ViewModelBase
     {
         if (fromIndex < 0 || fromIndex >= UpNext.Count) return;
         if (toIndex < 0 || toIndex >= UpNext.Count) return;
+        if (fromIndex == toIndex) return;
+        RememberQueueEdit("Reorder queue");
 
         CancelAutoMixTransition("queue changed");
         MarkQueueChanged();
@@ -2157,6 +2165,7 @@ public partial class PlayerViewModel : ViewModelBase
     {
         var rows = indices.Where(i => i >= 0 && i < UpNext.Count).Distinct().OrderByDescending(i => i).ToList();
         if (rows.Count == 0) return;
+        RememberQueueEdit("Remove songs from queue");
 
         DebugLogger.Info(DebugLogger.Category.Queue, "RemoveManyFromQueue", $"count={rows.Count}");
         CancelAutoMixTransition("queue changed");
@@ -2209,6 +2218,7 @@ public partial class PlayerViewModel : ViewModelBase
         var landAt = insertIndex - rows.Count(i => i < insertIndex);
         var contiguous = rows[^1] - rows[0] == rows.Count - 1;
         if (contiguous && landAt == rows[0]) return -1;
+        RememberQueueEdit("Reorder queue songs");
 
         CancelAutoMixTransition("queue changed");
         MarkQueueChanged();
@@ -2685,6 +2695,7 @@ public partial class PlayerViewModel : ViewModelBase
 
     partial void OnCurrentTrackChanged(Track? value)
     {
+        UndoJournal.Shared.Prune();
         OnPropertyChanged(nameof(HasContent));
         ViewCurrentTrackAlbumCommand.NotifyCanExecuteChanged();
         ResolveLyricsBackground();

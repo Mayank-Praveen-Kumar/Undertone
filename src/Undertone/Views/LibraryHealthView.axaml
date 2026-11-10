@@ -1,0 +1,30 @@
+<UserControl xmlns="https://github.com/avaloniaui" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Undertone.ViewModels" xmlns:s="using:Undertone.Services"
+             x:Class="Undertone.Views.LibraryHealthView" x:DataType="vm:ListeningToolsViewModel" Background="Transparent">
+
+  <UserControl.Styles>
+    <Style Selector="ListBox.listening-list ListBoxItem">
+      <Setter Property="CornerRadius" Value="12"/>
+      <Setter Property="Margin" Value="0,2"/>
+      <Setter Property="Padding" Value="4"/>
+    </Style>
+  </UserControl.Styles>
+<Grid Margin="0" RowDefinitions="Auto,Auto,*,Auto,Auto" RowSpacing="12">
+          <Grid ColumnDefinitions="Auto,Auto,*,Auto" ColumnSpacing="10">
+            <Button Classes="pill-action" Content="Check library" Command="{Binding ScanHealthCommand}"/>
+            <Button Classes="pill-action" Grid.Column="1" Content="Cancel" Command="{Binding ScanHealthCancelCommand}"/>
+            <ComboBox CornerRadius="18" Padding="14,8" Grid.Column="3" ItemsSource="{Binding HealthFilters}" SelectedItem="{Binding SelectedHealthFilter}" MinWidth="180"/>
+          </Grid>
+          <TextBlock Grid.Row="1" Text="{Binding HealthSummary}" TextWrapping="Wrap" Opacity="0.7"/>
+          <ListBox Classes="listening-list" Background="Transparent" BorderThickness="0" Padding="4" Grid.Row="2" ItemsSource="{Binding HealthIssues}" SelectedItem="{Binding SelectedIssue}">
+            <ListBox.ItemTemplate><DataTemplate x:DataType="s:LibraryHealthIssue"><Grid Margin="9,8" ColumnDefinitions="160,*" ColumnSpacing="12">
+              <TextBlock Text="{Binding Category}" FontSize="12" Opacity="0.65"/><TextBlock Grid.Column="1" Text="{Binding Title}" TextTrimming="CharacterEllipsis"/>
+            </Grid></DataTemplate></ListBox.ItemTemplate>
+          </ListBox>
+          <TextBlock Grid.Row="3" Text="{Binding SelectedIssue.Detail}" TextWrapping="Wrap" MaxHeight="100"/>
+          <StackPanel Grid.Row="4" Spacing="8">
+            <TextBlock Text="Possible duplicates match title, artist and approximate duration; compare them before making changes." FontSize="12" Opacity="0.6" TextWrapping="Wrap"/>
+            <StackPanel Orientation="Horizontal" Spacing="10"><Button Classes="pill-action" Content="Show file location" Command="{Binding RevealIssueCommand}"/><Button Classes="pill-action" Content="Play selected" Command="{Binding PlayIssueCommand}"/></StackPanel>
+          </StackPanel>
+        </Grid>
+</UserControl>

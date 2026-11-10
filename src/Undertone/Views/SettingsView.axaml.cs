@@ -259,6 +259,7 @@ public partial class SettingsView : UserControl
         (SettingsViewModel.TabAudio, "AudioTabPanel"),
         (SettingsViewModel.TabLibrary, "LibraryTabPanel"),
         (SettingsViewModel.TabAdvanced, "AdvancedTabPanel"),
+        (SettingsViewModel.TabDiagnostics, "DiagnosticsTabPanel"),
         (SettingsViewModel.TabIntegrations, "IntegrationsTabPanel"),
         (SettingsViewModel.TabPlugins, "PluginsTabPanel"),
     };

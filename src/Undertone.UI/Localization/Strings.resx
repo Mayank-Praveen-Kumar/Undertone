@@ -2790,12 +2790,12 @@ The lines and their timings are dropped and an empty lyrics box opens for your o
   <data name="LyricsStudio.EngineUnavailableWindows" xml:space="preserve"><value>Couldn't start — this PC can't load the speech engine. Install the Microsoft Visual C++ Redistributable (x64), then restart Undertone.</value><comment>Lyrics Studio status line on Windows when the speech engine (Whisper) fails to load. Keep "Microsoft Visual C++ Redistributable (x64)" in English: it is the download's name</comment></data>
   <data name="Settings.Desc.General" xml:space="preserve"><value>Language, startup, and how the window and sidebar behave.</value><comment>Settings page description</comment></data>
   <data name="Settings.Desc.Appearance" xml:space="preserve"><value>Themes, accent colour, glass, text animation and artwork.</value><comment>Settings page description</comment></data>
-  <data name="Settings.Desc.Player" xml:space="preserve"><value>The player island, the mini player, Cover Flow and Now Playing artwork.</value><comment>Settings page description</comment></data>
+  <data name="Settings.Desc.Player" xml:space="preserve"><value>Listening sessions, the player island, mini player, Cover Flow and Now Playing artwork.</value><comment>Settings page description</comment></data>
   <data name="Settings.Desc.Lyrics" xml:space="preserve"><value>The lyrics page, online lyrics sources, and Lyrics Studio.</value><comment>Settings page description</comment></data>
   <data name="Settings.Desc.Shortcuts" xml:space="preserve"><value>Click a key to change it. Esc cancels, Backspace unbinds.</value><comment>Settings page description</comment></data>
   <data name="Settings.Desc.Audio" xml:space="preserve"><value>Playback, output, analysis and the equalizer.</value><comment>Settings page description</comment></data>
   <data name="Settings.Desc.Library" xml:space="preserve"><value>Media folders, scanning, how artists and albums are organised, and library tools.</value><comment>Settings page description</comment></data>
-  <data name="Settings.Desc.Advanced" xml:space="preserve"><value>Storage, helper programs, updates and reset.</value><comment>Settings page description</comment></data>
+  <data name="Settings.Desc.Advanced" xml:space="preserve"><value>Helper programs, updates and reset.</value><comment>Settings page description</comment></data>
   <data name="Settings.Desc.AccountDevices" xml:space="preserve"><value>Your account, your phone and remote control.</value><comment>Settings page description</comment></data>
   <data name="Settings.Desc.Integrations" xml:space="preserve"><value>Discord, scrobbling, TIDAL and music servers.</value><comment>Settings page description</comment></data>
   <data name="Settings.Desc.Plugins" xml:space="preserve"><value>Add extra features to Undertone.</value><comment>Settings page description</comment></data>
@@ -3149,4 +3149,6 @@ The lines and their timings are dropped and an empty lyrics box opens for your o
   <data name="Settings.PlaylistSideRailHint" xml:space="preserve"><value>Show the panel with the playlist's artists and suggested songs on the right.</value><comment>Text in SettingsView.axaml (Playlist Page section)</comment></data>
   <data name="Playlist.HideSideRail" xml:space="preserve"><value>Hide Featured Artists &amp; Suggestions</value><comment>Playlist page options menu: hides the right-hand panel</comment></data>
   <data name="Playlist.ShowSideRail" xml:space="preserve"><value>Show Featured Artists &amp; Suggestions</value><comment>Playlist page options menu: shows the right-hand panel again</comment></data>
+  <data name="Settings.Tab.Diagnostics" xml:space="preserve"><value>Diagnostics</value></data>
+  <data name="Settings.Desc.Diagnostics" xml:space="preserve"><value>Library health, disk usage, cache maintenance and power controls.</value></data>
 </root>

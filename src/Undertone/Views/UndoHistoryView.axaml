@@ -1,0 +1,19 @@
+<UserControl xmlns="https://github.com/avaloniaui" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Undertone.ViewModels" xmlns:s="using:Undertone.Services"
+             x:Class="Undertone.Views.UndoHistoryView" x:DataType="vm:ListeningToolsViewModel" Background="Transparent">
+
+  <UserControl.Styles>
+    <Style Selector="ListBox.listening-list ListBoxItem">
+      <Setter Property="CornerRadius" Value="12"/>
+      <Setter Property="Margin" Value="0,2"/>
+      <Setter Property="Padding" Value="4"/>
+    </Style>
+  </UserControl.Styles>
+<Grid Margin="0" RowDefinitions="Auto,Auto,Auto,*" RowSpacing="14">
+          <TextBlock Text="Undo queue edits, playlist removals and deleted sessions with Ctrl+Z. History lasts for this app run; queue undo resets when the song changes." TextWrapping="Wrap" Opacity="0.65"/>
+          <TextBlock Grid.Row="1" Text="{Binding Status}" TextWrapping="Wrap"/><Button Classes="pill-action" Grid.Row="2" Content="{Binding UndoLabel}" Command="{Binding UndoLastCommand}" HorizontalAlignment="Left"/>
+          <ListBox Classes="listening-list" Background="Transparent" BorderThickness="0" Padding="4" Grid.Row="3" ItemsSource="{Binding UndoEntries}">
+            <ListBox.ItemTemplate><DataTemplate x:DataType="s:UndoEntry"><TextBlock Text="{Binding Label}" Margin="9,8"/></DataTemplate></ListBox.ItemTemplate>
+          </ListBox>
+        </Grid>
+</UserControl>

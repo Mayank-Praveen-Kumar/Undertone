@@ -90,6 +90,8 @@ public partial class SettingsViewModel : ViewModelBase
     public const string TabAccountDevices = "Account & Devices";
     public const string TabPlayer = "Player";
     public const string TabLyrics = "Lyrics";
+    public const string TabDiagnostics = "Diagnostics";
+    public ListeningToolsViewModel? ListeningTools { get; set; }
     public const string TabAdvanced = "Advanced";
 
     [ObservableProperty] private string _selectedSettingsTab = TabGeneral;
@@ -114,7 +116,7 @@ public partial class SettingsViewModel : ViewModelBase
             // RailFolderIcon is the open-folder shape the sidebar's Folders entry uses.
             G("App", (TabGeneral, "RailSettingsIcon"), (TabAppearance, "RailPaletteIcon"), (TabPlayer, "RailPlayIcon"), (TabLyrics, "LyricsBubbleIcon"), (TabShortcuts, "RailKeyboardIcon")),
             G("Playback", (TabAudio, "RailSpeakerIcon")),
-            G("Library", (TabLibrary, "RailFolderIcon"), (TabAdvanced, "RailWrenchIcon")),
+            G("Library", (TabLibrary, "RailFolderIcon"), (TabAdvanced, "RailWrenchIcon"), (TabDiagnostics, "ListeningToolsIcon")),
             G("Connect", (TabIntegrations, "RailPlugIcon"), (TabPlugins, "RailPuzzleIcon")),
         };
         groups[0].Sections[0].IsSelected = true; // mirrors the TabGeneral default of SelectedSettingsTab
@@ -154,6 +156,8 @@ public partial class SettingsViewModel : ViewModelBase
     public bool IsLyricsTabVisible => IsLyricsTabSelected;
     public bool IsAdvancedTabSelected => SelectedSettingsTab == TabAdvanced;
     public bool IsAdvancedTabVisible => IsAdvancedTabSelected;
+    public bool IsDiagnosticsTabSelected => SelectedSettingsTab == TabDiagnostics;
+    public bool IsDiagnosticsTabVisible => IsDiagnosticsTabSelected;
 
     // ── Plugins tab ──
     /// <summary>The plugin host, attached by MainWindowViewModel once the player exists.</summary>
@@ -462,6 +466,8 @@ public partial class SettingsViewModel : ViewModelBase
         OnPropertyChanged(nameof(IsLyricsTabVisible));
         OnPropertyChanged(nameof(IsAdvancedTabSelected));
         OnPropertyChanged(nameof(IsAdvancedTabVisible));
+        OnPropertyChanged(nameof(IsDiagnosticsTabSelected));
+        OnPropertyChanged(nameof(IsDiagnosticsTabVisible));
         OnPropertyChanged(nameof(SelectedTabTitle));
         OnPropertyChanged(nameof(SelectedTabDescription));
         OnFeatureTabOpened(value);
@@ -517,7 +523,7 @@ public partial class SettingsViewModel : ViewModelBase
             RefreshSnoozedTracks();
             _ = RefreshRemovedTracksAsync();
         }
-        else if (tab == TabAdvanced)
+        else if (tab == TabDiagnostics)
         {
             _ = RefreshStorageInfoAsync();
         }

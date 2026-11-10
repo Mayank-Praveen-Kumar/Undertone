@@ -19,6 +19,7 @@
     <Product>Undertone</Product>
     <Company>Undertone</Company>
     <Version>1.6.7</Version>
+    <LibVlcWindowsVersion>3.0.23.1</LibVlcWindowsVersion>
     <!-- Pre-release marker: numeric Version stays 1.1.16 (update checks + the
          displayed number are unchanged); the "-prerelease" SemVer suffix on the
          informational version is what lights the "Pre-release" badge in Settings.
@@ -140,7 +141,7 @@
   <!-- Audio playback via libVLC -->
   <ItemGroup>
     <PackageReference Include="LibVLCSharp" Version="3.10.1" />
-    <PackageReference Include="VideoLAN.LibVLC.Windows" Version="3.0.23.1" Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
+    <PackageReference Include="VideoLAN.LibVLC.Windows" Version="$(LibVlcWindowsVersion)" Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
     <!-- macOS gets NO libvlc NuGet on purpose: VideoLAN.LibVLC.Mac's 3.0.21 pin
          never existed on nuget.org, so restore floated to the abandoned 2019-era
          3.1.3.1 payload (x86_64-only, no plugins, pre-3.0.8 security state).
@@ -203,4 +204,20 @@
     <AvaloniaResource Include="Assets\AppIcons\*.ico;Assets\AppIcons\*.png" />
   </ItemGroup>
 
+  <!-- NuGet's build-time VLC copy is skipped when compilation is disabled. Always
+       include the selected Windows runtime so a repackaged player can start. -->
+  <Target Name="EnsurePublishedWindowsVlc" AfterTargets="Publish"
+          Condition="'$(RuntimeIdentifier)' == 'win-x64' Or '$(RuntimeIdentifier)' == 'win-x86' Or '$(RuntimeIdentifier)' == 'win-arm64'">
+    <PropertyGroup>
+      <_VlcArchitecture Condition="'$(RuntimeIdentifier)' == 'win-x64'">x64</_VlcArchitecture>
+      <_VlcArchitecture Condition="'$(RuntimeIdentifier)' == 'win-x86'">x86</_VlcArchitecture>
+      <_VlcArchitecture Condition="'$(RuntimeIdentifier)' == 'win-arm64'">arm64</_VlcArchitecture>
+      <_VlcNativeRoot>$(NuGetPackageRoot)\videolan.libvlc.windows\$(LibVlcWindowsVersion)\build\$(_VlcArchitecture)\</_VlcNativeRoot>
+    </PropertyGroup>
+    <Error Condition="!Exists('$(_VlcNativeRoot)libvlc.dll')" Text="The matching Windows VLC runtime is missing. Restore packages before publishing." />
+    <ItemGroup><_PublishedVlcFile Include="$(_VlcNativeRoot)**\*" /></ItemGroup>
+    <Copy SourceFiles="@(_PublishedVlcFile)"
+          DestinationFiles="@(_PublishedVlcFile->'$(PublishDir)libvlc\$(RuntimeIdentifier)\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
 </Project>

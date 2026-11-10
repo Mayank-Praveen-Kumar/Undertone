@@ -4031,7 +4031,8 @@ public partial class LyricsViewModel : ViewModelBase, IDisposable
     private bool IsAnyLyricsSurfaceVisible => _visibleLyricsSurfaces > 0;
 
     private bool WantsWordClock =>
-        _hasSyncedLyrics
+        !Undertone.Helpers.ListeningPowerMode.Enabled
+        && _hasSyncedLyrics
         && _animatedLyricsSurfaces > 0
         && _player.State == Models.PlaybackState.Playing
         && _lyricsSyncTimer.IsEnabled

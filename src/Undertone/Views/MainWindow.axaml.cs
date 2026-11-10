@@ -2162,6 +2162,15 @@ public partial class MainWindow : Window, IPageKeyOverlayHost
         // A plugin's view shown in Settings owns its keys, as in its own window (where the app's
         // shortcuts never reached it): Space presses its focused button instead of play/pause.
         if (IsInHostedPluginView(e.Source)) return;
+        if (e.Key == Key.Z && e.KeyModifiers is KeyModifiers.Control or KeyModifiers.Meta
+            && e.Source is not TextBox
+            && (e.Source is not Visual sourceVisual || !sourceVisual.GetVisualAncestors().OfType<TextBox>().Any())
+            && vm.ListeningTools.UndoLastCommand.CanExecute(null))
+        {
+            _ = vm.ListeningTools.UndoLastCommand.ExecuteAsync(null);
+            e.Handled = true;
+            return;
+        }
         if (shortcuts.TryMatch(e) is not { } action) return;
         // Space (or Enter) on a control reached with the keyboard, its focus ring showing,
         // presses that control. After a mouse click it stays play/pause, so clicking Next and

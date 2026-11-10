@@ -769,6 +769,8 @@ public partial class PlaylistViewModel : ViewModelBase, ISearchable, IDisposable
         // come back on the next reload.
         if (IsSmartPlaylist) return;
         var tracks = SelectionOr(track);
+        var beforeIds = _playlist.TrackIds.ToList();
+        var beforeAdded = new Dictionary<Guid, DateTime>(_playlist.TrackAddedAt);
         foreach (var t in tracks)
         {
             var displayIdx = Tracks.IndexOf(t);
@@ -795,6 +797,18 @@ public partial class PlaylistViewModel : ViewModelBase, ISearchable, IDisposable
         RebuildFeaturedArtists(Tracks.ToList());
 
         await _persistence.SavePlaylistsAsync(_sidebar.Playlists.ToList());
+        var expected = _playlist.TrackIds.ToArray();
+        UndoJournal.Shared.Record($"Remove songs from “{_playlist.Name}”", async () =>
+        {
+            var removedIds = _playlist.TrackIds;
+            var removedAdded = _playlist.TrackAddedAt;
+            _playlist.TrackIds = beforeIds.ToList();
+            _playlist.TrackAddedAt = new Dictionary<Guid, DateTime>(beforeAdded);
+            _playlist.ModifiedAt = DateTime.UtcNow;
+            try { await _persistence.SavePlaylistsAsync(_sidebar.Playlists.ToList()); }
+            catch { _playlist.TrackIds = removedIds; _playlist.TrackAddedAt = removedAdded; throw; }
+            LoadTracks();
+        }, () => _sidebar.GetPlaylist(_playlist.Id) != null && _playlist.TrackIds.SequenceEqual(expected));
         CtrlSelectedTracks.Clear();
     }
 

@@ -3800,6 +3800,7 @@ public class LibraryService : ILibraryService
     /// </summary>
     private static int GetScanParallelism()
     {
+        if (Undertone.Helpers.ListeningPowerMode.Enabled) return 1;
         var raw = Environment.GetEnvironmentVariable("UNDERTONE_SCAN_THREADS");
         if (int.TryParse(raw, out var n) && n >= 1)
             return Math.Min(n, 64);

@@ -109,6 +109,8 @@ public sealed class AudioAnalysisCoordinator
         bool anyWritten = false;
         foreach (var track in pending)
         {
+            while (Undertone.Helpers.ListeningPowerMode.Enabled)
+                await Task.Delay(1000, ct);
             if (ct.IsCancellationRequested) break;
             try
             {

@@ -147,6 +147,7 @@ public partial class MainWindowViewModel : ViewModelBase
     /// <summary>"Continue from your phone" pill (Pick Up on Computer).</summary>
     public HandoffPromptViewModel HandoffPrompt { get; } = new();
     public SettingsViewModel Settings { get; }
+    public ListeningToolsViewModel ListeningTools { get; }
     public LyricsViewModel Lyrics => _lyricsVm;
 
     private MiniPlayerViewModel? _miniPlayerVm;
@@ -379,7 +380,9 @@ public partial class MainWindowViewModel : ViewModelBase
         Sidebar = new SidebarViewModel(persistence, library);
         TopBar = new TopBarViewModel();
         Sidebar.TopBar = TopBar;
+        ListeningTools = new ListeningToolsViewModel(Player, library, persistence);
         Settings = new SettingsViewModel(persistence, library, playHistory, mediaServer);
+        Settings.ListeningTools = ListeningTools;
         Settings.SetAudioPlayer(audioPlayer);
         Settings.SetPlayer(Player);
         Player.SetSettingsViewModel(Settings);
@@ -880,6 +883,7 @@ public partial class MainWindowViewModel : ViewModelBase
     public async Task InitializeAsync()
     {
         // Load settings
+        await ListeningTools.InitializeAsync();
         await Settings.LoadAsync();
 
         // Warm the play-history log off the UI thread. Every consumer (Home, Statistics,
@@ -1178,6 +1182,7 @@ public partial class MainWindowViewModel : ViewModelBase
     /// </summary>
     public async Task ShutdownAsync()
     {
+        await ListeningTools.FlushAsync();
         // Silence playback first. The saves below run for seconds after the window
         // is already gone, and nothing else stops the audio engine before process
         // exit — so the track audibly kept playing after the app "closed".

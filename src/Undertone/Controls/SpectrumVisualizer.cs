@@ -179,6 +179,11 @@ public sealed class SpectrumVisualizer : Control
         }
 
         var nowMs = _clock.Elapsed.TotalMilliseconds;
+        if (!Undertone.Helpers.ListeningPowerMode.ShouldRender(nowMs, _lastFrameMs))
+        {
+            topLevel.RequestAnimationFrame(OnFrame);
+            return;
+        }
         var dtMs = Math.Clamp(nowMs - _lastFrameMs, 0, 100);
         _lastFrameMs = nowMs;
 

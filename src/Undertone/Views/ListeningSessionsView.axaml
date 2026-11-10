@@ -1,0 +1,34 @@
+<UserControl xmlns="https://github.com/avaloniaui" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Undertone.ViewModels" xmlns:s="using:Undertone.Services"
+             x:Class="Undertone.Views.ListeningSessionsView" x:DataType="vm:ListeningToolsViewModel" Background="Transparent">
+
+  <UserControl.Styles>
+    <Style Selector="ListBox.listening-list ListBoxItem">
+      <Setter Property="CornerRadius" Value="12"/>
+      <Setter Property="Margin" Value="0,2"/>
+      <Setter Property="Padding" Value="4"/>
+    </Style>
+  </UserControl.Styles>
+<Grid Margin="0" RowDefinitions="Auto,*,Auto,Auto" RowSpacing="14">
+          <StackPanel Spacing="6"><TextBlock Text="Save the current song, its position and the upcoming queue. Resuming a session starts playback." TextWrapping="Wrap" Opacity="0.65"/><TextBlock Text="{Binding Status}" TextWrapping="Wrap" FontSize="12"/></StackPanel>
+          <ListBox Classes="listening-list" Background="Transparent" BorderThickness="0" Padding="4" Grid.Row="1" ItemsSource="{Binding Sessions}" SelectedItem="{Binding SelectedSession}">
+            <ListBox.ItemTemplate><DataTemplate x:DataType="s:NamedListeningSession"><StackPanel Margin="10,9" Spacing="5">
+              <TextBlock Text="{Binding Name}" FontSize="16" FontWeight="SemiBold"/><TextBlock Text="{Binding Detail}" FontSize="12" Opacity="0.6"/>
+            </StackPanel></DataTemplate></ListBox.ItemTemplate>
+          </ListBox>
+          <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="10">
+            <Button Classes="pill-action" Content="Resume selected" Command="{Binding RestoreSessionCommand}"/>
+            <Button Classes="pill-action" Content="Delete selected" Command="{Binding DeleteSessionCommand}" IsEnabled="{Binding !IsSavingChanges}"/>
+          </StackPanel>
+          <StackPanel Grid.Row="3" Spacing="8">
+            <TextBlock Text="Enter a name to save the current queue or rename the selected session." FontSize="12" Opacity="0.65"/>
+            <StackPanel Spacing="8">
+              <TextBox CornerRadius="999" Padding="14,9" BorderThickness="1.5" MinHeight="0" Text="{Binding SessionName}" Watermark="Session name" MaxLength="80"/>
+              <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button Classes="pill-action" Content="Save current queue" Command="{Binding SaveSessionCommand}"/>
+                <Button Classes="pill-action" Content="Rename selected" Command="{Binding RenameSessionCommand}"/>
+              </StackPanel>
+            </StackPanel>
+          </StackPanel>
+        </Grid>
+</UserControl>

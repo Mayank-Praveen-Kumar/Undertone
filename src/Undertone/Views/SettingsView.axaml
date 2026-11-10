@@ -4,6 +4,7 @@
              xmlns:plugins="using:Undertone.Services.Plugins"
              xmlns:server="using:Undertone.Services.Server"
              xmlns:studio="using:Undertone.Services.LyricsStudio"
+             xmlns:views="using:Undertone.Views"
              xmlns:vm="using:Undertone.ViewModels"
              xmlns:models="using:Undertone.Models"
              xmlns:sys="using:System"
@@ -3283,6 +3284,11 @@
             </StackPanel>
 
             <StackPanel x:Name="PlayerTabPanel" Classes="tab-page" IsVisible="{Binding IsPlayerTabVisible}" Spacing="4">
+            <TextBlock Classes="section-title" Text="Listening sessions" Margin="0,2,0,8"/>
+            <Border Classes="setting-card group-card" Padding="16">
+              <views:ListeningSessionsView Height="430" DataContext="{Binding ListeningTools}"/>
+            </Border>
+
             <TextBlock Classes="section-title" Text="{loc:T Settings.Section.PlayerIsland}" Margin="0,2,0,8"/>
             <Border Classes="setting-card group-card">
             <StackPanel>
@@ -5258,8 +5264,26 @@
             </Border>
             </StackPanel>
 
-            <StackPanel x:Name="AdvancedTabPanel" Classes="tab-page" IsVisible="{Binding IsAdvancedTabVisible}" Spacing="4">
-            <TextBlock Classes="section-title" Text="{loc:T Settings.Section.Storage}" Margin="0,2,0,8"/>
+            <StackPanel x:Name="DiagnosticsTabPanel" Classes="tab-page" IsVisible="{Binding IsDiagnosticsTabVisible}" Spacing="4">
+            <TextBlock Classes="section-title" Text="Power and performance" Margin="0,2,0,8"/>
+            <Border Classes="setting-card group-card"><StackPanel><Border Classes="setting-row">
+              <Grid ColumnDefinitions="*,Auto" ColumnSpacing="14">
+                <StackPanel Spacing="5"><TextBlock Text="Low-power mode" FontSize="15" FontWeight="SemiBold"/>
+                  <TextBlock Text="Quieter visual updates, fewer simultaneous scans and deferred background audio analysis. Your appearance preferences are preserved." Opacity="0.6" FontSize="12" TextWrapping="Wrap"/>
+                  <TextBlock Text="{Binding ListeningTools.ModeStatus}" FontSize="12" TextWrapping="Wrap"/>
+                </StackPanel>
+                <controls:LottieToggle Grid.Column="1" IsChecked="{Binding ListeningTools.IsLowPowerMode}" AutomationProperties.Name="Low-power mode" VerticalAlignment="Center"/>
+              </Grid>
+            </Border></StackPanel></Border>
+            <TextBlock Classes="section-title" Text="Library health" Margin="0,16,0,8"/>
+            <Border Classes="setting-card group-card" Padding="16">
+              <views:LibraryHealthView Height="460" DataContext="{Binding ListeningTools}"/>
+            </Border>
+            <TextBlock Classes="section-title" Text="Undo history" Margin="0,16,0,8"/>
+            <Border Classes="setting-card group-card" Padding="16">
+              <views:UndoHistoryView Height="260" DataContext="{Binding ListeningTools}"/>
+            </Border>
+            <TextBlock Classes="section-title" Text="{loc:T Settings.Section.Storage}" Margin="0,16,0,8"/>
             <Border Classes="setting-card group-card">
             <StackPanel>
             <Border Classes="setting-row">
@@ -5425,6 +5449,9 @@
             </StackPanel>
             </Border>
 
+            </StackPanel>
+
+            <StackPanel x:Name="AdvancedTabPanel" Classes="tab-page" IsVisible="{Binding IsAdvancedTabVisible}" Spacing="4">
             <TextBlock Classes="section-title" Text="{loc:T Settings.Section.AudioTools}" Margin="0,16,0,8"/>
             <Border Classes="setting-card group-card">
             <StackPanel>
