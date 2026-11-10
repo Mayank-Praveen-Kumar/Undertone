@@ -230,6 +230,8 @@ public partial class PlaybackBarView : UserControl
 
     private void OnPlaybackBarDetachedFromVisualTree(object? sender, VisualTreeAttachmentEventArgs e)
     {
+        CancelPendingLyricsClick();
+        _isolatedLyricsWindow?.Close();
         // Safety: ensure seek drag state is fully cleared on detach
         if (_isSeekDragging)
         {
@@ -1853,11 +1855,65 @@ public partial class PlaybackBarView : UserControl
         }
     }
 
+    private DispatcherTimer? _lyricsClickTimer;
+    private Window? _isolatedLyricsWindow;
+
+    private void CancelPendingLyricsClick()
+    {
+        _lyricsClickTimer?.Stop();
+        _lyricsClickTimer = null;
+    }
+
     private void OnLyricsButtonClick(object? sender, RoutedEventArgs e)
     {
         var mainWindow = this.FindLogicalAncestorOfType<MainWindow>();
-        if (mainWindow?.DataContext is MainWindowViewModel mainVm)
+        if (mainWindow?.DataContext is not MainWindowViewModel mainVm) return;
+
+        // Wait for the system's double-click interval so a double click never
+        // briefly opens the compact window before navigating to the lyrics page.
+        if (_lyricsClickTimer != null)
+        {
+            CancelPendingLyricsClick();
+            _isolatedLyricsWindow?.Close();
             mainVm.ToggleLyricsCommand.Execute(null);
+            return;
+        }
+
+        _lyricsClickTimer = new DispatcherTimer
+        {
+            Interval = mainWindow.GetPlatformSettings()?.GetDoubleTapTime(PointerType.Mouse)
+                ?? TimeSpan.FromMilliseconds(500)
+        };
+        _lyricsClickTimer.Tick += (_, _) =>
+        {
+            CancelPendingLyricsClick();
+            if (_isolatedLyricsWindow != null)
+            {
+                _isolatedLyricsWindow.Activate();
+                return;
+            }
+            var lyrics = new LyricsPanelView { DataContext = mainVm.Lyrics };
+            var window = new IsolatedLyricsWindow
+            {
+                Title = "Undertone — Lyrics",
+                Width = 380, Height = 500, MinWidth = 280, MinHeight = 280,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                RequestedThemeVariant = mainWindow.ActualThemeVariant,
+                Content = lyrics
+            };
+            lyrics.SetCloseAction(window.Close, "Close compact lyrics");
+            _isolatedLyricsWindow = window;
+            window.Closed += (_, _) =>
+            {
+                lyrics.SetShown(false);
+                lyrics.DataContext = null;
+                window.Content = null;
+                _isolatedLyricsWindow = null;
+            };
+            window.Show(mainWindow);
+            lyrics.SetShown(true);
+        };
+        _lyricsClickTimer.Start();
     }
 
     private void OnLyricsPanelButtonClick(object? sender, RoutedEventArgs e)
