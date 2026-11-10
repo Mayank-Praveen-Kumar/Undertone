@@ -25,13 +25,16 @@ public partial class DiscoverViewModel : ViewModelBase
     private readonly ILibraryService _library;
     private readonly IPlayHistoryService _history;
     private readonly DiscoverService _service;
-    private readonly DiscoverPreferences _preferences;
+    private DiscoverPreferences _preferences;
+    private string _listeningModeId = "everyday";
+    private IReadOnlyList<PlayHistoryEvent> ModeHistory => _history.Events.TakeLast(20000).Where(e => e.ListeningModeId == _listeningModeId).ToArray();
     private CancellationTokenSource? _request;
     private List<DiscoverSong> _candidates = new();
     private string _seedTitle = "your listening";
     private bool _active;
     private bool _loaded;
     public PlayerViewModel Player { get; }
+    public ListeningModesViewModel? Modes { get; }
     public ObservableCollection<DiscoverCard> Songs { get; } = new();
     [ObservableProperty] private bool _isBusy;
     [ObservableProperty] private string _status = "Play a song, then start Discover.";
@@ -46,13 +49,26 @@ public partial class DiscoverViewModel : ViewModelBase
     public event EventHandler<DiscoverCard>? PreviewRequested;
     public event EventHandler<DiscoverCard>? AlbumRequested;
 
-    public DiscoverViewModel(PlayerViewModel player, ILibraryService library, IPlayHistoryService history, DiscoverService service)
+    public DiscoverViewModel(PlayerViewModel player, ILibraryService library, IPlayHistoryService history, DiscoverService service, ListeningModesViewModel? modes = null)
     {
         (Player, _library, _history, _service) = (player, library, history, service);
         _preferences = service.LoadPreferences();
         _enabled = _preferences.Enabled;
         _adventure = _preferences.Adventure;
+        Modes = modes;
+        if (modes is not null) modes.ModeChanged += (_, id) => ChangeListeningMode(id);
         Player.PropertyChanged += PlayerChanged;
+    }
+    private void ChangeListeningMode(string id)
+    {
+        if (_listeningModeId == id) return;
+        _request?.Cancel(); SavePreferences();
+        _listeningModeId = id;
+        _preferences = _service.LoadPreferences(id);
+        _enabled = _preferences.Enabled; _adventure = _preferences.Adventure;
+        OnPropertyChanged(nameof(Enabled)); OnPropertyChanged(nameof(NeedsStart)); OnPropertyChanged(nameof(Adventure));
+        _candidates.Clear(); Songs.Clear(); _loaded = false;
+        if (_active && Enabled) _ = RefreshAsync();
     }
 
     public void SetActive(bool active)
@@ -93,7 +109,7 @@ public partial class DiscoverViewModel : ViewModelBase
     }
     public void SavePreferences()
     {
-        try { _service.SavePreferences(_preferences); }
+        try { _service.SavePreferences(_preferences, _listeningModeId); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Status = "Your discovery preferences could not be saved."; }
     }
     partial void OnModeChanged(int value)
@@ -139,8 +155,10 @@ public partial class DiscoverViewModel : ViewModelBase
             if (Mode == 2)
             {
                 Subtitle = "Old favourites, ready for another listen.";
-                var tracks = _library.Tracks.Where(t => !t.IsDisliked && !t.IsSnoozed && t.PlayCount > 0
-                    && (t.LastPlayed is null || t.LastPlayed < DateTime.UtcNow.AddDays(-14)))
+                var lastInMode = ModeHistory.Where(e => !e.Skipped).GroupBy(e => e.TrackId).ToDictionary(g => g.Key, g => g.Max(e => e.PlayedAtUtc));
+                var tracks = _library.Tracks.Where(t => !t.IsDisliked && !t.IsSnoozed
+                    && (_listeningModeId == "everyday" ? t.PlayCount > 0 && (t.LastPlayed is null || t.LastPlayed < DateTime.UtcNow.AddDays(-14))
+                        : lastInMode.TryGetValue(t.Id, out var last) && last < DateTime.UtcNow.AddDays(-14)))
                     .Where(t => !_preferences.HiddenSongs.Contains(DiscoverSong.KeyFor(t.Artist, t.Title)))
                     .OrderByDescending(t => (t.IsFavorite ? 5 : 0) + t.Rating + Math.Log(1 + t.PlayCount))
                     .ThenBy(t => t.LastPlayed).Take(24);
@@ -151,10 +169,11 @@ public partial class DiscoverViewModel : ViewModelBase
                 return;
             }
             var current = Player.CurrentTrack;
+            var modeCounts = ModeHistory.Where(e => !e.Skipped).GroupBy(e => e.TrackId).ToDictionary(g => g.Key, g => g.Count());
             var seeds = Mode == 0 ? (current is null ? Array.Empty<Track>() : new[] { current })
-                : _library.Tracks.Where(t => !t.IsDisliked && !t.IsSnoozed && (t.IsFavorite || t.PlayCount > 0))
-                    .OrderByDescending(t => (t.IsFavorite ? 4 : 0) + t.Rating + Math.Log(1 + t.PlayCount)
-                        + (t.LastPlayed > DateTime.UtcNow.AddDays(-7) ? 2 : 0))
+                : _library.Tracks.Where(t => !t.IsDisliked && !t.IsSnoozed && (_listeningModeId == "everyday" ? t.IsFavorite || t.PlayCount > 0 : modeCounts.ContainsKey(t.Id)))
+                    .OrderByDescending(t => _listeningModeId == "everyday" ? (t.IsFavorite ? 4 : 0) + t.Rating + Math.Log(1 + t.PlayCount)
+                        + (t.LastPlayed > DateTime.UtcNow.AddDays(-7) ? 2 : 0) : Math.Log(1 + modeCounts.GetValueOrDefault(t.Id)))
                     .DistinctBy(t => t.Artist, StringComparer.OrdinalIgnoreCase).Take(3).ToArray();
             if (seeds.Length == 0 && current is not null) seeds = new[] { current };
             if (seeds.Length == 0) { Status = "Play a song or favourite a few tracks to get started."; return; }
@@ -185,7 +204,7 @@ public partial class DiscoverViewModel : ViewModelBase
     {
         Songs.Clear();
         var local = _library.Tracks.GroupBy(t => DiscoverSong.KeyFor(t.Artist, t.Title)).ToDictionary(g => g.Key, g => g.First());
-        foreach (var item in DiscoverService.Rank(_candidates, _library.Tracks, _history.Events, _preferences, _seedTitle))
+        foreach (var item in DiscoverService.Rank(_candidates, _library.Tracks, ModeHistory, _preferences, _seedTitle, _listeningModeId == "everyday"))
         {
             local.TryGetValue(item.Song.Key, out var track);
             Songs.Add(new(item.Song, item.Reason, track) { Album = track?.Album ?? "Find album details" });

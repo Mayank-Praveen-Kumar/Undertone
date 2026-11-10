@@ -191,6 +191,12 @@ public static class ThemeDerivation
         foreach (var k in chromeBrushKeys)
             dict[k] = new SolidColorBrush(k == "SystemControlBackgroundBaseLowBrush" ? sidebar : main);
 
+        if (def.Id == "listening-nature")
+        {
+            dict["HomeCardBackground"] = new SolidColorBrush(Color.Parse("#F5EBCB"));
+            dict["HomeCardHoverBackground"] = new SolidColorBrush(Color.Parse("#EEE0B6"));
+            dict["SidebarSelectedBrush"] = new SolidColorBrush(Color.Parse("#EADCA9"));
+        }
         return dict;
     }
 }

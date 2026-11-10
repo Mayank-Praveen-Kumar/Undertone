@@ -165,6 +165,7 @@
             </TranslateTransform>
         </DockPanel.RenderTransform>
 
+        <views:ModeSwitcherView DockPanel.Dock="Top" DataContext="{Binding Modes}"/>
         <Grid RowDefinitions="Auto,*">
             <!-- Zone A: Top bar left | centered playback island | right actions.
                  Auto-height: collapses on pages where the bar renders nothing

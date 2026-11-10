@@ -141,7 +141,8 @@ public sealed class PlayHistoryService : IPlayHistoryService
             Title = track.Title,
             Artist = track.Artist,
             PlayedAtUtc = playedUtc,
-            Skipped = false
+            Skipped = false,
+            ListeningModeId = ListeningModeContext.CurrentId
         };
         lock (_lock)
         {

@@ -13,4 +13,5 @@ public class PlayHistoryEvent
 
     /// <summary>True when the user skipped away before hearing half the track.</summary>
     public bool Skipped { get; set; }
+    public string ListeningModeId { get; set; } = "everyday";
 }

@@ -29,25 +29,30 @@ public sealed class DiscoverService
     public DiscoverService(HttpClient http, string root, string? apiKey = null)
         => (_http, _root, _apiKey) = (http, Path.Combine(root, "discover"), apiKey ?? LastFmApi.ApiKey);
 
-    public DiscoverPreferences LoadPreferences()
+    private string PreferencesPath(string modeId) => modeId == "everyday" ? Path.Combine(_root, "preferences.json")
+        : Path.Combine(_root, "preferences", Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(modeId))) + ".json");
+    public DiscoverPreferences LoadPreferences(string modeId = "everyday")
     {
         try
         {
-            var value = JsonSerializer.Deserialize<DiscoverPreferences>(File.ReadAllText(Path.Combine(_root, "preferences.json"))) ?? new();
+            var value = JsonSerializer.Deserialize<DiscoverPreferences>(File.ReadAllText(PreferencesPath(modeId))) ?? new();
             value.HiddenSongs = new(value.HiddenSongs ?? [], StringComparer.OrdinalIgnoreCase);
             value.ArtistFeedback = new(value.ArtistFeedback ?? [], StringComparer.OrdinalIgnoreCase);
             value.Adventure = double.IsFinite(value.Adventure) ? Math.Clamp(value.Adventure, 0, 100) : 35;
+            if (modeId != "everyday") value.Enabled = LoadPreferences().Enabled;
             return value;
         }
-        catch { return new(); }
+        catch { return new() { Enabled = modeId != "everyday" && LoadPreferences().Enabled }; }
     }
 
-    public void SavePreferences(DiscoverPreferences value)
+    public void SavePreferences(DiscoverPreferences value, string modeId = "everyday")
     {
         Directory.CreateDirectory(_root);
-        var file = Path.Combine(_root, "preferences.json");
+        var file = PreferencesPath(modeId);
+        Directory.CreateDirectory(Path.GetDirectoryName(file)!);
         File.WriteAllText(file + ".tmp", JsonSerializer.Serialize(value));
         File.Move(file + ".tmp", file, true);
+        if (modeId != "everyday") { var master = LoadPreferences(); master.Enabled = value.Enabled; SavePreferences(master); }
     }
 
     public async Task<(IReadOnlyList<DiscoverSong> Songs, bool Offline)> SimilarAsync(Track seed, CancellationToken ct)
@@ -115,10 +120,10 @@ public sealed class DiscoverService
         && v.ValueKind is JsonValueKind.String or JsonValueKind.Number ? v.ToString().Trim() : "";
 
     internal static IReadOnlyList<(DiscoverSong Song, string Reason)> Rank(IEnumerable<DiscoverSong> candidates,
-        IReadOnlyList<Track> library, IReadOnlyList<PlayHistoryEvent> history, DiscoverPreferences preferences, string seedTitle)
+        IReadOnlyList<Track> library, IReadOnlyList<PlayHistoryEvent> history, DiscoverPreferences preferences, string seedTitle, bool useLibraryAffinity = true)
     {
         var artistScores = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-        foreach (var t in library.Where(t => t.IsFavorite || t.Rating > 0))
+        foreach (var t in library.Where(t => useLibraryAffinity && (t.IsFavorite || t.Rating > 0)))
             artistScores[t.Artist] = artistScores.GetValueOrDefault(t.Artist) + (t.IsFavorite ? 2 : 0) + t.Rating / 5d;
         foreach (var e in history.TakeLast(2000))
         {

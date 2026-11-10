@@ -1,0 +1,18 @@
+<UserControl xmlns="https://github.com/avaloniaui" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Undertone.ViewModels" xmlns:m="using:Undertone.Models"
+             x:Class="Undertone.Views.ModeSwitcherView" x:DataType="vm:ListeningModesViewModel">
+  <UserControl.Styles>
+    <Style Selector="ListBox.mode-switcher"><Setter Property="Background" Value="Transparent"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Padding" Value="0"/></Style>
+    <Style Selector="ListBox.mode-switcher ListBoxItem"><Setter Property="CornerRadius" Value="18"/><Setter Property="Padding" Value="16,8"/><Setter Property="Margin" Value="2,0"/><Setter Property="MinHeight" Value="34"/><Setter Property="Background" Value="Transparent"/></Style>
+    <Style Selector="ListBox.mode-switcher ListBoxItem:selected"><Setter Property="Background" Value="{DynamicResource AccentColorBrush}"/><Setter Property="Foreground" Value="White"/></Style>
+    <Style Selector="ListBox.mode-switcher ListBoxItem:pointerover"><Setter Property="Background" Value="{DynamicResource SidebarHoverBrush}"/></Style>
+  </UserControl.Styles>
+  <Border CornerRadius="22" Padding="5" Margin="18,9,18,3" Background="{DynamicResource AppSidebarBackground}" HorizontalAlignment="Center">
+    <ListBox Classes="mode-switcher" ItemsSource="{Binding Profiles}" SelectedItem="{Binding SelectedMode}" IsEnabled="{Binding !IsBusy}"
+             SelectionMode="Single" ScrollViewer.HorizontalScrollBarVisibility="Auto" ScrollViewer.VerticalScrollBarVisibility="Disabled"
+             AutomationProperties.Name="Listening modes">
+      <ListBox.ItemsPanel><ItemsPanelTemplate><StackPanel Orientation="Horizontal"/></ItemsPanelTemplate></ListBox.ItemsPanel>
+      <ListBox.ItemTemplate><DataTemplate x:DataType="m:ListeningMode"><TextBlock Text="{Binding Name}" FontSize="13" FontWeight="Medium"/></DataTemplate></ListBox.ItemTemplate>
+    </ListBox>
+  </Border>
+</UserControl>

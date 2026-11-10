@@ -50,8 +50,18 @@ jobs:
           dotnet test tests/Undertone.Tests/Undertone.Tests.csproj
           --configuration Release
           -p:RuntimeIdentifiers=win-x64 -p:PublishReadyToRun=false
-          --filter "FullyQualifiedName~ListeningToolsTests|FullyQualifiedName~LyricsFlowingBackdropTests|FullyQualifiedName~SettingsRailTests|FullyQualifiedName~SettingsStorageRefreshTests|FullyQualifiedName~AppIconTests|FullyQualifiedName~PinnedShortcutIconTests|FullyQualifiedName~SettingsResetTests|FullyQualifiedName~ContentPackTests|FullyQualifiedName~CustomThemePersistenceTests|FullyQualifiedName~FreshInstallDefaultsTests|FullyQualifiedName~MobileSettingsTests|FullyQualifiedName~ThemeRegistrationTests|FullyQualifiedName~SettingsViewModelPersistenceTests|FullyQualifiedName~DiscoverTests|FullyQualifiedName~TorrentSearchTests|FullyQualifiedName~TorrentDownloadTests"
+          --filter "FullyQualifiedName~ListeningToolsTests|FullyQualifiedName~LyricsFlowingBackdropTests|FullyQualifiedName~SettingsRailTests|FullyQualifiedName~SettingsStorageRefreshTests|FullyQualifiedName~AppIconTests|FullyQualifiedName~PinnedShortcutIconTests|FullyQualifiedName~SettingsResetTests|FullyQualifiedName~ContentPackTests|FullyQualifiedName~CustomThemePersistenceTests|FullyQualifiedName~FreshInstallDefaultsTests|FullyQualifiedName~MobileSettingsTests|FullyQualifiedName~ThemeRegistrationTests|FullyQualifiedName~SettingsViewModelPersistenceTests|FullyQualifiedName~DiscoverTests|FullyQualifiedName~TorrentSearchTests|FullyQualifiedName~TorrentDownloadTests|FullyQualifiedName~ListeningModesTests|FullyQualifiedName~ExclusiveModePausedTests|FullyQualifiedName~PlayHistoryRetentionTests|FullyQualifiedName~PlayHistoryRemapTests"
           --logger "trx;LogFileName=windows-checks.trx"
+          --results-directory TestResults
+
+      - name: Verify grayscale artwork pixels
+        env:
+          UNDERTONE_TEST_SKIA: '1'
+        run: >-
+          dotnet test tests/Undertone.Tests/Undertone.Tests.csproj
+          --configuration Release --no-build --no-restore
+          --filter "FullyQualifiedName~FocusGrayscaleRendersArtworkWithoutFlatteningItsDetail"
+          --logger "trx;LogFileName=focus-grayscale-pixels.trx"
           --results-directory TestResults
 
       - name: Publish self-contained player

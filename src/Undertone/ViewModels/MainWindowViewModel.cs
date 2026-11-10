@@ -143,6 +143,7 @@ public partial class MainWindowViewModel : ViewModelBase
     public SidebarViewModel Sidebar { get; }
     public TopBarViewModel TopBar { get; }
     public PlayerViewModel Player { get; }
+    public ListeningModesViewModel Modes { get; }
     /// <summary>"Added to Queue" / "Playing Next" pill above the island (owner 10-08).</summary>
     public QueueToastViewModel QueueToast { get; } = new();
     /// <summary>"Continue from your phone" pill (Pick Up on Computer).</summary>
@@ -516,8 +517,10 @@ public partial class MainWindowViewModel : ViewModelBase
         });
         audioCd.StartWatching();
         _homeVm = new HomeViewModel(Player, library, Sidebar, artistImageService, playHistory, Settings);
+        Modes = new ListeningModesViewModel(Settings, Player, persistence.DataDirectory);
+        Modes.SettingsRequested += (_, _) => { Settings.SelectedSettingsTab = SettingsViewModel.TabAppearance; OpenSettings(); };
         _discoverVm = new DiscoverViewModel(Player, library, playHistory,
-            new DiscoverService(new HttpClient { Timeout = TimeSpan.FromSeconds(20) }, AppPaths.DataRoot));
+            new DiscoverService(new HttpClient { Timeout = TimeSpan.FromSeconds(20) }, AppPaths.DataRoot), Modes);
         _songsVm = new LibrarySongsViewModel(library, Player, Sidebar, persistence, Settings);
         _albumsVm = new LibraryAlbumsViewModel(library, Player, Sidebar, Settings);
         // Keep the top-bar dropdown labels in sync with the Albums grid filters/sort.
@@ -911,6 +914,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
         // Apply saved volume
         Player.Volume = Settings.GetSettings().Volume;
+        await Modes.InitializeAsync();
         // ...and persist every later change (slider, wheel, keys, MPRIS, remote) through the
         // debounced settings save. Written only on a graceful exit, a crash or kill brought
         // back the previous session's volume — possibly louder than the user left it.
@@ -1200,6 +1204,7 @@ public partial class MainWindowViewModel : ViewModelBase
         // is guarded so one failing save can't skip the later ones (the queue snapshot
         // below used to be silently lost this way).
         Settings.SetVolume(Player.Volume);
+        try { await Modes.FlushAsync(); } catch (Exception ex) { Debug.WriteLine($"[Modes] Save failed: {ex.Message}"); }
         try { await Settings.SaveAsync(); }
         catch (Exception ex) { Debug.WriteLine($"[MainWindowVM] Settings save failed: {ex.Message}"); }
 
