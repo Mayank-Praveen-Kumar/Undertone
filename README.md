@@ -57,4 +57,12 @@ To package a self-contained Windows publish folder, install [Inno Setup](https:/
 
 The installer is written to `installer-output/`. Optional `-CompilerPath` and `-OutputDirectory` arguments let you use a local compiler or another output folder. `/NOLAUNCH` suppresses the app launch during unattended installation.
 
+### Automated Windows builds
+
+The [Windows installer workflow](https://github.com/Mayank-Praveen-Kumar/Undertone/actions/workflows/windows-installer.yml) builds from source on a clean GitHub-hosted Windows machine. It runs the listening-tools and Settings checks, publishes the self-contained player, and packages the installer using a checksum-verified Inno Setup compiler.
+
+Relevant changes pushed to `main` start a build. To build manually, open **Actions → Windows installer → Run workflow**. After a successful run, download **Undertone-windows-x64-unsigned** under **Artifacts**. It contains the setup executable, SHA-256 checksum, and a manifest linking it to the source commit and build run. Artifacts are retained for 14 days; public releases remain on the Releases page.
+
+These builds are currently unsigned. SignPath signing can be connected after the project is approved and its signing credentials and policies are configured.
+
 qBittorrent's local API must be configured for the download panel. Credentials are stored encrypted for the current Windows account and are never included in releases.

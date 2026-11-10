@@ -1,0 +1,124 @@
+name: Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/windows-installer.yml'
+      - 'src/**'
+      - 'tests/**'
+      - 'plugins/**'
+      - 'samples/**'
+      - 'tools/**'
+      - 'scripts/**'
+      - 'installer.iss'
+      - 'LICENSE'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-installer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and verify Windows installer
+    runs-on: windows-2025
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Check listening tools and Settings
+        run: >-
+          dotnet test tests/Undertone.Tests/Undertone.Tests.csproj
+          --configuration Release
+          -p:RuntimeIdentifiers=win-x64 -p:PublishReadyToRun=false
+          --filter "FullyQualifiedName~ListeningToolsTests|FullyQualifiedName~LyricsFlowingBackdropTests|FullyQualifiedName~SettingsRailTests|FullyQualifiedName~SettingsStorageRefreshTests"
+          --logger "trx;LogFileName=windows-checks.trx"
+          --results-directory TestResults
+
+      - name: Publish self-contained player
+        run: >-
+          dotnet publish src/Undertone/Undertone.csproj
+          --configuration Release --runtime win-x64 --self-contained true
+          -p:RuntimeIdentifiers=win-x64 -p:PublishReadyToRun=false
+          --output publish/win-x64
+
+      - name: Set up verified installer compiler
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $download = Join-Path $env:RUNNER_TEMP 'innosetup-7.1.1-x64.exe'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_1/innosetup-7.1.1-x64.exe' -OutFile $download
+          $expectedHash = '8A5A6711C3766A6E5FB74F280BA0E3551E719CE94538D901FDBD1F8F9920B3F0'
+          if ((Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash -ne $expectedHash) {
+            throw 'Installer compiler checksum mismatch.'
+          }
+          $compilerDirectory = Join-Path $env:RUNNER_TEMP 'undertone-inno-setup'
+          $arguments = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /NOICONS /DIR="{0}"' -f $compilerDirectory
+          $setup = Start-Process -FilePath $download -ArgumentList $arguments -WindowStyle Hidden -Wait -PassThru
+          if ($setup.ExitCode -ne 0) { throw "Compiler setup failed: $($setup.ExitCode)" }
+          "UNDERTONE_ISCC=$(Join-Path $compilerDirectory 'ISCC.exe')" >> $env:GITHUB_ENV
+
+      - name: Build installer
+        run: ./scripts/build-windows-installer.ps1 -PublishDirectory ./publish/win-x64 -CompilerPath $env:UNDERTONE_ISCC -OutputDirectory ./installer-output
+
+      - name: Record checksum and source revision
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installers = @(Get-ChildItem installer-output -Filter '*-Setup.exe' -File)
+          if ($installers.Count -ne 1) { throw 'Expected exactly one setup executable.' }
+          $installer = $installers[0]
+          $hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $($installer.Name)" | Set-Content -LiteralPath ($installer.FullName + '.sha256') -Encoding ascii
+          $manifest = [ordered]@{
+            product = 'Undertone'
+            source_commit = $env:GITHUB_SHA
+            repository = $env:GITHUB_REPOSITORY
+            build_url = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            sdk_version = (dotnet --version)
+            runtime = 'win-x64'
+            installer = $installer.Name
+            sha256 = $hash
+            signing_status = 'unsigned; SignPath approval and integration pending'
+          }
+          $manifest | ConvertTo-Json | Set-Content installer-output/build-info.json -Encoding utf8
+          "Built **$($installer.Name)** from commit **$env:GITHUB_SHA**. Download the installer from this run's **Artifacts** section. This build is unsigned." >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload installer for review and future signing
+        id: installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Undertone-windows-x64-unsigned
+          path: |
+            installer-output/*-Setup.exe
+            installer-output/*.sha256
+            installer-output/build-info.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload check results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Windows-check-results
+          path: TestResults/*.trx
+          if-no-files-found: ignore
+          retention-days: 7
