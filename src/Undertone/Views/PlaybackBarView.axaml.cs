@@ -1887,6 +1887,9 @@ public partial class PlaybackBarView : UserControl
         _lyricsClickTimer.Tick += (_, _) =>
         {
             CancelPendingLyricsClick();
+            // The full lyrics page already owns focus; only the existing
+            // double-click toggle applies there, never another lyrics layer.
+            if (mainVm.IsLyricsViewActive) return;
             if (_lyricsBubble != null)
             {
                 _lyricsBubble.Close();

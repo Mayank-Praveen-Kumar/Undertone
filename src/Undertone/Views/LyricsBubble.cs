@@ -25,8 +25,8 @@ internal sealed class LyricsBubble
     private readonly Polygon _tail;
     private readonly Button _anchorButton;
     private readonly LyricsViewModel _lyrics;
-    private readonly TextBlock _currentLine = new() { FontSize = 20, FontWeight = FontWeight.SemiBold, Foreground = Brushes.White, MaxLines = 1, TextTrimming = TextTrimming.CharacterEllipsis, TextAlignment = TextAlignment.Center };
-    private readonly TextBlock _nextLine = new() { FontSize = 16, Foreground = new SolidColorBrush(Color.Parse("#A6FFFFFF")), MaxLines = 1, TextTrimming = TextTrimming.CharacterEllipsis, TextAlignment = TextAlignment.Center };
+    private readonly TextBlock _currentLine = new() { FontSize = 20, FontWeight = FontWeight.SemiBold, Foreground = Brushes.White, TextWrapping = TextWrapping.Wrap, TextTrimming = TextTrimming.None, TextAlignment = TextAlignment.Center };
+    private readonly TextBlock _nextLine = new() { FontSize = 16, Foreground = new SolidColorBrush(Color.Parse("#A6FFFFFF")), TextWrapping = TextWrapping.Wrap, TextTrimming = TextTrimming.None, TextAlignment = TextAlignment.Center };
     private readonly Action _closed;
     private bool _isClosed;
 
@@ -43,7 +43,7 @@ internal sealed class LyricsBubble
         text.Children.Add(_nextLine);
         var open = new Button
         {
-            Content = text, Padding = new Thickness(28, 18),
+            Content = new ScrollViewer { Content = text, HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled, VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto }, Padding = new Thickness(28, 18),
             Background = Brushes.Transparent, BorderThickness = new Thickness(0),
             CornerRadius = new CornerRadius(52),
             HorizontalContentAlignment = HorizontalAlignment.Stretch,
@@ -105,11 +105,13 @@ internal sealed class LyricsBubble
         {
             _currentLine.Text = _lyrics.IsSearching ? "Finding lyrics…" : "No lyrics available";
             _nextLine.Text = "Click to open full lyrics";
+            Position();
             return;
         }
         var index = Math.Clamp(_lyrics.ActiveLineIndex, 0, lines.Count - 1);
         _currentLine.Text = lines[index].IsIntroPlaceholder ? "♪" : lines[index].Text.Replace('\n', ' ').Replace('\r', ' ');
         _nextLine.Text = lines.Skip(index + 1).FirstOrDefault(line => !line.IsIntroPlaceholder && !string.IsNullOrWhiteSpace(line.Text))?.Text.Replace('\n', ' ').Replace('\r', ' ') ?? "";
+        Position();
     }
 
     private void OnSizeChanged(object? sender, SizeChangedEventArgs e) => Position();
@@ -118,7 +120,13 @@ internal sealed class LyricsBubble
     {
         if (_anchor.TranslatePoint(default, _root) is not { } point) { Close(); return; }
         var width = Math.Min(440, Math.Max(220, _root.Bounds.Width - 32));
-        var height = 104.0;
+        // Fit both complete lyric lines. Very long text can scroll rather than
+        // being clipped when the bubble reaches the available window height.
+        var textWidth = Math.Max(1, width - 58);
+        _currentLine.Measure(new Size(textWidth, double.PositiveInfinity));
+        _nextLine.Measure(new Size(textWidth, double.PositiveInfinity));
+        var height = Math.Clamp(_currentLine.DesiredSize.Height + _nextLine.DesiredSize.Height + 45,
+            104, Math.Max(104, point.Y - 40));
         var center = point.X + _anchor.Bounds.Width / 2;
         var left = Math.Clamp(center - width / 2, 16, Math.Max(16, _root.Bounds.Width - width - 16));
         var top = Math.Max(16, point.Y - height - 12);
