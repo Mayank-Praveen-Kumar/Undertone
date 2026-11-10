@@ -5,6 +5,7 @@ using Avalonia.Headless.XUnit;
 using Avalonia.Media;
 using Avalonia.Media.Imaging;
 using Avalonia.Threading;
+using Avalonia.VisualTree;
 using SkiaSharp;
 using Undertone.Models;
 using Undertone.Services;
@@ -122,7 +123,9 @@ public class ListeningModesTests
             window.Show(); Dispatcher.UIThread.RunJobs();
             Assert.Same(modes, view.DataContext);
             Assert.Equal(new[] { "Everyday", "Focus", "Energy", "Wind down", "Custom" }, modes.Profiles.Select(p => p.Name));
-            await Select(modes, "focus");
+            var list = view.GetVisualDescendants().OfType<ListBox>().Single();
+            Assert.Same(modes.SelectedMode, list.SelectedItem);
+            list.SelectedItem = modes.Profiles.Single(p => p.Id == "focus"); await modes.PendingSwitch;
             Assert.Same(modes, view.DataContext); Assert.Equal("focus", modes.ActiveId);
             await Select(modes, "everyday"); Assert.False(FocusGrayscale.Enabled);
         }

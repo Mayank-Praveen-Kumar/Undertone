@@ -6,6 +6,10 @@
     <Style Selector="ListBox.mode-switcher ListBoxItem"><Setter Property="CornerRadius" Value="18"/><Setter Property="Padding" Value="16,8"/><Setter Property="Margin" Value="2,0"/><Setter Property="MinHeight" Value="34"/><Setter Property="Background" Value="Transparent"/></Style>
     <Style Selector="ListBox.mode-switcher ListBoxItem:selected"><Setter Property="Background" Value="{DynamicResource AccentColorBrush}"/><Setter Property="Foreground" Value="White"/></Style>
     <Style Selector="ListBox.mode-switcher ListBoxItem:pointerover"><Setter Property="Background" Value="{DynamicResource SidebarHoverBrush}"/></Style>
+    <Style Selector="ListBox.mode-switcher ListBoxItem /template/ ContentPresenter"><Setter Property="CornerRadius" Value="18"/></Style>
+    <Style Selector="ListBox.mode-switcher ListBoxItem:selected /template/ ContentPresenter, ListBox.mode-switcher ListBoxItem:selected:pointerover /template/ ContentPresenter, ListBox.mode-switcher ListBoxItem:selected:focus /template/ ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource AccentColorBrush}"/><Setter Property="Foreground" Value="White"/>
+    </Style>
   </UserControl.Styles>
   <Border CornerRadius="22" Padding="5" Margin="18,9,18,3" Background="{DynamicResource AppSidebarBackground}" HorizontalAlignment="Center">
     <ListBox Classes="mode-switcher" ItemsSource="{Binding Profiles}" SelectedItem="{Binding SelectedMode}" IsEnabled="{Binding !IsBusy}"
