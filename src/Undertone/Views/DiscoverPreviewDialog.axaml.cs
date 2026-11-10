@@ -19,6 +19,10 @@ public partial class DiscoverPreviewDialog : Window
     public DiscoverPreviewDialog()
     {
         InitializeComponent();
+        PropertyChanged += (_, e) =>
+        {
+            if (e.Property == WindowStateProperty && WindowState == Avalonia.Controls.WindowState.Minimized) Close();
+        };
         Opened += (_, _) => _previewOwner = Owner;
         Closed += (_, _) =>
         {
