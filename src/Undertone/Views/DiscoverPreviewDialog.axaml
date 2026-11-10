@@ -1,0 +1,24 @@
+<Window xmlns="https://github.com/avaloniaui" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Undertone.Views.DiscoverPreviewDialog" Width="760" Height="600" MinWidth="560" MinHeight="480"
+        WindowStartupLocation="CenterOwner" Title="Undertone · Preview" Background="{DynamicResource AppMainBackground}">
+  <Grid RowDefinitions="Auto,*,Auto,Auto" Margin="22" RowSpacing="14">
+    <StackPanel Spacing="4"><TextBlock x:Name="SongTitle" FontSize="22" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+      <TextBlock x:Name="ArtistTitle" Opacity="0.7" TextTrimming="CharacterEllipsis"/>
+    </StackPanel>
+    <Grid Grid.Row="1" x:Name="PlayerHost" MinHeight="240">
+      <TextBlock x:Name="PreviewPlaceholder" Text="Finding a YouTube preview…" VerticalAlignment="Center" HorizontalAlignment="Center" Opacity="0.6"/>
+    </Grid>
+    <StackPanel Grid.Row="2" Spacing="9">
+      <TextBlock x:Name="PreviewStatus" Text="YouTube · 30-second excerpt" TextWrapping="Wrap" Opacity="0.7"/>
+      <Button x:Name="EnableSearchButton" Content="Enable YouTube search" Click="EnableSearch" CornerRadius="16" Padding="14,8" IsVisible="False" HorizontalAlignment="Left"/>
+      <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+        <TextBox x:Name="YouTubeLink" Watermark="Or paste a YouTube / YouTube Music link" CornerRadius="16"/>
+        <Button Grid.Column="1" Content="Use link" Click="UseLink" CornerRadius="16" Padding="16,8"/>
+      </Grid>
+    </StackPanel>
+    <Grid Grid.Row="3" ColumnDefinitions="*,Auto" ColumnSpacing="14">
+      <TextBlock Text="Search results may include alternate versions. Your music resumes when this preview closes." TextWrapping="Wrap" FontSize="12" Opacity="0.55" VerticalAlignment="Center"/>
+      <Button Grid.Column="1" Content="Close preview" Click="ClosePreview" CornerRadius="18" Padding="18,10"/>
+    </Grid>
+  </Grid>
+</Window>

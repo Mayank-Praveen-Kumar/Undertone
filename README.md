@@ -10,6 +10,11 @@ The original MIT copyright and license are preserved in [LICENSE](LICENSE).
 
 ## Added capabilities
 
+- **Discover**: Song Radio uses the current song, For You starts from favourites and frequently played artists, and Rediscover surfaces older library favourites. Last.fm supplies candidates; local ranking uses favourites, ratings, recent plays, skips, variety and your Familiar–Adventurous setting. Less like this hides a song and reduces similar-artist suggestions; Reset feedback clears those choices.
+- Discover starts only when enabled on its page. Listening history stays local; seed song/artist lookups go to Last.fm, and album lookup uses MusicBrainz. Up to 100 seed results are cached, reused for seven days, and available as a fallback offline. Rediscover works from the library without network lookups.
+- Preview opens one visible YouTube player for a 30-second excerpt, pauses the local player and resumes it when finished or closed. An existing pause or a later track change is respected. YouTube playback depends on the video being embeddable and available in your region; the excerpt is not guaranteed to be the chorus. WebView2 Runtime is required on Windows; the browser engine is not bundled or started with the app. You can enable the on-demand YouTube search helper or paste a YouTube/YouTube Music link.
+- **Find album** on a suggestion checks MusicBrainz and fills the existing album/torrent-search dialog. Review the artist, album edition and results before submitting a download to qBittorrent. Finding a recommendation does not automatically download it.
+
 - **Settings → Diagnostics**: library health, disk/cache controls and low-power mode. **Settings → Player**: named listening sessions. Undo history is also in **Settings → Diagnostics**.
 - Low-power mode reduces flowing-artwork/visualizer refresh, uses one library scan worker, and defers background BPM/key analysis. Appearance preferences are preserved.
 - Named sessions retain the current song, position, upcoming queue, shuffle and repeat modes. Missing songs are skipped on resume.
@@ -30,7 +35,7 @@ The original MIT copyright and license are preserved in [LICENSE](LICENSE).
 
 ## Versions and downloads
 
-For a normal Windows installation, download **Undertone-v1.6.8-Setup.exe** from the [latest release](https://github.com/Mayank-Praveen-Kumar/Undertone/releases/latest). It installs for your Windows account, adds a Start menu shortcut and an optional desktop shortcut, and supports uninstalling through Windows Settings. Your library and preferences remain in `%APPDATA%\Undertone` when you uninstall. Earlier portable ZIPs remain available in the release history.
+For a normal Windows installation, download **Undertone-v1.7.0-Setup.exe** from the [latest release](https://github.com/Mayank-Praveen-Kumar/Undertone/releases/latest). It installs for your Windows account, adds a Start menu shortcut and an optional desktop shortcut, and supports uninstalling through Windows Settings. Your library and preferences remain in `%APPDATA%\Undertone` when you uninstall. Earlier portable ZIPs remain available in the release history.
 
 The latest edition is named **Undertone**. Earlier editions retain their historical **mit-sound** names.
 

@@ -52,6 +52,7 @@ public partial class App : Application
             [typeof(LibraryArtistsViewModel)] = () => new LibraryArtistsView(),
             [typeof(CoverFlowViewModel)] = () => new CoverFlowView(),
             [typeof(HomeViewModel)] = () => new HomeView(),
+            [typeof(DiscoverViewModel)] = () => new DiscoverView(),
             [typeof(FavoritesViewModel)] = () => new FavoritesView(),
             [typeof(LibraryPlaylistsViewModel)] = () => new LibraryPlaylistsView(),
             [typeof(StatisticsViewModel)] = () => new StatisticsView(),

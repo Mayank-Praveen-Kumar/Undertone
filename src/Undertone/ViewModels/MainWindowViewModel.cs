@@ -82,6 +82,7 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         var current = IsSettingsModalOpen ? null : CurrentView;
         _homeVm.IsActive = ReferenceEquals(current, _homeVm);
+        _discoverVm?.SetActive(ReferenceEquals(current, _discoverVm));
         _coverFlowVm.IsActive = ReferenceEquals(current, _coverFlowVm);
         _songsVm.IsActive = ReferenceEquals(current, _songsVm);
         _albumsVm.IsActive = ReferenceEquals(current, _albumsVm);
@@ -295,6 +296,7 @@ public partial class MainWindowViewModel : ViewModelBase
     // ── Cached content ViewModels (created once, reused) ──
 
     private readonly HomeViewModel _homeVm;
+    private readonly DiscoverViewModel _discoverVm;
     private readonly LibrarySongsViewModel _songsVm;
     private readonly LibraryAlbumsViewModel _albumsVm;
     private readonly LibraryArtistsViewModel _artistsVm;
@@ -514,6 +516,8 @@ public partial class MainWindowViewModel : ViewModelBase
         });
         audioCd.StartWatching();
         _homeVm = new HomeViewModel(Player, library, Sidebar, artistImageService, playHistory, Settings);
+        _discoverVm = new DiscoverViewModel(Player, library, playHistory,
+            new DiscoverService(new HttpClient { Timeout = TimeSpan.FromSeconds(20) }, AppPaths.DataRoot));
         _songsVm = new LibrarySongsViewModel(library, Player, Sidebar, persistence, Settings);
         _albumsVm = new LibraryAlbumsViewModel(library, Player, Sidebar, Settings);
         // Keep the top-bar dropdown labels in sync with the Albums grid filters/sort.
@@ -2356,6 +2360,7 @@ public partial class MainWindowViewModel : ViewModelBase
             CurrentView = key switch
             {
                 "home" => RefreshAndReturn(_homeVm),
+                "discover" => _discoverVm,
                 "songs" => RefreshAndReturnSongs(_songsVm),
                 "albums" => ResetFilterAndReturnAlbums(),
                 "artists" => ResetAndReturnArtists(),
@@ -2402,6 +2407,7 @@ public partial class MainWindowViewModel : ViewModelBase
         TopBar.CurrentTabName = key switch
         {
             "home" => "Home",
+            "discover" => "Discover",
             "songs" => "Songs",
             "albums" => "Albums",
             "artists" => "Artists",
@@ -2993,6 +2999,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private ViewModelBase ResolveSectionView(string key) => key switch
     {
         "home"      => RefreshAndReturn(_homeVm),
+        "discover"  => _discoverVm,
         "songs"     => RefreshAndReturnSongs(_songsVm),
         "albums"    => ResetFilterAndReturnAlbums(),
         "artists"   => ResetAndReturnArtists(),
@@ -3039,6 +3046,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private string GetCurrentViewKey()
     {
         if (CurrentView == _homeVm) return "home";
+        if (CurrentView == _discoverVm) return "discover";
         if (CurrentView == _songsVm) return "songs";
         if (CurrentView == _albumsVm || CurrentView == _coverFlowVm) return "albums";
         if (CurrentView == _artistsVm) return "artists";

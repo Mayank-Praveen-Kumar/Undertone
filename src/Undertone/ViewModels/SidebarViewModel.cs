@@ -50,6 +50,7 @@ public partial class SidebarViewModel : ViewModelBase
     public ObservableCollection<NavItem> NavItems { get; } = new()
     {
         new NavItem { Key = "home", Label = Loc.T("Nav.Home"), IconGlyph = "HomeIcon" },
+        new NavItem { Key = "discover", Label = "Discover", IconGlyph = "SearchIcon" },
         new NavItem { Key = "songs", Label = Loc.T("Nav.Songs"), IconGlyph = "SongsIcon" },
         new NavItem { Key = "albums", Label = Loc.T("Nav.Albums"), IconGlyph = "AlbumsIcon" },
         new NavItem { Key = "artists", Label = Loc.T("Nav.Artists"), IconGlyph = "ArtistsIcon" },
@@ -72,7 +73,7 @@ public partial class SidebarViewModel : ViewModelBase
         "home" => "Nav.Home", "songs" => "Nav.Songs", "albums" => "Nav.Albums", "artists" => "Nav.Artists",
         "folders" => "Nav.Folders", "playlists" => "Nav.Playlists", "visualizer" => "Nav.Visualizer", "lyricsstudio" => "Nav.LyricsStudio",
         "settings" => "Nav.Settings", "favorites" => "Nav.Favorites", "server" => "Nav.Server", "cd" => "Nav.AudioCd",
-        "inbox" => "Nav.Inbox",
+        "inbox" => "Nav.Inbox", "discover" => "Nav.Discover",
         _ => navKey,
     };
 

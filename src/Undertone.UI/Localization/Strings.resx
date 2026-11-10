@@ -3151,4 +3151,5 @@ The lines and their timings are dropped and an empty lyrics box opens for your o
   <data name="Playlist.ShowSideRail" xml:space="preserve"><value>Show Featured Artists &amp; Suggestions</value><comment>Playlist page options menu: shows the right-hand panel again</comment></data>
   <data name="Settings.Tab.Diagnostics" xml:space="preserve"><value>Diagnostics</value></data>
   <data name="Settings.Desc.Diagnostics" xml:space="preserve"><value>Library health, disk usage, cache maintenance and power controls.</value></data>
+  <data name="Nav.Discover" xml:space="preserve"><value>Discover</value></data>
 </root>

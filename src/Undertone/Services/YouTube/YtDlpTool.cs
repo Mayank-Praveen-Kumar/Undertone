@@ -85,6 +85,39 @@ public sealed class YtDlpTool
 
     public bool IsAvailable => Resolve() != null;
 
+    /// <summary>Finds a public video id; playback stays in YouTube's visible embedded player.</summary>
+    public async Task<string?> FindPreviewVideoAsync(string artist, string title, CancellationToken ct)
+    {
+        var exe = Resolve() ?? throw new InvalidOperationException("YouTube search needs yt-dlp. Install it using Settings, or paste a YouTube link below.");
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(TimeSpan.FromSeconds(25));
+        var result = await Runner(exe, new[] { "--ignore-config", "--flat-playlist", "--skip-download", "--dump-single-json", "--no-warnings", "--socket-timeout", "10", "--", $"ytsearch3:{artist} {title} official audio" }, null, timeout.Token).ConfigureAwait(false);
+        if (result.ExitCode != 0) throw new InvalidOperationException("YouTube search is unavailable. Paste a YouTube link to preview instead.");
+        using var doc = JsonDocument.Parse(result.Stdout);
+        if (!doc.RootElement.TryGetProperty("entries", out var entries)) return null;
+        foreach (var entry in entries.EnumerateArray())
+            if (entry.TryGetProperty("id", out var id) && IsVideoId(id.GetString())) return id.GetString();
+        return null;
+    }
+
+    internal static bool IsVideoId(string? value) => value is { Length: 11 }
+        && value.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_');
+
+    internal static string? PreviewVideoId(string text)
+    {
+        if (!Uri.TryCreate(text.Trim(), UriKind.Absolute, out var uri) || uri.Scheme != "https") return null;
+        string? id = null;
+        if (uri.Host is "youtu.be" or "www.youtu.be") id = uri.AbsolutePath.Trim('/');
+        else if (uri.Host is "youtube.com" or "www.youtube.com" or "m.youtube.com" or "music.youtube.com")
+        {
+            if (uri.AbsolutePath == "/watch")
+                id = uri.Query.TrimStart('?').Split('&').Select(p => p.Split('=', 2))
+                    .Where(p => p.Length == 2 && p[0] == "v").Select(p => Uri.UnescapeDataString(p[1])).FirstOrDefault();
+            else if (uri.AbsolutePath.StartsWith("/shorts/") || uri.AbsolutePath.StartsWith("/embed/")) id = uri.AbsolutePath.Split('/').Last();
+        }
+        return IsVideoId(id) ? id : null;
+    }
+
     /// <summary>True when <paramref name="path"/> is the copy Undertone installed (the only one it may replace).</summary>
     public bool IsAppInstalled(string? path)
     {
