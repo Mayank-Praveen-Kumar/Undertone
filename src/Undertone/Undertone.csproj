@@ -13,7 +13,7 @@
     <RuntimeIdentifiers>win-x64;osx-x64;osx-arm64;linux-x64;linux-arm64</RuntimeIdentifiers>
     <ApplicationIcon Condition="$([MSBuild]::IsOSPlatform('Windows')) And Exists('Assets\Icons\Undertone.ico')">Assets\Icons\Undertone.ico</ApplicationIcon>
     <AssemblyName>Undertone</AssemblyName>
-    <AppHostDotNetSearch>AppRelative;EnvironmentVariable;Global</AppHostDotNetSearch>
+    <AppHostDotNetSearch>AppLocal;AppRelative;EnvironmentVariable;Global</AppHostDotNetSearch>
     <AppHostRelativeDotNet>.runtime</AppHostRelativeDotNet>
     <RootNamespace>Undertone</RootNamespace>
     <Product>Undertone</Product>

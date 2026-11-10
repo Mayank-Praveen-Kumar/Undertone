@@ -2,7 +2,9 @@
 
 All recoverable local editions are preserved in [GitHub Releases](https://github.com/Mayank-Praveen-Kumar/Undertone/releases/tag/saved-versions-2026-11-09).
 
-`undertone-current-windows-x64.zip` contains the complete current player and shared dependencies.
+The latest player is available separately as `Undertone-windows-x64.zip` in the latest release and launches as `Undertone.exe`.
+
+`undertone-current-windows-x64.zip` is the shared base for the historical collection. Its filename is retained so the historical restoration scripts remain compatible.
 
 Each `*-version-files.zip` preserves the files that differ for that edition, its complete file inventory, and a restoration script. These archives are lossless relative to the shared base; local settings, credentials, logs and music libraries are excluded.
 
