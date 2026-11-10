@@ -231,7 +231,7 @@ public partial class PlaybackBarView : UserControl
     private void OnPlaybackBarDetachedFromVisualTree(object? sender, VisualTreeAttachmentEventArgs e)
     {
         CancelPendingLyricsClick();
-        _isolatedLyricsWindow?.Close();
+        _lyricsBubble?.Close();
         // Safety: ensure seek drag state is fully cleared on detach
         if (_isSeekDragging)
         {
@@ -1856,7 +1856,7 @@ public partial class PlaybackBarView : UserControl
     }
 
     private DispatcherTimer? _lyricsClickTimer;
-    private Window? _isolatedLyricsWindow;
+    private LyricsBubble? _lyricsBubble;
 
     private void CancelPendingLyricsClick()
     {
@@ -1874,7 +1874,7 @@ public partial class PlaybackBarView : UserControl
         if (_lyricsClickTimer != null)
         {
             CancelPendingLyricsClick();
-            _isolatedLyricsWindow?.Close();
+            _lyricsBubble?.Close();
             mainVm.ToggleLyricsCommand.Execute(null);
             return;
         }
@@ -1887,31 +1887,15 @@ public partial class PlaybackBarView : UserControl
         _lyricsClickTimer.Tick += (_, _) =>
         {
             CancelPendingLyricsClick();
-            if (_isolatedLyricsWindow != null)
+            if (_lyricsBubble != null)
             {
-                _isolatedLyricsWindow.Activate();
+                _lyricsBubble.Close();
                 return;
             }
-            var lyrics = new LyricsPanelView { DataContext = mainVm.Lyrics };
-            var window = new IsolatedLyricsWindow
-            {
-                Title = "Undertone — Lyrics",
-                Width = 380, Height = 500, MinWidth = 280, MinHeight = 280,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
-                RequestedThemeVariant = mainWindow.ActualThemeVariant,
-                Content = lyrics
-            };
-            lyrics.SetCloseAction(window.Close, "Close compact lyrics");
-            _isolatedLyricsWindow = window;
-            window.Closed += (_, _) =>
-            {
-                lyrics.SetShown(false);
-                lyrics.DataContext = null;
-                window.Content = null;
-                _isolatedLyricsWindow = null;
-            };
-            window.Show(mainWindow);
-            lyrics.SetShown(true);
+            if (sender is Control anchor)
+                _lyricsBubble = new LyricsBubble(mainWindow, anchor, mainVm.Lyrics,
+                    () => OnLyricsButtonClick(sender, new RoutedEventArgs()),
+                    () => { _lyricsBubble = null; CancelPendingLyricsClick(); });
         };
         _lyricsClickTimer.Start();
     }

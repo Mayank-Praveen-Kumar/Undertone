@@ -1644,7 +1644,7 @@
                          "Show icons in Accent Color when corresponding panels are opened"). -->
                     <Button Classes="secondary-btn"
                             Click="OnLyricsButtonClick"
-                            ToolTip.Tip="Click for compact lyrics · Double-click for the lyrics page"
+                            ToolTip.Tip="Click for lyrics bubble · Double-click for the lyrics page"
                             Width="34" Height="34">
                         <Panel Width="34" Height="34">
                             <Border Width="28" Height="28"

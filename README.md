@@ -10,7 +10,7 @@ The original MIT copyright and license are preserved in [LICENSE](LICENSE).
 
 ## Added capabilities
 
-- Single-click the player island's Lyrics button for a compact, separate lyrics window; double-click to use the full lyrics page.
+- Single-click the player island's Lyrics button for a lyrics bubble attached to the button, with a softly blurred backdrop; double-click to use the full lyrics page.
 - Cyberpunk styling and a playback-aware taskbar title.
 - Automatic random library queue refills without restarting the current song.
 - Lyrics lookup during song import, with sidecar files saved alongside the audio.
