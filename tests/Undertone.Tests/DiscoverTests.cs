@@ -98,6 +98,22 @@ public class DiscoverTests : IDisposable
     [InlineData("file:///C:/anything", null)]
     public void PreviewAcceptsOnlyYouTubeVideoIds(string url, string? expected) => Assert.Equal(expected, YtDlpTool.PreviewVideoId(url));
 
+    [Fact]
+    public async Task PreviewSearchFetchesVideoIdsWithoutDownloadingAudio()
+    {
+        Directory.CreateDirectory(_root);
+        var exe = Path.Combine(_root, "yt-dlp.exe"); File.WriteAllText(exe, "test fixture");
+        using var http = new HttpClient();
+        var tool = new YtDlpTool(http, _root, () => exe);
+        tool.Runner = (_, args, _, ct) =>
+        {
+            Assert.Contains("--skip-download", args); Assert.Contains("--flat-playlist", args);
+            Assert.StartsWith("ytsearch3:", args.Last());
+            return Task.FromResult((0, """{"entries":[{"id":"M7lc1UVf-VE"}]}""", ""));
+        };
+        Assert.Equal("M7lc1UVf-VE", await tool.FindPreviewVideoAsync("Artist", "Song", default));
+    }
+
     [AvaloniaFact]
     public void ClosingPreviewResumesOwnedPause_ButPreservesAnExistingPause()
     {

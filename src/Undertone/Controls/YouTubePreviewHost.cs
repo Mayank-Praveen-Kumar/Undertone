@@ -71,11 +71,20 @@ public sealed class YouTubePreviewHost : NativeControlHost
             {
                 if (!e.Source.StartsWith("https://undertone.local/", StringComparison.Ordinal)) return;
                 var message = e.TryGetWebMessageAsString();
-                if (message == "ended") Finished?.Invoke();
-                else if (message == "playing") StatusChanged?.Invoke("Playing a 30-second excerpt · YouTube");
-                else if (message == "error") { StatusChanged?.Invoke("This video cannot play here. Try another YouTube link."); Failed?.Invoke(); }
+                // WebView2 forbids destroying a controller reentrantly inside its COM callback.
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (_closed) return;
+                    if (message == "ended") Finished?.Invoke();
+                    else if (message == "playing") StatusChanged?.Invoke("Playing a 30-second excerpt · YouTube");
+                    else if (message == "error") { StatusChanged?.Invoke("This video cannot play here. Try another YouTube link."); Failed?.Invoke(); }
+                });
             };
-            web.ProcessFailed += (_, _) => { StatusChanged?.Invoke("The preview player stopped. Close and retry the preview."); Finished?.Invoke(); };
+            web.ProcessFailed += (_, _) => Dispatcher.UIThread.Post(() =>
+            {
+                if (_closed) return;
+                StatusChanged?.Invoke("The preview player stopped. Close and retry the preview."); Finished?.Invoke();
+            });
             ResizeController();
             web.Navigate("https://undertone.local/preview.html?id=" + Uri.EscapeDataString(VideoId));
             StatusChanged?.Invoke("Press Play in the YouTube player if playback does not start.");
