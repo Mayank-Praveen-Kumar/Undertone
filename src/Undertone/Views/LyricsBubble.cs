@@ -3,10 +3,13 @@ using Avalonia;
 using Avalonia.Layout;
 using Avalonia.Automation;
 using Avalonia.Controls;
+using Avalonia.Controls.Presenters;
+using Avalonia.Controls.Templates;
 using Avalonia.Controls.Shapes;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Media;
+using Avalonia.Styling;
 using Undertone.ViewModels;
 
 namespace Undertone.Views;
@@ -43,6 +46,22 @@ internal sealed class LyricsBubble
         text.Children.Add(_nextLine);
         var open = new Button
         {
+            // Keep button input/accessibility, with no button chrome or
+            // pointer-over/pressed fill inside the pill's existing surface.
+            Theme = new ControlTheme(typeof(Button))
+            {
+                Setters =
+                {
+                    new Setter(Button.TemplateProperty, new FuncControlTemplate<Button>((button, _) =>
+                        new ContentPresenter
+                        {
+                            Content = button.Content,
+                            Padding = button.Padding,
+                            HorizontalContentAlignment = HorizontalAlignment.Stretch,
+                            VerticalContentAlignment = VerticalAlignment.Center
+                        }))
+                }
+            },
             Content = new ScrollViewer { Content = text, HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled, VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto }, Padding = new Thickness(28, 18),
             Background = Brushes.Transparent, BorderThickness = new Thickness(0),
             CornerRadius = new CornerRadius(52),
