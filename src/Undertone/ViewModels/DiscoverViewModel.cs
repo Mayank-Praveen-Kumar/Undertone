@@ -152,12 +152,17 @@ public partial class DiscoverViewModel : ViewModelBase
         try
         {
             Songs.Clear();
+            var history = ModeHistory;
+            // Legacy play counters are useful for cold starts, but must not import plays
+            // from another listening mode once mode-tagged history exists.
+            var useLegacyCounters = _listeningModeId == "everyday" && history.Count == 0
+                && !_history.Events.Any(e => e.ListeningModeId != "everyday");
             if (Mode == 2)
             {
                 Subtitle = "Old favourites, ready for another listen.";
-                var lastInMode = ModeHistory.Where(e => !e.Skipped).GroupBy(e => e.TrackId).ToDictionary(g => g.Key, g => g.Max(e => e.PlayedAtUtc));
+                var lastInMode = history.Where(e => !e.Skipped).GroupBy(e => e.TrackId).ToDictionary(g => g.Key, g => g.Max(e => e.PlayedAtUtc));
                 var tracks = _library.Tracks.Where(t => !t.IsDisliked && !t.IsSnoozed
-                    && (_listeningModeId == "everyday" ? t.PlayCount > 0 && (t.LastPlayed is null || t.LastPlayed < DateTime.UtcNow.AddDays(-14))
+                    && (useLegacyCounters ? t.PlayCount > 0 && (t.LastPlayed is null || t.LastPlayed < DateTime.UtcNow.AddDays(-14))
                         : lastInMode.TryGetValue(t.Id, out var last) && last < DateTime.UtcNow.AddDays(-14)))
                     .Where(t => !_preferences.HiddenSongs.Contains(DiscoverSong.KeyFor(t.Artist, t.Title)))
                     .OrderByDescending(t => (t.IsFavorite ? 5 : 0) + t.Rating + Math.Log(1 + t.PlayCount))
@@ -169,11 +174,12 @@ public partial class DiscoverViewModel : ViewModelBase
                 return;
             }
             var current = Player.CurrentTrack;
-            var modeCounts = ModeHistory.Where(e => !e.Skipped).GroupBy(e => e.TrackId).ToDictionary(g => g.Key, g => g.Count());
+            var modeCounts = history.Where(e => !e.Skipped).GroupBy(e => e.TrackId).ToDictionary(g => g.Key, g => g.Count());
             var seeds = Mode == 0 ? (current is null ? Array.Empty<Track>() : new[] { current })
-                : _library.Tracks.Where(t => !t.IsDisliked && !t.IsSnoozed && (_listeningModeId == "everyday" ? t.IsFavorite || t.PlayCount > 0 : modeCounts.ContainsKey(t.Id)))
-                    .OrderByDescending(t => _listeningModeId == "everyday" ? (t.IsFavorite ? 4 : 0) + t.Rating + Math.Log(1 + t.PlayCount)
-                        + (t.LastPlayed > DateTime.UtcNow.AddDays(-7) ? 2 : 0) : Math.Log(1 + modeCounts.GetValueOrDefault(t.Id)))
+                : _library.Tracks.Where(t => !t.IsDisliked && !t.IsSnoozed && (modeCounts.ContainsKey(t.Id)
+                    || _listeningModeId == "everyday" && (t.IsFavorite || useLegacyCounters && t.PlayCount > 0)))
+                    .OrderByDescending(t => Math.Log(1 + (useLegacyCounters ? t.PlayCount : modeCounts.GetValueOrDefault(t.Id)))
+                        + (_listeningModeId == "everyday" ? (t.IsFavorite ? 4 : 0) + t.Rating : 0))
                     .DistinctBy(t => t.Artist, StringComparer.OrdinalIgnoreCase).Take(3).ToArray();
             if (seeds.Length == 0 && current is not null) seeds = new[] { current };
             if (seeds.Length == 0) { Status = "Play a song or favourite a few tracks to get started."; return; }
