@@ -129,7 +129,7 @@ public class AppSettings : IJsonOnDeserializing
     public bool AccentTrackLinks { get; set; } = true;
 
     /// <summary>Settings › Appearance › App Icon: id of the window/taskbar/tray icon
-    /// ("classic", "blush", "sky", ...). Unknown ids fall back to classic.</summary>
+    /// ("violet", "classic", "blush", ...). Unknown ids fall back to violet.</summary>
     public string AppIcon { get; set; } = DefaultAppIcon;
 
     /// <summary>Phone: "System" (follow Android's dark/light), "Dark" (the dark theme in

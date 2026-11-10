@@ -37,6 +37,8 @@ public partial class App : Application
     public override void Initialize()
     {
         AvaloniaXamlLoader.Load(this);
+        // Use the shipped default before the saved profile finishes loading.
+        SetThemeCore(Models.AppSettings.DefaultTheme);
         // Interface Size (GitHub #145): every window gets its scale host from here on.
         Undertone.Helpers.UiScale.Install();
 

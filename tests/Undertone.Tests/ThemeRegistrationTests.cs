@@ -25,6 +25,8 @@ public class ThemeRegistrationTests
         {
             var app = new Undertone.App();
             app.Initialize();
+            Assert.EndsWith("/Assets/Themes/Midnight.axaml", ThemeOverlayOf(app)!.Source!.ToString());
+            Assert.Equal(Color.Parse("#0D0A17"), Resolve(app, "AppMainBackground"));
             s_app = app;
         }
         return s_app;
