@@ -30,6 +30,8 @@ The original MIT copyright and license are preserved in [LICENSE](LICENSE).
 
 ## Versions and downloads
 
+For a normal Windows installation, download **Undertone-v1.6.7-Setup.exe** from the [latest release](https://github.com/Mayank-Praveen-Kumar/Undertone/releases/latest). It installs for your Windows account, adds a Start menu shortcut and an optional desktop shortcut, and supports uninstalling through Windows Settings. Your library and preferences remain in `%APPDATA%\Undertone` when you uninstall. The ZIP is also available for portable use.
+
 The latest edition is named **Undertone**. Earlier editions retain their historical **mit-sound** names.
 
 The current Undertone edition is built from the source in this repository. Preserved earlier compiled editions are rebranded individually and distributed as historical downloads, with the common branding and settings cleanup applied. Those historical binaries are not represented as exact source snapshots; their original individual source snapshots were not recorded.
@@ -46,5 +48,13 @@ dotnet build src/Undertone/Undertone.csproj -c Release -r win-x64 -p:RuntimeIden
 ```
 
 The application, executable, assemblies and internal namespaces use **Undertone**.
+
+To package a self-contained Windows publish folder, install [Inno Setup](https://jrsoftware.org/isdl.php) 6.5 or newer, then run:
+
+```powershell
+./scripts/build-windows-installer.ps1 -PublishDirectory ./publish/win-x64
+```
+
+The installer is written to `installer-output/`. Optional `-CompilerPath` and `-OutputDirectory` arguments let you use a local compiler or another output folder. `/NOLAUNCH` suppresses the app launch during unattended installation.
 
 qBittorrent's local API must be configured for the download panel. Credentials are stored encrypted for the current Windows account and are never included in releases.

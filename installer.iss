@@ -1,10 +1,15 @@
 ; Undertone — Inno Setup Installer Script
 ; Builds a setup.exe from the publish\win-x64\ output.
-; Compile with: ISCC.exe installer.iss
+; Compile with scripts\build-windows-installer.ps1 (also accepts an existing publish folder).
 
 #define MyAppName "Undertone"
-#define MyAppVersion "1.6.7"
-#define MyAppPublisher "heartached"
+#ifndef MyAppVersion
+  #define MyAppVersion "1.6.7"
+#endif
+#ifndef PublishDir
+  #define PublishDir "publish\win-x64"
+#endif
+#define MyAppPublisher "Mayank Praveen Kumar"
 #define MyAppExeName "Undertone.exe"
 #define MyAppURL "https://github.com/Mayank-Praveen-Kumar/Undertone"
 
@@ -16,6 +21,7 @@ AppVerName={#MyAppName}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
+AppUpdatesURL={#MyAppURL}/releases/latest
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
@@ -23,9 +29,11 @@ OutputDir=installer-output
 OutputBaseFilename=Undertone-v{#MyAppVersion}-Setup
 SetupIconFile=src\Undertone\Assets\Icons\Undertone.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
-Compression=lzma2/ultra64
+; Moderate compression keeps installer creation and extraction reasonable on laptops.
+Compression=lzma2/normal
 SolidCompression=yes
 WizardStyle=modern
+MinVersion=10.0.19041
 PrivilegesRequired=lowest
 ; Inno 6.5+ turns on Windows RedirectionGuard for Setup, and on current Windows builds the app
 ; Setup launches (finish page or the in-app updater's relaunch) inherits it. That session's
@@ -102,7 +110,9 @@ Root: HKA; Subkey: "Software\Classes\.m4b\OpenWithProgids"; ValueType: none; Val
 ; A wildcard cannot drift from what CI actually produces.
 ; *.pdb is excluded: it ships full source paths and internal symbol names to end users,
 ; and nothing in the app consumes it.
-Source: "publish\win-x64\*"; DestDir: "{app}"; Excludes: "*.pdb"; Flags: ignoreversion recursesubdirs createallsubdirs
+; This is an x64 player; NuGet also publishes unused x86/ARM VLC copies.
+Source: "{#PublishDir}\*"; DestDir: "{app}"; Excludes: "*.pdb,*.log,plugins.dat,plugins.dat.undertone,\libvlc\win-arm64\*,\libvlc\win-x86\*"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
 [UninstallDelete]
 ; libvlc's plugins cache, written by the app on first start (Services/VlcPluginCache.cs).
@@ -115,9 +125,21 @@ Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent; Check: LaunchAfterSetup
 
 [Code]
+// Used by unattended deployment and install/uninstall verification. Normal installs
+// keep the finish-page launch checkbox; the in-app updater still relaunches below.
+function LaunchAfterSetup(): Boolean;
+var
+  I: Integer;
+begin
+  Result := True;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), '/NOLAUNCH') = 0 then
+      Result := False;
+end;
+
 // On silent installs (the in-app updater path), Inno skips every [Run] entry
 // flagged `postinstall skipifsilent`, so the app would never relaunch after
 // "Install & Restart". Launch the new exe ourselves at ssDone in that case.
@@ -125,7 +147,7 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
 begin
-  if (CurStep = ssDone) and WizardSilent() then
+  if (CurStep = ssDone) and WizardSilent() and LaunchAfterSetup() then
     Exec(ExpandConstant('{app}\{#MyAppExeName}'), '', '',
          SW_SHOW, ewNoWait, ResultCode);
 end;
