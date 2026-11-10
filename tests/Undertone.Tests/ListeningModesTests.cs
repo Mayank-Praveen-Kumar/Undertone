@@ -51,9 +51,12 @@ public class ListeningModesTests
             Assert.False(FocusGrayscale.Enabled); Assert.False(settings.ExclusiveAudioEnabled);
             Assert.True(settings.LyricsFlowingLightEnabled); Assert.Equal(FlowingStyles.Kawarp, settings.LyricsFlowingStyle);
             Assert.Equal("listening-energy", settings.ActiveCustomThemeId);
+            Assert.Equal("Dark", settings.CustomThemes.Single(t => t.Id == "listening-energy").BaseMode);
+            Assert.Equal("#D83B16", settings.ActiveAccentHex);
             await Select(modes, "wind-down");
             Assert.False(settings.LyricsFlowingLightEnabled);
             Assert.Equal(75, player.Volume); Assert.Equal("listening-nature", settings.ActiveCustomThemeId);
+            Assert.Equal("#17272F", settings.CustomThemes.Single(t => t.Id == "listening-nature").MainHex);
             player.Volume = 61;
             await Select(modes, "everyday");
             Assert.Equal(42, player.Volume); Assert.True(settings.IsMidnightTheme); Assert.False(settings.ExclusiveAudioEnabled);

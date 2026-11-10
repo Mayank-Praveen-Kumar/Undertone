@@ -26,8 +26,8 @@ public partial class ListeningModesViewModel : ViewModelBase
     public string Description => ActiveId switch
     {
         "focus" => "Grayscale, including artwork · exclusive audio on by default",
-        "energy" => "Bright high contrast · Kawarp lyric background on by default",
-        "wind-down" => "Soft nature colours · volume starts at 75%",
+        "energy" => "Electric blue and hot orange · Kawarp lyric background on by default",
+        "wind-down" => "Dusk blue, sage and warm earth tones · volume starts at 75%",
         "everyday" => "Your normal appearance and playback settings",
         _ => "Your own appearance, audio and lyric background settings"
     };
@@ -51,6 +51,20 @@ public partial class ListeningModesViewModel : ViewModelBase
         foreach (var profile in state.Profiles.Where(p => p.IsCustom && !Profiles.Any(x => x.Id == p.Id))) Profiles.Add(profile);
         SelectedMode = Profiles.FirstOrDefault(p => p.Id == state.ActiveId) ?? Profiles[0];
         CaptureSelected();
+        var reapplyPalette = false;
+        foreach (var profile in Profiles)
+        {
+            var changed = profile.Theme switch
+            {
+                "Custom:listening-energy" => _settings.EnsureModeTheme("listening-energy", "Energy", "#111526", "#1B2440", "#D83B16"),
+                "Custom:listening-nature" => _settings.EnsureModeTheme("listening-nature", "Wind down", "#17272F", "#22382F", "#91633F"),
+                _ => false
+            };
+            if (changed && profile.Theme == "Custom:listening-energy" && profile.AccentHex == "#B92300") profile.AccentHex = "#D83B16";
+            if (changed && profile.Theme == "Custom:listening-nature" && profile.AccentHex == "#79543B") profile.AccentHex = "#91633F";
+            reapplyPalette |= changed && ReferenceEquals(profile, SelectedMode);
+        }
+        if (reapplyPalette) await _settings.ApplyListeningModeAsync(SelectedMode);
         ListeningModeContext.CurrentId = ActiveId;
         FocusGrayscale.SetEnabled(SelectedMode.Grayscale);
         _ready = true;
@@ -92,14 +106,14 @@ public partial class ListeningModesViewModel : ViewModelBase
                 if (next.Id == "focus") { next.Grayscale = true; next.Exclusive = true; next.Theme = "Gray"; next.AccentHex = "#707070"; next.AccentName = "Custom"; }
                 if (next.Id == "energy")
                 {
-                    _settings.EnsureModeTheme("listening-energy", "Energy", "#FFF8DB", "#FFE17A", "#B92300");
-                    next.Theme = "Custom:listening-energy"; next.AccentHex = "#B92300"; next.AccentName = "Custom";
+                    _settings.EnsureModeTheme("listening-energy", "Energy", "#111526", "#1B2440", "#D83B16");
+                    next.Theme = "Custom:listening-energy"; next.AccentHex = "#D83B16"; next.AccentName = "Custom";
                     next.Exclusive = false; next.FlowingLyrics = true; next.FlowingStyle = FlowingStyles.Kawarp;
                 }
                 if (next.Id == "wind-down")
                 {
-                    _settings.EnsureModeTheme("listening-nature", "Wind down", "#EBF3F6", "#DFE9CF", "#79543B");
-                    next.Theme = "Custom:listening-nature"; next.AccentHex = "#79543B"; next.AccentName = "Custom";
+                    _settings.EnsureModeTheme("listening-nature", "Wind down", "#17272F", "#22382F", "#91633F");
+                    next.Theme = "Custom:listening-nature"; next.AccentHex = "#91633F"; next.AccentName = "Custom";
                     next.Volume = 75; next.Exclusive = false;
                 }
             }

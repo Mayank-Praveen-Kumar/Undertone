@@ -11,15 +11,26 @@ public partial class SettingsViewModel
         Icon = AppIcon, Volume = volume, Exclusive = ExclusiveAudioEnabled,
         FlowingLyrics = LyricsFlowingLightEnabled, FlowingStyle = LyricsFlowingStyle
     };
-    internal void EnsureModeTheme(string id, string name, string main, string sidebar, string accent)
+    internal bool EnsureModeTheme(string id, string name, string main, string sidebar, string accent, string baseMode = "Dark")
     {
+        var changed = false;
         var definition = _settings.CustomThemes.FirstOrDefault(t => t.Id == id);
         if (definition is null)
         {
-            definition = new CustomThemeDefinition { Id = id, Name = name, BaseMode = "Light", MainBackgroundHex = main, SidebarBackgroundHex = sidebar, AccentHex = accent };
+            definition = new CustomThemeDefinition { Id = id, Name = name, BaseMode = baseMode, MainBackgroundHex = main, SidebarBackgroundHex = sidebar, AccentHex = accent };
             _settings.CustomThemes.Add(definition);
+            changed = true;
         }
-        if (!CustomThemes.Any(t => t.Id == id)) CustomThemes.Add(MapDefToTile(definition));
+        else if (definition.BaseMode == "Light" &&
+            (id == "listening-energy" && definition.MainBackgroundHex == "#FFF8DB" && definition.SidebarBackgroundHex == "#FFE17A" && definition.AccentHex == "#B92300"
+            || id == "listening-nature" && definition.MainBackgroundHex == "#EBF3F6" && definition.SidebarBackgroundHex == "#DFE9CF" && definition.AccentHex == "#79543B"))
+        {
+            definition.BaseMode = baseMode; definition.MainBackgroundHex = main; definition.SidebarBackgroundHex = sidebar; definition.AccentHex = accent; changed = true;
+        }
+        var tile = CustomThemes.FirstOrDefault(t => t.Id == id);
+        if (tile is null) CustomThemes.Add(MapDefToTile(definition));
+        else if (changed) { tile.BaseMode = definition.BaseMode; tile.MainHex = definition.MainBackgroundHex; tile.SidebarHex = definition.SidebarBackgroundHex; tile.AccentHex = definition.AccentHex; }
+        return changed;
     }
     internal async Task ApplyListeningModeAsync(ListeningMode mode)
     {
