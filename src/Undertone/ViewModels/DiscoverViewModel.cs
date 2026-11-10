@@ -153,6 +153,7 @@ public partial class DiscoverViewModel : ViewModelBase
         {
             Songs.Clear();
             var history = ModeHistory;
+            var modeCounts = history.Where(e => !e.Skipped).GroupBy(e => e.TrackId).ToDictionary(g => g.Key, g => g.Count());
             // Legacy play counters are useful for cold starts, but must not import plays
             // from another listening mode once mode-tagged history exists.
             var useLegacyCounters = _listeningModeId == "everyday" && history.Count == 0
@@ -165,7 +166,7 @@ public partial class DiscoverViewModel : ViewModelBase
                     && (useLegacyCounters ? t.PlayCount > 0 && (t.LastPlayed is null || t.LastPlayed < DateTime.UtcNow.AddDays(-14))
                         : lastInMode.TryGetValue(t.Id, out var last) && last < DateTime.UtcNow.AddDays(-14)))
                     .Where(t => !_preferences.HiddenSongs.Contains(DiscoverSong.KeyFor(t.Artist, t.Title)))
-                    .OrderByDescending(t => (t.IsFavorite ? 5 : 0) + t.Rating + Math.Log(1 + t.PlayCount))
+                    .OrderByDescending(t => (t.IsFavorite ? 5 : 0) + t.Rating + Math.Log(1 + (useLegacyCounters ? t.PlayCount : modeCounts.GetValueOrDefault(t.Id))))
                     .ThenBy(t => t.LastPlayed).Take(24);
                 foreach (var track in tracks)
                     Songs.Add(new(new(track.Title, track.Artist), "From your library · not played in the last two weeks", track) { Album = track.Album });
@@ -174,7 +175,6 @@ public partial class DiscoverViewModel : ViewModelBase
                 return;
             }
             var current = Player.CurrentTrack;
-            var modeCounts = history.Where(e => !e.Skipped).GroupBy(e => e.TrackId).ToDictionary(g => g.Key, g => g.Count());
             var seeds = Mode == 0 ? (current is null ? Array.Empty<Track>() : new[] { current })
                 : _library.Tracks.Where(t => !t.IsDisliked && !t.IsSnoozed && (modeCounts.ContainsKey(t.Id)
                     || _listeningModeId == "everyday" && (t.IsFavorite || useLegacyCounters && t.PlayCount > 0)))

@@ -18,7 +18,7 @@ public class ListeningModesTests
 {
     private sealed class History : IPlayHistoryService
     {
-        public IReadOnlyList<PlayHistoryEvent> Events => Array.Empty<PlayHistoryEvent>();
+        public IReadOnlyList<PlayHistoryEvent> Events { get; set; } = Array.Empty<PlayHistoryEvent>();
         public Task PreloadAsync() => Task.CompletedTask;
         public void RecordPlay(Track t) { }
         public void RecordSkip(Track t) { }
@@ -107,6 +107,38 @@ public class ListeningModesTests
             Assert.Equal(new[] { "focus", "energy" }, history.Events.Select(e => e.ListeningModeId));
         }
         finally { ListeningModeContext.CurrentId = "everyday"; if (Directory.Exists(root)) Directory.Delete(root, true); }
+    }
+    private sealed class RecommendationHandler : HttpMessageHandler
+    {
+        public List<string> Requests { get; } = new();
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            Requests.Add(request.RequestUri!.Query);
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            { Content = new StringContent("""{"similartracks":{"track":[]}}""") });
+        }
+    }
+    [AvaloniaFact]
+    public async Task EverydaySeedsAndRediscoveryIgnoreAnotherModesPlayCounters()
+    {
+        using var persistence = new TestPersistenceService();
+        var library = new FakeLibraryService();
+        var everyday = new Track { Id = Guid.NewGuid(), Title = "Everyday song", Artist = "Everyday artist", PlayCount = 1, LastPlayed = DateTime.UtcNow };
+        var energy = new Track { Id = Guid.NewGuid(), Title = "Energy song", Artist = "Energy artist", PlayCount = 1000, LastPlayed = DateTime.UtcNow.AddDays(-30) };
+        library.TrackList.AddRange(new[] { everyday, energy });
+        var history = new History { Events = new[]
+        {
+            new PlayHistoryEvent { TrackId = everyday.Id, Artist = everyday.Artist, PlayedAtUtc = DateTime.UtcNow.AddDays(-30), ListeningModeId = "everyday" },
+            new PlayHistoryEvent { TrackId = energy.Id, Artist = energy.Artist, PlayedAtUtc = DateTime.UtcNow.AddDays(-30), ListeningModeId = "energy" }
+        } };
+        var player = new PlayerViewModel(new FakeAudioPlayer(), library, persistence, new FakeAnimatedCoverService());
+        var handler = new RecommendationHandler(); using var http = new HttpClient(handler);
+        var discover = new DiscoverViewModel(player, library, history, new DiscoverService(http, persistence.DataDirectory, "test"));
+        discover.Mode = 1; discover.SetActive(true); await discover.StartCommand.ExecuteAsync(null);
+        Assert.Single(handler.Requests); Assert.Contains("Everyday", handler.Requests[0]); Assert.DoesNotContain("Energy", handler.Requests[0]);
+        discover.Mode = 2; await discover.RefreshCommand.ExecuteAsync(null);
+        Assert.Equal(everyday.Id, Assert.Single(discover.Songs).LocalTrack!.Id);
+        discover.SetActive(false);
     }
     [AvaloniaFact]
     public async Task TopSwitcherListsAllModes_AndSurvivesEnablingGrayscale()
