@@ -4010,11 +4010,16 @@ public partial class LyricsViewModel : ViewModelBase, IDisposable
     // word-timed track while sitting on Home with the panel closed) burned CPU and
     // battery indefinitely, because nothing stopped the timer on navigation away.
     private int _visibleLyricsSurfaces;
+    private int _animatedLyricsSurfaces;
 
     /// <summary>Called by LyricsView / LyricsPanelView on attach and detach.</summary>
-    public void SetLyricsSurfaceVisible(bool visible)
+    public void SetLyricsSurfaceVisible(bool visible, bool animateWords = true)
     {
         _visibleLyricsSurfaces = Math.Max(0, _visibleLyricsSurfaces + (visible ? 1 : -1));
+        // A two-line text pill needs line sync and lyric lookup, but no per-frame
+        // word sweep. Full lyrics surfaces keep their existing smooth animation.
+        if (animateWords)
+            _animatedLyricsSurfaces = Math.Max(0, _animatedLyricsSurfaces + (visible ? 1 : -1));
         if (_visibleLyricsSurfaces == 0)
             _lyricsSyncTimer.Stop();
         else if (_hasSyncedLyrics && _player.State == Models.PlaybackState.Playing)
@@ -4027,7 +4032,7 @@ public partial class LyricsViewModel : ViewModelBase, IDisposable
 
     private bool WantsWordClock =>
         _hasSyncedLyrics
-        && IsAnyLyricsSurfaceVisible
+        && _animatedLyricsSurfaces > 0
         && _player.State == Models.PlaybackState.Playing
         && _lyricsSyncTimer.IsEnabled
         && AnyActiveLineHasWordLayer();

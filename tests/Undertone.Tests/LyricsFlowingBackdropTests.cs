@@ -143,6 +143,35 @@ public class LyricsFlowingBackdropTests
 
     private static int VisibleSurfaces(LyricsViewModel vm) => (int)PrivateField(vm, "_visibleLyricsSurfaces")!;
 
+    [AvaloniaFact]
+    public void LineOnlyPill_DoesNotKeepWordAnimationAlive_AfterFullPanelCloses()
+    {
+        var vm = MakeViewModel();
+        vm.SetLyricsSurfaceVisible(true, animateWords: false);
+        var panel = new LyricsPanelView { DataContext = vm };
+        var win = new Window { Width = 360, Height = 500, Content = panel };
+        try
+        {
+            win.Show();
+            Assert.Equal(2, VisibleSurfaces(vm));
+            Assert.Equal(1, (int)PrivateField(vm, "_animatedLyricsSurfaces")!);
+
+            panel.SetShown(false);
+            Assert.Equal(1, VisibleSurfaces(vm));
+            Assert.Equal(0, (int)PrivateField(vm, "_animatedLyricsSurfaces")!);
+
+            panel.SetShown(true);
+            Assert.Equal(1, (int)PrivateField(vm, "_animatedLyricsSurfaces")!);
+        }
+        finally
+        {
+            win.Close();
+            vm.SetLyricsSurfaceVisible(false, animateWords: false);
+        }
+        Assert.Equal(0, VisibleSurfaces(vm));
+        Assert.Equal(0, (int)PrivateField(vm, "_animatedLyricsSurfaces")!);
+    }
+
     /// <summary>
     /// Closing the side panel only hides its wrapper (IsVisible=false); the view stays
     /// attached, so DetachedFromVisualTree never fires. It used to stay counted as a

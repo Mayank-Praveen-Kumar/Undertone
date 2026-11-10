@@ -1,4 +1,7 @@
+using System.ComponentModel;
 using Avalonia;
+using Avalonia.Layout;
+using Avalonia.Automation;
 using Avalonia.Controls;
 using Avalonia.Controls.Shapes;
 using Avalonia.Input;
@@ -21,7 +24,9 @@ internal sealed class LyricsBubble
     private readonly Border _card;
     private readonly Polygon _tail;
     private readonly Button _anchorButton;
-    private readonly LyricsPanelView _lyrics;
+    private readonly LyricsViewModel _lyrics;
+    private readonly TextBlock _currentLine = new() { FontSize = 20, FontWeight = FontWeight.SemiBold, Foreground = Brushes.White, MaxLines = 1, TextTrimming = TextTrimming.CharacterEllipsis, TextAlignment = TextAlignment.Center };
+    private readonly TextBlock _nextLine = new() { FontSize = 16, Foreground = new SolidColorBrush(Color.Parse("#A6FFFFFF")), MaxLines = 1, TextTrimming = TextTrimming.CharacterEllipsis, TextAlignment = TextAlignment.Center };
     private readonly Action _closed;
     private bool _isClosed;
 
@@ -32,14 +37,33 @@ internal sealed class LyricsBubble
         _root = (Panel)owner.Content!;
         _app = owner.FindControl<Panel>("AppContentLayer")!;
         _closed = closed;
-        _lyrics = new LyricsPanelView { DataContext = vm };
-        _lyrics.SetCloseAction(Close, "Close lyrics bubble");
+        _lyrics = vm;
+        var text = new StackPanel { Spacing = 7, VerticalAlignment = VerticalAlignment.Center };
+        text.Children.Add(_currentLine);
+        text.Children.Add(_nextLine);
+        var open = new Button
+        {
+            Content = text, Padding = new Thickness(28, 18),
+            Background = Brushes.Transparent, BorderThickness = new Thickness(0),
+            CornerRadius = new CornerRadius(52),
+            HorizontalContentAlignment = HorizontalAlignment.Stretch,
+            VerticalContentAlignment = VerticalAlignment.Center,
+            Cursor = new Cursor(StandardCursorType.Hand),
+            [AutomationProperties.NameProperty] = "Open full lyrics",
+            [ToolTip.TipProperty] = "Open full lyrics"
+        };
+        open.Click += (_, _) =>
+        {
+            Close();
+            if (owner.DataContext is MainWindowViewModel main && !main.IsLyricsViewActive)
+                main.ToggleLyricsCommand.Execute(null);
+        };
         var fill = new SolidColorBrush(Color.Parse("#191723"));
         _card = new Border
         {
-            Background = fill, CornerRadius = new CornerRadius(22), ClipToBounds = true,
+            Background = fill, CornerRadius = new CornerRadius(52), ClipToBounds = true,
             BorderBrush = new SolidColorBrush(Color.Parse("#40FFFFFF")), BorderThickness = new Thickness(1),
-            Child = _lyrics
+            Child = open
         };
         _tail = new Polygon { Fill = fill, IsHitTestVisible = false };
         _anchorButton = new Button
@@ -61,7 +85,31 @@ internal sealed class LyricsBubble
         _root.SizeChanged += OnSizeChanged;
         owner.AddHandler(InputElement.KeyDownEvent, OnKeyDown, RoutingStrategies.Tunnel, handledEventsToo: true);
         Position();
-        _lyrics.SetShown(true);
+        _lyrics.PropertyChanged += OnLyricsChanged;
+        _lyrics.SetLyricsSurfaceVisible(true, animateWords: false);
+        UpdateLines();
+    }
+
+    private void OnLyricsChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(LyricsViewModel.ActiveLineIndex) or nameof(LyricsViewModel.ActiveLyricLines)
+            or nameof(LyricsViewModel.IsSearching) or nameof(LyricsViewModel.ShowSearchButton) or null)
+            UpdateLines();
+    }
+
+    private void UpdateLines()
+    {
+        var lines = _lyrics.ActiveLyricLines as IReadOnlyList<Undertone.Models.LyricLine>
+            ?? _lyrics.ActiveLyricLines.ToArray();
+        if (lines.Count == 0)
+        {
+            _currentLine.Text = _lyrics.IsSearching ? "Finding lyrics…" : "No lyrics available";
+            _nextLine.Text = "Click to open full lyrics";
+            return;
+        }
+        var index = Math.Clamp(_lyrics.ActiveLineIndex, 0, lines.Count - 1);
+        _currentLine.Text = lines[index].IsIntroPlaceholder ? "♪" : lines[index].Text.Replace('\n', ' ').Replace('\r', ' ');
+        _nextLine.Text = lines.Skip(index + 1).FirstOrDefault(line => !line.IsIntroPlaceholder && !string.IsNullOrWhiteSpace(line.Text))?.Text.Replace('\n', ' ').Replace('\r', ' ') ?? "";
     }
 
     private void OnSizeChanged(object? sender, SizeChangedEventArgs e) => Position();
@@ -69,8 +117,8 @@ internal sealed class LyricsBubble
     private void Position()
     {
         if (_anchor.TranslatePoint(default, _root) is not { } point) { Close(); return; }
-        var width = Math.Min(350, Math.Max(220, _root.Bounds.Width - 32));
-        var height = Math.Min(410, Math.Max(140, point.Y - 40));
+        var width = Math.Min(440, Math.Max(220, _root.Bounds.Width - 32));
+        var height = 104.0;
         var center = point.X + _anchor.Bounds.Width / 2;
         var left = Math.Clamp(center - width / 2, 16, Math.Max(16, _root.Bounds.Width - width - 16));
         var top = Math.Max(16, point.Y - height - 12);
@@ -90,8 +138,8 @@ internal sealed class LyricsBubble
     {
         if (_isClosed) return;
         _isClosed = true;
-        _lyrics.SetShown(false);
-        _lyrics.DataContext = null;
+        _lyrics.PropertyChanged -= OnLyricsChanged;
+        _lyrics.SetLyricsSurfaceVisible(false, animateWords: false);
         _root.SizeChanged -= OnSizeChanged;
         _owner.RemoveHandler(InputElement.KeyDownEvent, OnKeyDown);
         _root.Children.Remove(_layer);

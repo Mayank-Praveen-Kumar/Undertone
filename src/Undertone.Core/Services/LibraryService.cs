@@ -1162,7 +1162,7 @@ public class LibraryService : ILibraryService
                     candidates,
                     new ParallelOptions
                     {
-                        MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2),
+                        MaxDegreeOfParallelism = GetScanParallelism(),
                         CancellationToken = _shutdownCts.Token
                     },
                     track =>
@@ -2831,7 +2831,7 @@ public class LibraryService : ILibraryService
                 candidates,
                 new ParallelOptions
                 {
-                    MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2),
+                    MaxDegreeOfParallelism = GetScanParallelism(),
                     // Stop on shutdown instead of hammering the disk after the user quit.
                     CancellationToken = _shutdownCts.Token
                 },
@@ -2948,7 +2948,7 @@ public class LibraryService : ILibraryService
                 candidates,
                 new ParallelOptions
                 {
-                    MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2),
+                    MaxDegreeOfParallelism = GetScanParallelism(),
                     // Stop on shutdown instead of hammering the disk after the user quit.
                     CancellationToken = _shutdownCts.Token
                 },
@@ -2997,7 +2997,7 @@ public class LibraryService : ILibraryService
                 candidates,
                 new ParallelOptions
                 {
-                    MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2),
+                    MaxDegreeOfParallelism = GetScanParallelism(),
                     // Stop on shutdown instead of hammering the disk after the user quit.
                     CancellationToken = _shutdownCts.Token
                 },
@@ -3047,7 +3047,7 @@ public class LibraryService : ILibraryService
                 candidates,
                 new ParallelOptions
                 {
-                    MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2),
+                    MaxDegreeOfParallelism = GetScanParallelism(),
                     // Stop on shutdown instead of hammering the disk after the user quit.
                     CancellationToken = _shutdownCts.Token
                 },
@@ -3582,7 +3582,7 @@ public class LibraryService : ILibraryService
                             candidates,
                             new ParallelOptions
                             {
-                                MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2),
+                                MaxDegreeOfParallelism = GetScanParallelism(),
                                 CancellationToken = token
                             },
                             track =>
@@ -3684,7 +3684,7 @@ public class LibraryService : ILibraryService
                         candidates,
                         new ParallelOptions
                         {
-                            MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2),
+                            MaxDegreeOfParallelism = GetScanParallelism(),
                             CancellationToken = token
                         },
                         track =>
@@ -3795,14 +3795,15 @@ public class LibraryService : ILibraryService
     /// I/O-bound, so a single HDD or network share thrashes seeking once more than
     /// a handful of readers hit it at once — basing this on ProcessorCount (16-24
     /// on modern CPUs) hurts spinning/network volumes and barely helps SSDs.
-    /// Capped low by default; UNDERTONE_SCAN_THREADS overrides it for A/B testing.
+    /// Two readers by default to leave CPU and disk headroom for playback on laptops;
+    /// UNDERTONE_SCAN_THREADS still provides an explicit override.
     /// </summary>
     private static int GetScanParallelism()
     {
         var raw = Environment.GetEnvironmentVariable("UNDERTONE_SCAN_THREADS");
         if (int.TryParse(raw, out var n) && n >= 1)
             return Math.Min(n, 64);
-        return Math.Min(Environment.ProcessorCount, 8);
+        return Math.Min(Environment.ProcessorCount, 2);
     }
 
     /// <summary>

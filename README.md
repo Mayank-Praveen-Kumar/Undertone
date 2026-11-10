@@ -10,7 +10,9 @@ The original MIT copyright and license are preserved in [LICENSE](LICENSE).
 
 ## Added capabilities
 
-- Single-click the player island's Lyrics button for a lyrics bubble attached to the button, with a softly blurred backdrop; double-click to use the full lyrics page.
+- Lower-impact library scans use two workers by default; the two-line lyrics pill avoids the per-frame word-animation loop.
+
+- Single-click the player island's Lyrics button for a rounded, two-line lyrics pill attached to the button, with a softly blurred backdrop; click inside the pill or double-click the button to use the full lyrics page.
 - Cyberpunk styling and a playback-aware taskbar title.
 - Automatic random library queue refills without restarting the current song.
 - Lyrics lookup during song import, with sidecar files saved alongside the audio.
