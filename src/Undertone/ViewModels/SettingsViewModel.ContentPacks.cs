@@ -4,6 +4,7 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Undertone.Helpers;
 using Undertone.Localization;
+using Undertone.Models;
 using Undertone.Services.Plugins;
 
 namespace Undertone.ViewModels;
@@ -110,7 +111,7 @@ public partial class SettingsViewModel
             {
                 // The pack was switched off or removed: back to the default theme and accent.
                 ActivePackThemeKey = null;
-                SetActiveThemeFlags("Gray");
+                SetActiveThemeFlags(AppSettings.DefaultTheme);
                 ApplyAccent("#E74856", "Crimson");
                 ThemeChanged?.Invoke(this, ResolveActiveThemeKey());
                 if (_settingsLoaded) _ = SaveAsync();
@@ -178,8 +179,8 @@ public partial class SettingsViewModel
         else
         {
             ActivePackThemeKey = null;
-            SetActiveThemeFlags("Gray");
-            _settings.Theme = "Gray";
+            SetActiveThemeFlags(AppSettings.DefaultTheme);
+            _settings.Theme = AppSettings.DefaultTheme;
         }
         RefreshPackItems();
         return true;

@@ -63,6 +63,7 @@ public class SettingsResetTests : IDisposable
         await persistence.SaveSettingsAsync(new AppSettings
         {
             CommunityPluginsEnabled = false,
+            Theme = "Gray",
             AccentFollowsArtwork = true,
             AccentTrackLinks = false,
             AppIcon = "ruby",
@@ -105,6 +106,7 @@ public class SettingsResetTests : IDisposable
         Assert.True(vm.AccentFollowsArtwork);
         Assert.False(vm.AccentTrackLinks);
         Assert.Equal("ruby", vm.AppIcon);
+        Assert.True(vm.IsGrayTheme); // An explicitly saved choice survives the new default.
         Assert.False(vm.ShortcutService.IsDefault(ShortcutAction.PlayPause));
         Assert.True(vm.HasLyricsBackgroundOverride("track:1"));
         Assert.Equal("Surround", audio.UpmixMode);
@@ -119,11 +121,14 @@ public class SettingsResetTests : IDisposable
         Assert.False(vm.HasLyricsBackgroundOverride("track:1"));
         Assert.Equal("Off", audio.UpmixMode);
         Assert.False(vm.HeadphoneSurround);
-        Assert.Equal("classic", vm.AppIcon);
+        Assert.Equal("violet", vm.AppIcon);
+        Assert.True(vm.IsMidnightTheme);
 
         // Any toggle, or the unconditional save when the window closes.
         await vm.SaveAsync();
         var afterReset = await persistence.LoadSettingsAsync();
+        Assert.Equal("Midnight", afterReset.Theme);
+        Assert.Equal("violet", afterReset.AppIcon);
         // The defaults that went on for new installs (2026-10-18) come back on.
         Assert.True(afterReset.AlbumPageTintEnabled);
         Assert.True(afterReset.PlayPauseFadeEnabled);

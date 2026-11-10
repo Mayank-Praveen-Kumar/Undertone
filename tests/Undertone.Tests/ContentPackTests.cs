@@ -442,7 +442,7 @@ public class ContentPackThemeTests : IDisposable
     }
 
     [AvaloniaFact]
-    public void App_AppliesPackThemes_AndFallsBackToGray_WhenThePackIsGone()
+    public void App_AppliesPackThemes_AndFallsBackToCyberpunk_WhenThePackIsGone()
     {
         var host = SampleHost();
         var app = RealApp();
@@ -461,7 +461,7 @@ public class ContentPackThemeTests : IDisposable
             host.SetEnabled(host.Plugins.Single(), false);
             app.SetTheme(Undertone.App.PackThemePrefix + ContentPackKit.SampleId + "/paper");
             Assert.Equal(ThemeVariant.Dark, app.RequestedThemeVariant);
-            Assert.Equal(Color.Parse("#252525"), Resolve(app, "AppMainBackground")); // Gray
+            Assert.Equal(Color.Parse("#0D0A17"), Resolve(app, "AppMainBackground")); // Cyberpunk
         }
         finally
         {
@@ -501,8 +501,8 @@ public class ContentPackThemeTests : IDisposable
         vm.ApplyPackThemeCommand.Execute(key);
         host.Plugins.Single().IsEnabled = false; // switch the pack off
         Assert.Null(vm.ActivePackThemeKey);
-        Assert.True(vm.IsGrayTheme);
-        Assert.Equal("Gray", themes[^1]);
+        Assert.True(vm.IsMidnightTheme);
+        Assert.Equal("Midnight", themes[^1]);
         Assert.Empty(vm.PackThemes);
     }
 

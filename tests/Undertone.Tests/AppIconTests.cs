@@ -118,11 +118,12 @@ public class AppIconTests : IDisposable
     }
 
     [Fact]
-    public void Normalize_FallsBackToClassic()
+    public void Normalize_FallsBackToViolet()
     {
-        Assert.Equal("classic", AppIconService.Normalize(null));
-        Assert.Equal("classic", AppIconService.Normalize(""));
-        Assert.Equal("classic", AppIconService.Normalize("rainbow"));
+        Assert.Equal("violet", AppIconService.Normalize(null));
+        Assert.Equal("violet", AppIconService.Normalize(""));
+        Assert.Equal("violet", AppIconService.Normalize("rainbow"));
+        Assert.Equal("classic", AppIconService.Normalize("Classic"));
         Assert.Equal("ruby", AppIconService.Normalize(" Ruby "));
         Assert.Equal(10, AppIconService.Ids.Count);
         Assert.DoesNotContain("graphite", AppIconService.Ids);
@@ -131,7 +132,7 @@ public class AppIconTests : IDisposable
         Assert.Equal("light", AppIconService.Ids[1]); // Classic's inverse, between Classic and Dark
         Assert.Equal("dark", AppIconService.Ids[2]);
         Assert.Equal("light", AppIconService.Normalize("Light"));
-        Assert.Equal("classic", new AppSettings().AppIcon);
+        Assert.Equal("violet", new AppSettings().AppIcon);
     }
 
     [AvaloniaFact]
@@ -145,9 +146,13 @@ public class AppIconTests : IDisposable
             Assert.Equal(96, (png[16] << 24) | (png[17] << 16) | (png[18] << 8) | png[19]);
             Assert.NotNull(AppIconService.Load(id));
         }
-        // Classic copies: the window/tray fallback and the exe/installer icon.
-        AssertAllFrames("Undertone.UI Undertone.ico", ReadAsset("avares://Undertone.UI/Assets/Icons/Undertone.ico"));
-        AssertAllFrames("exe Undertone.ico", File.ReadAllBytes(Path.Combine(FindRepoRoot(), "src", "Undertone", "Assets", "Icons", "Undertone.ico")));
+        // Violet copies: the window/tray fallback and the exe/installer icon.
+        var fallback = ReadAsset("avares://Undertone.UI/Assets/Icons/Undertone.ico");
+        var executable = File.ReadAllBytes(Path.Combine(FindRepoRoot(), "src", "Undertone", "Assets", "Icons", "Undertone.ico"));
+        AssertAllFrames("Undertone.UI Undertone.ico", fallback);
+        AssertAllFrames("exe Undertone.ico", executable);
+        Assert.Equal(ReadAsset(AppIconService.IconUri("violet")), fallback);
+        Assert.Equal(fallback, executable);
     }
 
     [AvaloniaFact]
@@ -181,8 +186,8 @@ public class AppIconTests : IDisposable
             dialog.Close();
 
             AppIconService.Apply("bogus");
-            Assert.Equal("classic", AppIconService.CurrentId);
-            Assert.Same(AppIconService.Load("classic"), mini.Icon);
+            Assert.Equal("violet", AppIconService.CurrentId);
+            Assert.Same(AppIconService.Load("violet"), mini.Icon);
             Assert.Equal(2, changes);
         }
         finally
@@ -199,8 +204,9 @@ public class AppIconTests : IDisposable
         var persistence = new PersistenceService(_root);
         var vm = new SettingsViewModel(persistence, new FakeLibraryService(), new NoOpPlayHistory());
         await vm.LoadAsync();
-        Assert.Equal("classic", vm.AppIcon);
-        Assert.True(vm.AppIconOptions.Single(o => o.IsSelected).Id == "classic");
+        Assert.Equal("violet", vm.AppIcon);
+        Assert.True(vm.AppIconOptions.Single(o => o.IsSelected).Id == "violet");
+        Assert.True(vm.IsMidnightTheme); // Cyberpunk's persisted theme key.
 
         vm.SetAppIconCommand.Execute("sunset");
         Assert.Equal("sunset", vm.AppIcon);
@@ -215,26 +221,28 @@ public class AppIconTests : IDisposable
         Assert.Equal("sunset", reloaded.AppIcon);
         Assert.Equal("sunset", AppIconService.CurrentId); // applied at startup
 
-        // A hand-edited / future id lands on classic instead of a blank icon.
+        // Unknown icons and removed custom themes return to the shipped defaults.
         var s = await persistence.LoadSettingsAsync();
         s.AppIcon = "rainbow";
+        s.Theme = "Custom:missing";
         await persistence.SaveSettingsAsync(s);
         var odd = new SettingsViewModel(persistence, new FakeLibraryService(), new NoOpPlayHistory());
         await odd.LoadAsync();
-        Assert.Equal("classic", odd.AppIcon);
-        Assert.Equal("classic", AppIconService.CurrentId);
+        Assert.Equal("violet", odd.AppIcon);
+        Assert.Equal("violet", AppIconService.CurrentId);
+        Assert.True(odd.IsMidnightTheme);
     }
 
     /// <summary>
     /// Light (10-28) went in at index 1, between Classic and Dark. Settings store the id, so a
-    /// user who saved "dark" (index 1 before) or "ruby" keeps that icon; Light itself applies,
+    /// user who saved "classic", "dark" (index 1 before) or "ruby" keeps that icon; Light itself applies,
     /// persists and comes back on reload.
     /// </summary>
     [AvaloniaFact]
     public async Task Light_AppliesPersistsAndReloads_AndOlderSavedIdsKeepTheirIcon()
     {
         var persistence = new PersistenceService(_root);
-        foreach (var saved in new[] { "dark", "ruby" })
+        foreach (var saved in new[] { "classic", "dark", "ruby" })
         {
             var s = await persistence.LoadSettingsAsync();
             s.AppIcon = saved;

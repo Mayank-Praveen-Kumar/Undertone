@@ -7,6 +7,10 @@ namespace Undertone.Models;
 /// </summary>
 public class AppSettings : IJsonOnDeserializing
 {
+    // Cyberpunk keeps the historical "Midnight" key for saved-settings compatibility.
+    public const string DefaultTheme = "Midnight";
+    public const string DefaultAppIcon = "violet";
+
     /// <summary>Directories to scan for music files.</summary>
     public List<string> MusicFolders { get; set; } = new();
 
@@ -60,8 +64,8 @@ public class AppSettings : IJsonOnDeserializing
     /// <summary>Directory names to ignore while scanning (case-insensitive).</summary>
     public List<string> IgnoredFolderNames { get; set; } = new() { ".git", "node_modules", "$recycle.bin", "system volume information" };
 
-    /// <summary>Current theme: "Gray", "Dark", "MidnightBlack", "Light", or "System".</summary>
-    public string Theme { get; set; } = "Gray";
+    /// <summary>Current theme key; "Midnight" is displayed as Cyberpunk.</summary>
+    public string Theme { get; set; } = DefaultTheme;
 
     /// <summary>UI language: a culture name shipped in Localization/ ("es") or "" to follow the OS.</summary>
     public string Language { get; set; } = "";
@@ -126,7 +130,7 @@ public class AppSettings : IJsonOnDeserializing
 
     /// <summary>Settings › Appearance › App Icon: id of the window/taskbar/tray icon
     /// ("classic", "blush", "sky", ...). Unknown ids fall back to classic.</summary>
-    public string AppIcon { get; set; } = "classic";
+    public string AppIcon { get; set; } = DefaultAppIcon;
 
     /// <summary>Phone: "System" (follow Android's dark/light), "Dark" (the dark theme in
     /// <see cref="Theme"/>) or "Light".</summary>

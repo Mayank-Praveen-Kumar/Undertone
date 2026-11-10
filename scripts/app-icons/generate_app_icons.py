@@ -10,8 +10,8 @@ effects (they only muddy 16-32 px) and get a light unsharp mask.
 Outputs (paths relative to the repo root):
   src/Undertone/Assets/AppIcons/<id>.ico      multi-size icon (16..256, all DPI steps)
   src/Undertone/Assets/AppIcons/<id>.png      in-app preview (PREVIEW_SIZE px)
-  src/Undertone/Assets/Icons/Undertone.ico       classic icon (exe, installer)
-  src/Undertone.UI/Assets/Icons/Undertone.ico    classic icon (window/tray fallback)
+  src/Undertone/Assets/Icons/Undertone.ico       violet icon (exe, installer)
+  src/Undertone.UI/Assets/Icons/Undertone.ico    violet icon (window/tray fallback)
   artifacts/app-icons/<id>-1024.png        1024 px masters (not committed)
   artifacts/app-icons/icon-sheet.png       contact sheet of all eleven
 
@@ -385,7 +385,7 @@ def main(argv: list[str]) -> int:
         m = render(v, 1024)
         m.save(os.path.join(master_dir, v["id"] + "-1024.png"))
         masters.append((v, m))
-        if v["id"] == "classic":
+        if v["id"] == "violet":
             write_ico(os.path.join(ROOT, "src", "Undertone", "Assets", "Icons", "Undertone.ico"), frames)
             write_ico(os.path.join(ROOT, "src", "Undertone.UI", "Assets", "Icons", "Undertone.ico"), frames)
         print("rendered", v["id"])

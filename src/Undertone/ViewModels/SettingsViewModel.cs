@@ -638,14 +638,14 @@ public partial class SettingsViewModel : ViewModelBase
     }
 
     // ── Appearance ──
-    // Five theme buttons (Gray is the default) plus System (auto-pick Gray vs Light from OS).
+    // Cyberpunk (stored as Midnight) is the default; saved theme choices still win.
     // Exactly one of these is true at any time so the Settings UI can highlight the active card.
 
-    [ObservableProperty] private bool _isGrayTheme = true;
+    [ObservableProperty] private bool _isGrayTheme;
     [ObservableProperty] private bool _isDarkTheme;
     [ObservableProperty] private bool _isLightTheme;
     [ObservableProperty] private bool _isSystemTheme;
-    [ObservableProperty] private bool _isMidnightTheme;
+    [ObservableProperty] private bool _isMidnightTheme = true;
     [ObservableProperty] private bool _isInkTheme;
     [ObservableProperty] private bool _isSmokeTheme;
 
@@ -3242,10 +3242,10 @@ public partial class SettingsViewModel : ViewModelBase
                 foreach (var t in CustomThemes) t.IsActive = t.Id == id;
                 if (!CustomThemes.Any(t => t.Id == id))
                 {
-                    // Stale reference — fall back to Gray and persist.
+                    // Stale reference — fall back to the default and persist.
                     ActiveCustomThemeId = null;
-                    SetActiveThemeFlags("Gray");
-                    _settings.Theme = "Gray";
+                    SetActiveThemeFlags(AppSettings.DefaultTheme);
+                    _settings.Theme = AppSettings.DefaultTheme;
                 }
                 else
                 {
@@ -4537,7 +4537,7 @@ public partial class SettingsViewModel : ViewModelBase
         if (ActiveCustomThemeId == id)
         {
             ActiveCustomThemeId = null;
-            SetActiveThemeFlags("Gray");
+            SetActiveThemeFlags(AppSettings.DefaultTheme);
             ApplyAccent("#E74856", "Crimson");
             ThemeChanged?.Invoke(this, ResolveActiveThemeKey());
         }
@@ -4738,10 +4738,10 @@ public partial class SettingsViewModel : ViewModelBase
 
         if (themeKey == "__Custom") return; // custom-theme active: all built-in flags stay false
 
-        // Default-safety: if no flag matched, fall back to Gray.
+        // Default-safety: if no flag matched, fall back to Cyberpunk.
         if (!IsGrayTheme && !IsDarkTheme && !IsLightTheme && !IsSystemTheme && !IsMidnightTheme
             && !IsInkTheme && !IsSmokeTheme)
-            IsGrayTheme = true;
+            IsMidnightTheme = true;
     }
 
     private static CustomThemeTile MapDefToTile(CustomThemeDefinition def) => new()
@@ -4768,7 +4768,8 @@ public partial class SettingsViewModel : ViewModelBase
         if (IsInkTheme) return "Ink";
         if (IsSmokeTheme) return "Smoke";
         if (IsSystemTheme) return IsSystemDarkMode() ? "Gray" : "Light";
-        return "Gray";
+        if (IsGrayTheme) return "Gray";
+        return AppSettings.DefaultTheme;
     }
 
     private static bool IsSystemDarkMode()
@@ -7698,7 +7699,7 @@ public partial class SettingsViewModel : ViewModelBase
         {
             _settings = defaultSettings;
 
-            // Theme — reset to default (Gray).
+            // Theme — reset to the same default used by a fresh install.
             // SetActiveThemeFlags alone left ActiveCustomThemeId and the CustomThemes
             // collection intact, so ResolveActiveThemeKey() still returned "Custom:<id>"
             // and SyncToSettings wrote it straight back — the reset visibly undid itself.
@@ -7706,7 +7707,7 @@ public partial class SettingsViewModel : ViewModelBase
             CustomThemes.Clear();
             ActivePackThemeKey = null;
             foreach (var t in PackThemes) t.IsActive = false;
-            SetActiveThemeFlags("Gray");
+            SetActiveThemeFlags(defaultSettings.Theme);
 
             // Accent colour — reset to default (Crimson)
             ActiveAccentHex = defaultSettings.AccentColorHex;

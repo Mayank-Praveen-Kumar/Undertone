@@ -6,7 +6,7 @@ namespace Undertone.Tests;
 
 /// <summary>
 /// App Icon on a pinned taskbar button (11-03): only the pinned shortcut of THIS exe is
-/// repointed; classic resets it to the exe's own icon.
+/// repointed; violet resets it to the exe's own icon.
 /// </summary>
 public class PinnedShortcutIconTests
 {
@@ -21,9 +21,11 @@ public class PinnedShortcutIconTests
         Assert.Equal(expected, PinnedShortcutIcon.IsSameExe(target, exe));
 
     [Fact]
-    public void Classic_resets_to_exe_icon_others_point_at_copied_ico()
+    public void Violet_resets_to_exe_icon_others_point_at_copied_ico()
     {
         Assert.Equal("", PinnedShortcutIcon.DesiredIconPath(AppIconService.DefaultId));
+        Assert.Equal("", PinnedShortcutIcon.DesiredIconPath("violet"));
+        Assert.Equal("classic.ico", Path.GetFileName(PinnedShortcutIcon.DesiredIconPath("classic")));
         var dark = PinnedShortcutIcon.DesiredIconPath("dark");
         Assert.Equal("dark.ico", Path.GetFileName(dark));
         Assert.Equal("app-icons", Path.GetFileName(Path.GetDirectoryName(dark)));

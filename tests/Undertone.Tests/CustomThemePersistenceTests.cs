@@ -44,6 +44,7 @@ public class CustomThemePersistenceTests
     public void EmptySettings_HasNoCustomThemes()
     {
         var settings = new AppSettings();
+        Assert.Equal("Midnight", settings.Theme);
         Assert.NotNull(settings.CustomThemes);
         Assert.Empty(settings.CustomThemes);
     }
@@ -60,7 +61,7 @@ public class CustomThemePersistenceTests
         var restored = JsonSerializer.Deserialize<AppSettings>(json)!;
         Assert.Equal("Custom:nonexistent-id", restored.Theme);
         Assert.Empty(restored.CustomThemes);
-        // The fallback-to-Gray happens at load time in SettingsViewModel (Task 6);
+        // The fallback-to-Cyberpunk happens at load time in SettingsViewModel;
         // this test only confirms the JSON shape stays valid.
     }
 }

@@ -19,7 +19,7 @@ The original MIT copyright and license are preserved in [LICENSE](LICENSE).
 - Lower-impact library scans use two workers by default; the two-line lyrics pill avoids the per-frame word-animation loop.
 
 - Single-click the player island's Lyrics button for a rounded, two-line lyrics pill attached to the button, with a softly blurred backdrop; click inside the pill or double-click the button to use the full lyrics page.
-- Cyberpunk styling and a playback-aware taskbar title.
+- Cyberpunk is the default theme, with a violet app icon across the player, Windows executable and installer. Saved appearance choices are preserved; resetting settings restores these defaults. The taskbar title follows playback.
 - Automatic random library queue refills without restarting the current song.
 - Lyrics lookup during song import, with sidecar files saved alongside the audio.
 - EXT.to browser search and qBittorrent batch handoff.
@@ -30,7 +30,7 @@ The original MIT copyright and license are preserved in [LICENSE](LICENSE).
 
 ## Versions and downloads
 
-For a normal Windows installation, download **Undertone-v1.6.7-Setup.exe** from the [latest release](https://github.com/Mayank-Praveen-Kumar/Undertone/releases/latest). It installs for your Windows account, adds a Start menu shortcut and an optional desktop shortcut, and supports uninstalling through Windows Settings. Your library and preferences remain in `%APPDATA%\Undertone` when you uninstall. The ZIP is also available for portable use.
+For a normal Windows installation, download **Undertone-v1.6.8-Setup.exe** from the [latest release](https://github.com/Mayank-Praveen-Kumar/Undertone/releases/latest). It installs for your Windows account, adds a Start menu shortcut and an optional desktop shortcut, and supports uninstalling through Windows Settings. Your library and preferences remain in `%APPDATA%\Undertone` when you uninstall. Earlier portable ZIPs remain available in the release history.
 
 The latest edition is named **Undertone**. Earlier editions retain their historical **mit-sound** names.
 

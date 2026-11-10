@@ -92,7 +92,8 @@ public class FreshInstallDefaultsTests
     [Fact]
     public void LookAndFeelMatchesTheShippedDesign()
     {
-        Assert.Equal("Gray", Fresh.Theme);
+        Assert.Equal("Midnight", Fresh.Theme); // Cyberpunk's stable persisted key.
+        Assert.Equal("violet", Fresh.AppIcon);
         Assert.Equal("Crimson", Fresh.AccentPresetName);
         Assert.Equal("#E74856", Fresh.AccentColorHex);
         // Animated artwork is the only Appearance extra that ships on; liquid glass,

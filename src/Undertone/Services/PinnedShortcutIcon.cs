@@ -13,7 +13,7 @@ namespace Undertone.Services;
 /// icon, so the App Icon choice never showed there (verified 11-03: unpinned dev build
 /// followed the window icon live, the pinned button stayed classic). This points the
 /// pinned shortcut of THIS exe at the chosen .ico; Explorer repaints the button live
-/// after SHCNE_UPDATEITEM. Classic resets it to the exe's own icon.
+/// after SHCNE_UPDATEITEM. Violet resets it to the exe's own icon.
 /// </summary>
 public static class PinnedShortcutIcon
 {
@@ -40,13 +40,13 @@ public static class PinnedShortcutIcon
         }
     }
 
-    /// <summary>Icon location the shortcut should carry: empty = the exe's own (classic) icon.</summary>
+    /// <summary>Icon location the shortcut should carry: empty = the exe's own (violet) icon.</summary>
     internal static string DesiredIconPath(string id) =>
         id == AppIconService.DefaultId ? "" : IconFile(id);
 
     /// <summary>
     /// Fire and forget, off the UI thread. <paramref name="icoBytes"/> is the chosen icon
-    /// (read from avares on the UI side); null for classic.
+    /// (read from avares on the UI side); null for the default violet icon.
     /// </summary>
     public static void Sync(string id, byte[]? icoBytes)
     {
@@ -66,7 +66,7 @@ public static class PinnedShortcutIcon
     }
 
     /// <summary>
-    /// Settings › Reset Everything: deletes the icon copies once the classic icon is back (the
+    /// Settings › Reset Everything: deletes the icon copies once the default violet icon is back (the
     /// reset's AppIcon change queued that <see cref="Sync"/> first; the same gate keeps them in
     /// order). A pinned shortcut of another Undertone on this data folder that still points here
     /// gets its copy rewritten by that app's next start (it syncs at launch).

@@ -401,12 +401,12 @@ public partial class App : Application
                 SetAccent(def.AccentHex);
                 return;
             }
-            // Unknown id falls through to default handling (Gray).
-            themeName = ThemeGray;
+            // Unknown id falls through to the fresh-install default.
+            themeName = Models.AppSettings.DefaultTheme;
         }
 
         // Content-pack themes: pure data (colours for whitelisted keys), expanded the same way
-        // as custom themes. A pack that was switched off or removed falls back to Gray.
+        // as custom themes. A removed pack falls back to the fresh-install default.
         if (themeName != null && themeName.StartsWith(PackThemePrefix, StringComparison.Ordinal))
         {
             var theme = PackThemeResolver?.Invoke(themeName.Substring(PackThemePrefix.Length));
@@ -426,7 +426,7 @@ public partial class App : Application
                 SetAccent(_activeAccentHex ?? theme.AccentHex);
                 return;
             }
-            themeName = ThemeGray;
+            themeName = Models.AppSettings.DefaultTheme;
         }
 
         RequestedThemeVariant = IsLightVariantTheme(themeName)
@@ -439,7 +439,8 @@ public partial class App : Application
             ThemeMidnight => "avares://Undertone.UI/Assets/Themes/Midnight.axaml",
             ThemeInk => "avares://Undertone.UI/Assets/Themes/Ink.axaml",
             ThemeSmoke => "avares://Undertone.UI/Assets/Themes/Smoke.axaml",
-            _ => null
+            ThemeGray or ThemeLight or "System" => null,
+            _ => "avares://Undertone.UI/Assets/Themes/Midnight.axaml"
         };
 
         if (overlayUri != null)
