@@ -20,7 +20,7 @@ public partial class DiscoverCard : ObservableObject
         => (Song, Reason, LocalTrack) = (song, reason, localTrack);
 }
 
-public partial class DiscoverViewModel : ViewModelBase
+public partial class DiscoverViewModel : ViewModelBase, ISearchable
 {
     private readonly ILibraryService _library;
     private readonly IPlayHistoryService _history;
@@ -33,6 +33,40 @@ public partial class DiscoverViewModel : ViewModelBase
     private string _seedTitle = "your listening";
     private bool _active;
     private bool _loaded;
+    public bool IsSearchPage { get; init; }
+    public string Heading => IsSearchPage ? "Search & discover" : "Discover";
+    [ObservableProperty] private string _query = string.Empty;
+    public bool IsSearchCleared => string.IsNullOrWhiteSpace(Query);
+    public void ApplyFilter(string query) => Query = query;
+    partial void OnQueryChanged(string value) { if (IsSearchPage) _ = SearchAsync(value); }
+    private async Task SearchAsync(string query)
+    {
+        _request?.Cancel();
+        using var request = new CancellationTokenSource();
+        _request = request;
+        Songs.Clear();
+        IsBusy = false;
+        if (string.IsNullOrWhiteSpace(query)) { Status = "Search by song, artist or album. Library results appear first; online results come from Last.fm."; _request = null; return; }
+        var terms = query.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var local = _library.Tracks.Where(t => terms.All(term => Undertone.Helpers.SearchText.Matches($"{t.Title} {t.Artist} {t.Album}", term))).Take(100).ToArray();
+        foreach (var track in local)
+            Songs.Add(new(new(track.Title, track.Artist), "In your library", track) { Album = track.Album });
+        Status = $"{local.Length} library results · searching online…";
+        IsBusy = true;
+        try
+        {
+            await Task.Delay(350, request.Token);
+            var online = await _service.SearchAsync(query, request.Token);
+            request.Token.ThrowIfCancellationRequested();
+            var keys = Songs.Select(s => s.Song.Key).ToHashSet();
+            foreach (var song in online.Where(s => keys.Add(s.Key)))
+                Songs.Add(new(song, "Last.fm · discover a song", null));
+            Status = Songs.Count == 0 ? "No songs found. Try another song, artist or album." : $"{Songs.Count} results · {local.Length} in your library";
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception) { if (!request.IsCancellationRequested) Status = $"{local.Length} library results · online search unavailable. Check your connection and try again."; }
+        finally { if (ReferenceEquals(_request, request)) { _request = null; IsBusy = false; } }
+    }
     public PlayerViewModel Player { get; }
     public ListeningModesViewModel? Modes { get; }
     public ObservableCollection<DiscoverCard> Songs { get; } = new();
@@ -43,6 +77,8 @@ public partial class DiscoverViewModel : ViewModelBase
     [ObservableProperty] private double _adventure;
     [ObservableProperty] private bool _enabled;
     public bool NeedsStart => !Enabled;
+    public bool ShowStart => !IsSearchPage && !Enabled;
+    public bool ShowControls => !IsSearchPage && Enabled;
     public bool IsRadio => Mode == 0;
     public bool IsForYou => Mode == 1;
     public bool IsRediscover => Mode == 2;
@@ -66,7 +102,7 @@ public partial class DiscoverViewModel : ViewModelBase
         _listeningModeId = id;
         _preferences = _service.LoadPreferences(id);
         _enabled = _preferences.Enabled; _adventure = _preferences.Adventure;
-        OnPropertyChanged(nameof(Enabled)); OnPropertyChanged(nameof(NeedsStart)); OnPropertyChanged(nameof(Adventure));
+        OnPropertyChanged(nameof(Enabled)); OnPropertyChanged(nameof(NeedsStart)); OnPropertyChanged(nameof(ShowStart)); OnPropertyChanged(nameof(ShowControls)); OnPropertyChanged(nameof(Adventure));
         _candidates.Clear(); Songs.Clear(); _loaded = false;
         if (_active && Enabled) _ = RefreshAsync();
     }
@@ -74,13 +110,13 @@ public partial class DiscoverViewModel : ViewModelBase
     public void SetActive(bool active)
     {
         _active = active;
-        if (!active) { _request?.Cancel(); return; }
-        if (Enabled && !_loaded) _ = RefreshAsync();
+        if (!active) { _request?.Cancel(); IsBusy = false; return; }
+        if (!IsSearchPage && Enabled && !_loaded) _ = RefreshAsync();
     }
 
     private async void PlayerChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (e.PropertyName != nameof(PlayerViewModel.CurrentTrack)) return;
+        if (IsSearchPage || e.PropertyName != nameof(PlayerViewModel.CurrentTrack)) return;
         _loaded = false;
         if (!_active || !Enabled || Mode != 0) return;
         _request?.Cancel();
@@ -97,7 +133,7 @@ public partial class DiscoverViewModel : ViewModelBase
 
     partial void OnEnabledChanged(bool value)
     {
-        OnPropertyChanged(nameof(NeedsStart));
+        OnPropertyChanged(nameof(NeedsStart)); OnPropertyChanged(nameof(ShowStart)); OnPropertyChanged(nameof(ShowControls));
         _preferences.Enabled = value;
         SavePreferences();
         if (!value) { _request?.Cancel(); Songs.Clear(); _loaded = false; Status = "Discover is off."; }

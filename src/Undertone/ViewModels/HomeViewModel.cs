@@ -15,6 +15,7 @@ namespace Undertone.ViewModels;
 /// </summary>
 public partial class HomeViewModel : ViewModelBase, IDisposable
 {
+    public DiscoverViewModel? Discover { get; set; }
     private const int MaxTopArtists = 6;
     private readonly PlayerViewModel _player;
     private readonly ILibraryService _library;

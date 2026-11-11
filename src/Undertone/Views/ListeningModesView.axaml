@@ -1,24 +1,27 @@
 <UserControl xmlns="https://github.com/avaloniaui" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:vm="using:Undertone.ViewModels" xmlns:m="using:Undertone.Models"
              x:Class="Undertone.Views.ListeningModesView" x:DataType="vm:ListeningModesViewModel">
-  <Border Background="{DynamicResource AppSidebarBackground}" CornerRadius="20" Padding="16,12" Margin="0,6,0,10">
+  <UserControl.Styles>
+    <StyleInclude Source="avares://Undertone.UI/Assets/PillDialog.axaml"/>
+  </UserControl.Styles>
+  <Border Background="{DynamicResource HomeCardBackground}" CornerRadius="20" Padding="16,12" Margin="0,6,0,10">
     <StackPanel Spacing="8" IsEnabled="{Binding !IsBusy}">
       <WrapPanel>
         <TextBlock Text="Listening mode" VerticalAlignment="Center" Margin="0,0,12,0"/>
-        <ComboBox ItemsSource="{Binding Profiles}" SelectedItem="{Binding SelectedMode}" MinWidth="155" CornerRadius="16" Margin="0,0,10,0" AutomationProperties.Name="Listening mode">
+        <ComboBox Classes="pill-field" ItemsSource="{Binding Profiles}" SelectedItem="{Binding SelectedMode}" MinWidth="155" CornerRadius="16" Margin="0,0,10,0" AutomationProperties.Name="Listening mode">
           <ComboBox.ItemTemplate><DataTemplate x:DataType="m:ListeningMode"><TextBlock Text="{Binding Name}"/></DataTemplate></ComboBox.ItemTemplate>
         </ComboBox>
-        <Button Content="Adjust settings" Command="{Binding AdjustSettingsCommand}" CornerRadius="16" Padding="12,8" Margin="0,0,8,0"/>
-        <Button Content="Toggle exclusive audio" Command="{Binding ToggleExclusiveCommand}" CornerRadius="16" Padding="12,8"/>
+        <Button Classes="pill-secondary" Content="Adjust settings" Command="{Binding AdjustSettingsCommand}" CornerRadius="16" Padding="12,8" Margin="0,0,8,0"/>
+        <Button Classes="pill-secondary" Content="Toggle exclusive audio" Command="{Binding ToggleExclusiveCommand}" CornerRadius="16" Padding="12,8"/>
       </WrapPanel>
       <TextBlock Text="{Binding Description}" Opacity="0.65" FontSize="12" TextWrapping="Wrap"/>
       <Expander Header="Create your own mode" HorizontalAlignment="Stretch">
         <StackPanel Spacing="8" Margin="0,8,0,0">
           <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
-            <TextBox Text="{Binding CustomName}" PlaceholderText="Name your mode" CornerRadius="16" MaxLength="40"/>
-            <Button Grid.Column="1" Content="Create" Command="{Binding AddCustomCommand}" CornerRadius="16" Padding="16,8"/>
+            <TextBox Classes="pill-field" Text="{Binding CustomName}" PlaceholderText="Name your mode" CornerRadius="16" MaxLength="40"/>
+            <Button Classes="pill-secondary" Grid.Column="1" Content="Create" Command="{Binding AddCustomCommand}" CornerRadius="16" Padding="16,8"/>
           </Grid>
-          <Button Content="Toggle grayscale for this custom mode" Command="{Binding ToggleGrayscaleCommand}" IsVisible="{Binding IsCustom}" HorizontalAlignment="Left" CornerRadius="16" Padding="12,8"/>
+          <Button Classes="pill-secondary" Content="Toggle grayscale for this custom mode" Command="{Binding ToggleGrayscaleCommand}" IsVisible="{Binding IsCustom}" HorizontalAlignment="Left" CornerRadius="16" Padding="12,8"/>
           <TextBlock Text="Your appearance, volume, exclusive audio and lyric background choices are remembered for each mode. Recommendations learn separately in each mode." TextWrapping="Wrap" Opacity="0.65" FontSize="12"/>
         </StackPanel>
       </Expander>

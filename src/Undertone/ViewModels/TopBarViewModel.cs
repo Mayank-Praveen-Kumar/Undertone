@@ -679,7 +679,7 @@ public partial class TopBarViewModel : ViewModelBase
                 DebugLogger.Info(DebugLogger.Category.Search, "SearchDebounced", $"query=\"{value}\"");
                 Avalonia.Threading.Dispatcher.UIThread.Post(() =>
                 {
-                    SearchTextChanged?.Invoke(this, value);
+                    if (!token.IsCancellationRequested) SearchTextChanged?.Invoke(this, value);
                 });
             }
         }, token);

@@ -2,6 +2,7 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:loc="using:Undertone.Localization"
              xmlns:vm="using:Undertone.ViewModels"
+             xmlns:views="using:Undertone.Views"
              xmlns:m="using:Undertone.Models"
              xmlns:conv="using:Undertone.Converters"
              xmlns:helpers="using:Undertone.Helpers"
@@ -1241,8 +1242,7 @@
                     </controls:CollapsibleContent>
                 </StackPanel>
 
-            </StackPanel>
-        </ScrollViewer>
+
 
         <!-- Empty library (10-17): a new profile opened on a blank page. Says so and offers
              Settings' own Add Folder command; the link opens Settings at the media folders. -->
@@ -1346,6 +1346,9 @@
                        HorizontalAlignment="Center"
                        TextAlignment="Center" />
         </StackPanel>
+                <views:DiscoverView DataContext="{Binding Discover}" Margin="-28,0,-28,0"/>
+            </StackPanel>
+        </ScrollViewer>
     </Grid>
 
 </UserControl>

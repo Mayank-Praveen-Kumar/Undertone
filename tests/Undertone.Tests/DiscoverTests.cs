@@ -29,6 +29,16 @@ public class DiscoverTests : IDisposable
         }
     }
     [Fact]
+    public void SearchParsesDeduplicatesAndRejectsErrors()
+    {
+        var songs = DiscoverService.ParseSearch("""{"results":{"trackmatches":{"track":[{"name":"One","artist":"Artist"},{"name":"One","artist":"Artist"},{"name":"Incomplete"}]}}}""");
+        Assert.Single(songs);
+        Assert.Equal("One", songs[0].Title);
+        Assert.Empty(DiscoverService.ParseSearch("""{"results":{"trackmatches":{"track":[]}}}"""));
+        Assert.Throws<InvalidOperationException>(() => DiscoverService.ParseSearch("""{"error":10}"""));
+    }
+
+    [Fact]
     public void ParsesAndDeduplicates_AndDoesNotTurnProviderErrorsIntoEmptyResults()
     {
         var songs = DiscoverService.ParseSimilar(Similar);

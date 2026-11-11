@@ -98,6 +98,26 @@ public sealed class DiscoverService
         finally { _gate.Release(); }
     }
 
+    public async Task<IReadOnlyList<DiscoverSong>> SearchAsync(string query, CancellationToken ct)
+    {
+        var url = LastFmApi.ApiBase + "?method=track.search&format=json&limit=50&api_key="
+            + Uri.EscapeDataString(_apiKey) + "&track=" + Uri.EscapeDataString(query.Trim());
+        var json = await _http.GetStringAsync(url, ct).ConfigureAwait(false);
+        return ParseSearch(json);
+    }
+
+    internal static IReadOnlyList<DiscoverSong> ParseSearch(string json)
+    {
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+        if (root.TryGetProperty("error", out _)) throw new InvalidOperationException("Last.fm rejected the search request.");
+        var tracks = root.GetProperty("results").GetProperty("trackmatches").GetProperty("track");
+        var entries = tracks.ValueKind == JsonValueKind.Array ? tracks.EnumerateArray().ToArray()
+            : tracks.ValueKind == JsonValueKind.Object ? new[] { tracks } : Array.Empty<JsonElement>();
+        return entries.Select(t => new DiscoverSong(Text(t, "name"), Text(t, "artist"), Text(t, "mbid")))
+            .Where(s => s.Title.Length > 0 && s.Artist.Length > 0).DistinctBy(s => s.Key).ToArray();
+    }
+
     internal static IReadOnlyList<DiscoverSong> ParseSimilar(string json)
     {
         using var doc = JsonDocument.Parse(json);

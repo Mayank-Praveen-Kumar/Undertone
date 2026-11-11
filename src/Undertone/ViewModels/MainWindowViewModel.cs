@@ -82,7 +82,8 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         var current = IsSettingsModalOpen ? null : CurrentView;
         _homeVm.IsActive = ReferenceEquals(current, _homeVm);
-        _discoverVm?.SetActive(ReferenceEquals(current, _discoverVm));
+        _discoverVm?.SetActive(ReferenceEquals(current, _homeVm));
+        _searchVm?.SetActive(ReferenceEquals(current, _searchVm));
         _coverFlowVm.IsActive = ReferenceEquals(current, _coverFlowVm);
         _songsVm.IsActive = ReferenceEquals(current, _songsVm);
         _albumsVm.IsActive = ReferenceEquals(current, _albumsVm);
@@ -298,6 +299,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private readonly HomeViewModel _homeVm;
     private readonly DiscoverViewModel _discoverVm;
+    private readonly DiscoverViewModel _searchVm;
     private readonly LibrarySongsViewModel _songsVm;
     private readonly LibraryAlbumsViewModel _albumsVm;
     private readonly LibraryArtistsViewModel _artistsVm;
@@ -521,6 +523,9 @@ public partial class MainWindowViewModel : ViewModelBase
         Modes.SettingsRequested += (_, _) => { Settings.SelectedSettingsTab = SettingsViewModel.TabAppearance; OpenSettings(); };
         _discoverVm = new DiscoverViewModel(Player, library, playHistory,
             new DiscoverService(new HttpClient { Timeout = TimeSpan.FromSeconds(20) }, AppPaths.DataRoot), Modes);
+        _homeVm.Discover = _discoverVm;
+        _searchVm = new DiscoverViewModel(Player, library, playHistory,
+            new DiscoverService(new HttpClient { Timeout = TimeSpan.FromSeconds(20) }, AppPaths.DataRoot)) { IsSearchPage = true, Subtitle = "Your library and new music, together.", Status = "Search by song, artist or album." };
         _songsVm = new LibrarySongsViewModel(library, Player, Sidebar, persistence, Settings);
         _albumsVm = new LibraryAlbumsViewModel(library, Player, Sidebar, Settings);
         // Keep the top-bar dropdown labels in sync with the Albums grid filters/sort.
@@ -2365,7 +2370,7 @@ public partial class MainWindowViewModel : ViewModelBase
             CurrentView = key switch
             {
                 "home" => RefreshAndReturn(_homeVm),
-                "discover" => _discoverVm,
+                "discover" => _searchVm,
                 "songs" => RefreshAndReturnSongs(_songsVm),
                 "albums" => ResetFilterAndReturnAlbums(),
                 "artists" => ResetAndReturnArtists(),
@@ -2412,7 +2417,7 @@ public partial class MainWindowViewModel : ViewModelBase
         TopBar.CurrentTabName = key switch
         {
             "home" => "Home",
-            "discover" => "Discover",
+            "discover" => "Search",
             "songs" => "Songs",
             "albums" => "Albums",
             "artists" => "Artists",
@@ -2783,7 +2788,7 @@ public partial class MainWindowViewModel : ViewModelBase
         // the Songs item — so history and top-bar state behave like a real
         // navigation. Navigate closes and clears the search pill as part of the
         // section switch, so it may only be reopened once navigation is done.
-        var songs = Sidebar.NavItems.FirstOrDefault(n => n.Key == "songs");
+        var songs = Sidebar.NavItems.FirstOrDefault(n => n.Key == "discover");
         if (songs == null) return;
         Sidebar.SelectedNavItem = songs;
         if (TopBar.IsSearchVisible)
@@ -3004,7 +3009,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private ViewModelBase ResolveSectionView(string key) => key switch
     {
         "home"      => RefreshAndReturn(_homeVm),
-        "discover"  => _discoverVm,
+        "discover"  => _searchVm,
         "songs"     => RefreshAndReturnSongs(_songsVm),
         "albums"    => ResetFilterAndReturnAlbums(),
         "artists"   => ResetAndReturnArtists(),
@@ -3051,7 +3056,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private string GetCurrentViewKey()
     {
         if (CurrentView == _homeVm) return "home";
-        if (CurrentView == _discoverVm) return "discover";
+        if (CurrentView == _searchVm) return "discover";
         if (CurrentView == _songsVm) return "songs";
         if (CurrentView == _albumsVm || CurrentView == _coverFlowVm) return "albums";
         if (CurrentView == _artistsVm) return "artists";

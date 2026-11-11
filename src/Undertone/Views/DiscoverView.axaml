@@ -5,29 +5,46 @@
              x:Class="Undertone.Views.DiscoverView" x:DataType="vm:DiscoverViewModel"
              Background="{DynamicResource AppMainBackground}">
   <UserControl.Styles>
-    <Style Selector="Button.mode.active"><Setter Property="Background" Value="{DynamicResource AccentColorBrush}"/><Setter Property="Foreground" Value="White"/></Style>
+    <StyleInclude Source="avares://Undertone.UI/Assets/PillDialog.axaml"/>
+    <Style Selector="Button.mode.active"><Setter Property="Background" Value="{DynamicResource AccentColorBrush}"/><Setter Property="Foreground" Value="{DynamicResource AccentForegroundBrush}"/></Style>
+    <Style Selector="Button.mode.active /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource AccentButtonBackground}"/>
+      <Setter Property="Foreground" Value="{DynamicResource AccentForegroundBrush}"/>
+    </Style>
+    <Style Selector="Border.song-card:pointerover">
+      <Setter Property="Background" Value="{DynamicResource PillFieldBackgroundPointerOver}"/>
+    </Style>
   </UserControl.Styles>
-  <Grid RowDefinitions="Auto,Auto,*" Margin="28,18,28,20">
+  <ScrollViewer HorizontalScrollBarVisibility="Disabled">
+  <Grid RowDefinitions="Auto,Auto,Auto" Margin="28,20,28,32">
     <StackPanel Spacing="8">
-      <TextBlock Text="Discover" FontSize="30" FontWeight="SemiBold"/>
+      <TextBlock Text="{Binding Heading}" FontSize="26" FontWeight="SemiBold"/>
       <TextBlock Text="{Binding Subtitle}" TextWrapping="Wrap" Opacity="0.7"/>
-      <views:ListeningModesView DataContext="{Binding Modes}"/>
-      <Border CornerRadius="20" Padding="20" Margin="0,12,0,4" Background="{DynamicResource AppSidebarBackground}" IsVisible="{Binding NeedsStart}">
+      <views:ListeningModesView DataContext="{Binding Modes}" IsVisible="{Binding !$parent[UserControl].((vm:DiscoverViewModel)DataContext).IsSearchPage}"/>
+      <TextBox Classes="pill-field" Text="{Binding Query, Mode=TwoWay}" PlaceholderText="Search songs, artists and albums"
+               AutomationProperties.Name="Search songs, artists and albums" IsVisible="{Binding IsSearchPage}" Margin="0,16,0,4" Padding="10,12,18,12" CornerRadius="999">
+        <TextBox.InnerLeftContent>
+          <PathIcon Data="{StaticResource SearchIcon}" Width="16" Height="16" Opacity="0.55" Margin="18,0,4,0" VerticalAlignment="Center"/>
+        </TextBox.InnerLeftContent>
+      </TextBox>
+      <TextBlock Text="{Binding Status}" FontSize="12" Opacity="0.6" Margin="4,0,0,8" IsVisible="{Binding IsSearchPage}" TextWrapping="Wrap"/>
+      <ProgressBar IsVisible="{Binding IsBusy}" IsIndeterminate="True" Height="3"/>
+      <Border CornerRadius="20" Padding="20" Margin="0,12,0,4" Background="{DynamicResource HomeCardBackground}" IsVisible="{Binding ShowStart}">
         <StackPanel Spacing="12">
           <TextBlock Text="Find your next favourite" FontSize="20" FontWeight="SemiBold"/>
           <TextBlock Text="Undertone uses Last.fm to find songs, then ranks them using your listening on this computer. Song and artist lookups go online; your listening history stays here. YouTube loads only when you preview a song." TextWrapping="Wrap" Opacity="0.75"/>
-          <Button Content="Start discovering" Command="{Binding StartCommand}" HorizontalAlignment="Left" CornerRadius="18" Padding="18,10"/>
+          <Button Classes="pill-primary" Content="Start discovering" Command="{Binding StartCommand}" HorizontalAlignment="Left" CornerRadius="999" Padding="18,10"/>
         </StackPanel>
       </Border>
     </StackPanel>
-    <StackPanel Grid.Row="1" Spacing="12" Margin="0,16,0,14" IsVisible="{Binding Enabled}">
+    <StackPanel Grid.Row="1" Spacing="12" Margin="0,16,0,14" IsVisible="{Binding ShowControls}">
       <WrapPanel Orientation="Horizontal">
-        <Button Classes="mode" Content="Song radio" Command="{Binding SetModeCommand}" CommandParameter="0" Classes.active="{Binding IsRadio}" CornerRadius="18" Padding="16,9" Margin="0,0,8,6"/>
-        <Button Classes="mode" Content="For you" Command="{Binding SetModeCommand}" CommandParameter="1" Classes.active="{Binding IsForYou}" CornerRadius="18" Padding="16,9" Margin="0,0,8,6"/>
-        <Button Classes="mode" Content="Rediscover" Command="{Binding SetModeCommand}" CommandParameter="2" Classes.active="{Binding IsRediscover}" CornerRadius="18" Padding="16,9" Margin="0,0,8,6"/>
-        <Button Content="Refresh" Command="{Binding RefreshCommand}" IsEnabled="{Binding !IsBusy}" CornerRadius="18" Padding="16,9" Margin="0,0,8,6"/>
-        <Button Content="Reset feedback" Command="{Binding ResetFeedbackCommand}" CornerRadius="18" Padding="16,9" Margin="0,0,8,6"/>
-        <Button Content="Turn off" Command="{Binding TurnOffCommand}" CornerRadius="18" Padding="16,9" Margin="0,0,0,6"/>
+        <Button Classes="pill-secondary mode" Content="Song radio" Command="{Binding SetModeCommand}" CommandParameter="0" Classes.active="{Binding IsRadio}" CornerRadius="999" Padding="16,9" Margin="0,0,8,6"/>
+        <Button Classes="pill-secondary mode" Content="For you" Command="{Binding SetModeCommand}" CommandParameter="1" Classes.active="{Binding IsForYou}" CornerRadius="999" Padding="16,9" Margin="0,0,8,6"/>
+        <Button Classes="pill-secondary mode" Content="Rediscover" Command="{Binding SetModeCommand}" CommandParameter="2" Classes.active="{Binding IsRediscover}" CornerRadius="999" Padding="16,9" Margin="0,0,8,6"/>
+        <Button Classes="pill-secondary" Content="Refresh" Command="{Binding RefreshCommand}" IsEnabled="{Binding !IsBusy}" CornerRadius="999" Padding="16,9" Margin="0,0,8,6"/>
+        <Button Classes="pill-secondary" Content="Reset feedback" Command="{Binding ResetFeedbackCommand}" CornerRadius="999" Padding="16,9" Margin="0,0,8,6"/>
+        <Button Classes="pill-secondary" Content="Turn off" Command="{Binding TurnOffCommand}" CornerRadius="999" Padding="16,9" Margin="0,0,0,6"/>
       </WrapPanel>
       <Grid ColumnDefinitions="Auto,220,Auto" IsVisible="{Binding !IsRediscover}">
         <TextBlock Text="Familiar" VerticalAlignment="Center" Opacity="0.65" Margin="0,0,12,0"/>
@@ -37,29 +54,30 @@
       <TextBlock Text="{Binding Status}" TextWrapping="Wrap" Opacity="0.65"/>
       <ProgressBar IsVisible="{Binding IsBusy}" IsIndeterminate="True" Height="3"/>
     </StackPanel>
-    <ScrollViewer Grid.Row="2" HorizontalScrollBarVisibility="Disabled" IsVisible="{Binding Enabled}">
+    <Border Grid.Row="2">
       <ItemsControl ItemsSource="{Binding Songs}">
         <ItemsControl.ItemTemplate>
           <DataTemplate x:DataType="vm:DiscoverCard">
-            <Border Background="{DynamicResource AppSidebarBackground}" CornerRadius="22" Padding="20,16" Margin="0,0,0,10">
-              <Grid ColumnDefinitions="*,Auto" ColumnSpacing="16">
+            <Border Classes="song-card" Background="{DynamicResource HomeCardBackground}" CornerRadius="20" Padding="20" Margin="0,0,0,10">
+              <Grid RowDefinitions="Auto,Auto" RowSpacing="14">
                 <StackPanel Spacing="5">
-                  <TextBlock Text="{Binding Title}" FontSize="19" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                  <TextBlock Text="{Binding Title}" FontSize="16" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
                   <TextBlock Text="{Binding Artist}" FontSize="14" Opacity="0.85" TextTrimming="CharacterEllipsis"/>
                   <TextBlock Text="{Binding Album}" Opacity="0.6" TextTrimming="CharacterEllipsis"/>
                   <TextBlock Text="{Binding Reason}" FontSize="12" Opacity="0.6" TextWrapping="Wrap"/>
                 </StackPanel>
-                <StackPanel Grid.Column="1" Spacing="7" VerticalAlignment="Center">
-                  <Button Content="Preview · 30s" Command="{Binding $parent[UserControl].((vm:DiscoverViewModel)DataContext).PreviewCommand}" CommandParameter="{Binding}" CornerRadius="16" Padding="14,8"/>
-                  <Button Content="Play from library" IsVisible="{Binding IsInLibrary}" Command="{Binding $parent[UserControl].((vm:DiscoverViewModel)DataContext).PlayLocalCommand}" CommandParameter="{Binding}" CornerRadius="16" Padding="14,8"/>
-                  <Button Content="Find album" Command="{Binding $parent[UserControl].((vm:DiscoverViewModel)DataContext).FindAlbumCommand}" CommandParameter="{Binding}" CornerRadius="16" Padding="14,8"/>
-                  <Button Content="Less like this" Command="{Binding $parent[UserControl].((vm:DiscoverViewModel)DataContext).LessLikeThisCommand}" CommandParameter="{Binding}" CornerRadius="16" Padding="14,6" Opacity="0.65"/>
-                </StackPanel>
+                <WrapPanel Grid.Row="1" Orientation="Horizontal">
+                  <Button Classes="pill-secondary" Content="Preview · 30s" Command="{Binding $parent[UserControl].((vm:DiscoverViewModel)DataContext).PreviewCommand}" CommandParameter="{Binding}" Margin="0,0,8,6" CornerRadius="999" Padding="14,8"/>
+                  <Button Classes="pill-primary" Content="Play from library" IsVisible="{Binding IsInLibrary}" Command="{Binding $parent[UserControl].((vm:DiscoverViewModel)DataContext).PlayLocalCommand}" CommandParameter="{Binding}" Margin="0,0,8,6" CornerRadius="999" Padding="14,8"/>
+                  <Button Classes="pill-secondary" Content="Find album" Command="{Binding $parent[UserControl].((vm:DiscoverViewModel)DataContext).FindAlbumCommand}" CommandParameter="{Binding}" Margin="0,0,8,6" CornerRadius="999" Padding="14,8"/>
+                  <Button Classes="pill-secondary" IsVisible="{Binding !$parent[UserControl].((vm:DiscoverViewModel)DataContext).IsSearchPage}" Content="Less like this" Command="{Binding $parent[UserControl].((vm:DiscoverViewModel)DataContext).LessLikeThisCommand}" CommandParameter="{Binding}" Margin="0,0,8,6" CornerRadius="999" Padding="14,6" Opacity="0.65"/>
+                </WrapPanel>
               </Grid>
             </Border>
           </DataTemplate>
         </ItemsControl.ItemTemplate>
       </ItemsControl>
-    </ScrollViewer>
+    </Border>
   </Grid>
+  </ScrollViewer>
 </UserControl>
