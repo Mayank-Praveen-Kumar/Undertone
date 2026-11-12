@@ -5,7 +5,7 @@ Undertone is playing and control it: Stream Deck buttons, OBS "now playing" over
 Rainmeter skins, Discord bots, home-automation bridges, shell scripts. Nothing runs
 inside Undertone; any language that can make an HTTP request works.
 
-- Off by default. Turn it on in **Settings > Account & Devices > Local API**.
+- Off by default. Turn it on in **Settings > Integrations > Local API**.
 - Only reachable from this PC. It never listens on the network. (For phone control
   over Wi-Fi, use the separate **Web Remote** on the same Settings page.)
 - Versioned: everything lives under `/api/v1`.

@@ -509,7 +509,7 @@ Deezer and TIDAL: paste the link.</value></data>
   <data name="Settings.WaitingPhoneScanCode" xml:space="preserve"><value>Waiting for a phone. Tap the code to make it bigger.</value><comment>Text in SettingsView.axaml</comment></data>
   <data name="Settings.PhoneConnected" xml:space="preserve"><value>Phone connected</value><comment>Text in SettingsView.axaml</comment></data>
   <data name="Settings.LocalApi" xml:space="preserve"><value>Local API</value><comment>Text in SettingsView.axaml</comment></data>
-  <data name="Settings.LocalApiDesc" xml:space="preserve"><value>Lets apps on this PC, like Stream Deck or OBS, see what's playing and control Undertone.</value><comment>Text in SettingsView.axaml</comment></data>
+  <data name="Settings.LocalApiDesc" xml:space="preserve"><value>Lets apps on this PC, like Spine Shelf, Stream Deck, or OBS, see what's playing and control Undertone.</value><comment>Text in SettingsView.axaml</comment></data>
   <data name="Settings.LocalApiAddress" xml:space="preserve"><value>ADDRESS</value><comment>Text in SettingsView.axaml</comment></data>
   <data name="Settings.LocalApiToken" xml:space="preserve"><value>TOKEN</value><comment>Text in SettingsView.axaml</comment></data>
   <data name="Settings.LocalApiShowToken" xml:space="preserve"><value>Show</value><comment>Reveals the Local API token</comment></data>

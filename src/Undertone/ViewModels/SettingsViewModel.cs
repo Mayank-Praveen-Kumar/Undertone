@@ -3131,6 +3131,7 @@ public partial class SettingsViewModel : ViewModelBase
     {
         _player = player;
         ApplyPlayerSettings();
+        UpdateLocalApiState();
     }
 
     /// <summary>Sets the Discord presence service reference.</summary>
@@ -3380,7 +3381,7 @@ public partial class SettingsViewModel : ViewModelBase
             StartMinimizedToTray = _settings.StartMinimizedToTray;
             RestoreLastTrackOnStartup = _settings.RestoreLastTrackOnStartup;
             WebRemoteEnabled = false;
-            LocalApiEnabled = false;
+            LocalApiEnabled = _settings.LocalApiEnabled;
             UndertoneServerPort = _settings.UndertoneServerPort;
             UndertoneServerEnabled = false;
             ShowArtworkColumn = _settings.ShowArtworkColumn;
@@ -3897,7 +3898,7 @@ public partial class SettingsViewModel : ViewModelBase
         _settings.StartMinimizedToTray = StartMinimizedToTray;
         _settings.RestoreLastTrackOnStartup = RestoreLastTrackOnStartup;
         _settings.WebRemoteEnabled = false;
-        _settings.LocalApiEnabled = false;
+        _settings.LocalApiEnabled = LocalApiEnabled;
         if (AccountFeatures.Enabled) _settings.UndertoneServerEnabled = UndertoneServerEnabled;
         _settings.UndertoneServerPort = UndertoneServerPort;
         _settings.ShowArtworkColumn = ShowArtworkColumn;

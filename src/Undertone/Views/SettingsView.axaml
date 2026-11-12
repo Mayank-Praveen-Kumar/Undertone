@@ -5714,6 +5714,47 @@
             
 
             <StackPanel x:Name="IntegrationsTabPanel" Classes="tab-page" IsVisible="{Binding IsIntegrationsTabVisible}" Spacing="4">
+            <Border x:Name="LocalApiCard" Classes="setting-card group-card">
+              <StackPanel>
+                <Border Classes="setting-row">
+                  <StackPanel Spacing="12">
+                    <Grid ColumnDefinitions="*,Auto">
+                      <StackPanel Grid.Column="0" Spacing="4" Margin="0,0,18,0">
+                        <TextBlock Text="{loc:T Settings.LocalApi}" FontSize="15" FontWeight="SemiBold"/>
+                        <TextBlock Text="{loc:T Settings.LocalApiDesc}" FontSize="12" Opacity="0.6" TextWrapping="Wrap" MaxWidth="560" HorizontalAlignment="Left"/>
+                      </StackPanel>
+                      <controls:LottieToggle x:Name="LocalApiToggle" Grid.Column="1" VerticalAlignment="Center"
+                                            AutomationProperties.Name="{loc:T Settings.LocalApi}"
+                                            IsChecked="{Binding LocalApiEnabled, Mode=TwoWay}"/>
+                    </Grid>
+                    <TextBlock Text="{Binding LocalApiError}" IsVisible="{Binding LocalApiError, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"
+                               FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource AccentTextBrush}"/>
+                    <controls:CollapsibleContent IsOpen="{Binding LocalApiRunning}" Lift="6">
+                      <StackPanel Spacing="12">
+                        <StackPanel Spacing="5">
+                          <TextBlock Text="{loc:T Settings.LocalApiAddress}" FontSize="10" Opacity="0.5"/>
+                          <SelectableTextBlock Text="{Binding LocalApiBaseUrl}" FontSize="12"/>
+                        </StackPanel>
+                        <StackPanel Spacing="5">
+                          <TextBlock Text="{loc:T Settings.LocalApiToken}" FontSize="10" Opacity="0.5"/>
+                          <WrapPanel Orientation="Horizontal">
+                            <TextBlock Text="{Binding LocalApiTokenDisplay}" IsVisible="{Binding !LocalApiTokenRevealed}" VerticalAlignment="Center" FontSize="12" Margin="0,0,12,0"/>
+                            <Button Content="{loc:T Settings.LocalApiShowToken}" IsVisible="{Binding !LocalApiTokenRevealed}" Command="{Binding ToggleLocalApiTokenRevealCommand}" Classes="pill-action" Margin="0,0,8,0"/>
+                            <Button Content="{loc:T Settings.LocalApiHideToken}" IsVisible="{Binding LocalApiTokenRevealed}" Command="{Binding ToggleLocalApiTokenRevealCommand}" Classes="pill-action" Margin="0,0,8,0"/>
+                            <Button Content="{loc:T Settings.Copy}" Command="{Binding CopyLocalApiTokenCommand}" Classes="pill-action" Margin="0,0,8,0"/>
+                            <Button Content="{loc:T Settings.LocalApiRegenerate}" Command="{Binding RegenerateLocalApiTokenCommand}" Classes="pill-action" ToolTip.Tip="{loc:T Settings.LocalApiRegenerateTip}"/>
+                          </WrapPanel>
+                          <SelectableTextBlock Text="{Binding LocalApiToken}" IsVisible="{Binding LocalApiTokenRevealed}" TextWrapping="Wrap" FontSize="11"/>
+                        </StackPanel>
+                        <TextBlock Text="{loc:T Settings.LocalApiWarning}" FontSize="11" Opacity="0.6" TextWrapping="Wrap"/>
+                        <TextBlock Text="{loc:T Settings.LocalApiDiscovery}" FontSize="11" Opacity="0.6" TextWrapping="Wrap"/>
+                      </StackPanel>
+                    </controls:CollapsibleContent>
+                  </StackPanel>
+                </Border>
+              </StackPanel>
+            </Border>
+
 <Border Classes="setting-card group-card">
             <StackPanel>
             <Border Classes="setting-row">

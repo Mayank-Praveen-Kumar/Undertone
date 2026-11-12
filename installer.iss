@@ -4,7 +4,7 @@
 
 #define MyAppName "Undertone"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.8.0"
+  #define MyAppVersion "1.8.1"
 #endif
 #ifndef PublishDir
   #define PublishDir "publish\win-x64"
