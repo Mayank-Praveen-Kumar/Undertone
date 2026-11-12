@@ -52,7 +52,7 @@
             <Setter Property="Cursor" Value="Hand"/>
             <Setter Property="Template">
                 <ControlTemplate>
-                    <Border x:Name="TileFrame" CornerRadius="6" ClipToBounds="True"
+                    <Border x:Name="TileFrame" CornerRadius="{TemplateBinding CornerRadius}" ClipToBounds="True"
                             BoxShadow="0 8 22 0 #5E000000">
                         <ContentPresenter x:Name="TileContent"
                                           Content="{TemplateBinding Content}"

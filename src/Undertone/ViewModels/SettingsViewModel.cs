@@ -1025,6 +1025,14 @@ public partial class SettingsViewModel : ViewModelBase
     /// to every window through UiScale.</summary>
     [ObservableProperty] private int _uiScalePercent = 100;
 
+    [ObservableProperty] private bool _interfaceSoundsEnabled = true;
+    partial void OnInterfaceSoundsEnabledChanged(bool value)
+    {
+        InterfaceSounds.Enabled = value;
+        if (_settingsLoaded) _ = SaveAsync();
+    }
+
+
     /// <summary>One row of the Interface Size picker.</summary>
     public sealed record UiScaleOption(int Percent, string Label)
     {
@@ -3265,6 +3273,8 @@ public partial class SettingsViewModel : ViewModelBase
             CustomAccentHex = ActiveAccentHex;
             AccentFollowsArtwork = _settings.AccentFollowsArtwork;
             AccentTrackLinks = _settings.AccentTrackLinks;
+            InterfaceSoundsEnabled = _settings.InterfaceSoundsEnabled;
+            InterfaceSounds.Enabled = InterfaceSoundsEnabled;
             AppIcon = AppIconService.Normalize(_settings.AppIcon);
             AppIconService.Apply(AppIcon); // also when it equals the field default (no change event)
             try
@@ -3791,6 +3801,7 @@ public partial class SettingsViewModel : ViewModelBase
         _settings.AccentFollowsArtwork = AccentFollowsArtwork;
         _settings.AccentTrackLinks = AccentTrackLinks;
         _settings.AppIcon = AppIconService.Normalize(AppIcon);
+        _settings.InterfaceSoundsEnabled = InterfaceSoundsEnabled;
 
         _settings.ScanOnStartup = ScanOnStartup;
         _settings.WatchFoldersEnabled = WatchFoldersEnabled;
@@ -7717,6 +7728,7 @@ public partial class SettingsViewModel : ViewModelBase
             AccentFollowsArtwork = defaultSettings.AccentFollowsArtwork;
             AccentTrackLinks = defaultSettings.AccentTrackLinks;
             AppIcon = AppIconService.Normalize(defaultSettings.AppIcon);
+            InterfaceSoundsEnabled = defaultSettings.InterfaceSoundsEnabled;
             try
             {
                 _suppressPickerSync = true;

@@ -198,6 +198,7 @@ public sealed partial class WebRemoteServer
         {
             case "/status":
             case "/now-playing":
+            case "/appearance":
             case "/queue":
             case "/library/search":
             case "/lyrics/current":
@@ -233,6 +234,9 @@ public sealed partial class WebRemoteServer
                     playing = _player.State == PlaybackState.Playing,
                     hasTrack = _player.CurrentTrack != null,
                 }));
+
+            case "/appearance":
+                return Json(200, await OnUi(() => CompanionAppearance.Snapshot()));
 
             case "/now-playing":
                 return Json(200, await OnUi(() => LocalApiDto.NowPlaying(_player)));

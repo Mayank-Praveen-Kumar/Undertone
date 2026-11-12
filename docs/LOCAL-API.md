@@ -396,3 +396,7 @@ curl -N -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:9421/api/v1/events"
   announced in the release notes.
 - `apiVersion` in `/status` and `local-api.json` is the major version the running app
   serves.
+
+### Companion appearance
+
+`GET /api/v1/appearance` returns the current display colours, light/dark mode and selected app-icon id. It uses the same loopback token authentication as playback and exposes no credentials or paths.

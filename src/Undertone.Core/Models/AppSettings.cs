@@ -132,6 +132,9 @@ public class AppSettings : IJsonOnDeserializing
     /// ("violet", "classic", "blush", ...). Unknown ids fall back to violet.</summary>
     public string AppIcon { get; set; } = DefaultAppIcon;
 
+    /// <summary>Play the shared Spine Shelf click sound for interface buttons.</summary>
+    public bool InterfaceSoundsEnabled { get; set; } = true;
+
     /// <summary>Phone: "System" (follow Android's dark/light), "Dark" (the dark theme in
     /// <see cref="Theme"/>) or "Light".</summary>
     public string MobileAppearance { get; set; } = "System";

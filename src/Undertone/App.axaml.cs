@@ -112,6 +112,7 @@ public partial class App : Application
 
         // Icon-only buttons are named by their tooltip for screen readers / UI Automation.
         Undertone.Helpers.AccessibleNames.Install();
+        InterfaceSounds.Install();
 
         // Submenus (Lyrics ▸, Tools ▸ …) open 100 ms after the pointer rests on their row
         // instead of Avalonia's 400 ms default, which read as lag; a short wait still keeps

@@ -676,7 +676,7 @@
                             Background="{DynamicResource SystemControlBackgroundListLowBrush}"
                             BorderBrush="Transparent"
                             BorderThickness="2"
-                            CornerRadius="18"
+                            CornerRadius="{TemplateBinding CornerRadius}"
                             Padding="18,14">
                         <ContentPresenter Content="{TemplateBinding Content}"
                                           ContentTemplate="{TemplateBinding ContentTemplate}"/>
@@ -2224,6 +2224,17 @@
         <StackPanel Margin="28,8,40,28" HorizontalAlignment="Stretch" Spacing="4">
 
             <StackPanel x:Name="GeneralTabPanel" Classes="tab-page" IsVisible="{Binding IsGeneralTabVisible}" Spacing="4">
+            <Border x:Name="InterfaceSoundsCard" Classes="setting-card group-card">
+              <Grid ColumnDefinitions="*,Auto" ColumnSpacing="18">
+                <StackPanel Spacing="4">
+                  <TextBlock Text="{loc:T Settings.InterfaceSounds}" FontSize="15" FontWeight="SemiBold"/>
+                  <TextBlock Text="{loc:T Settings.InterfaceSoundsDesc}" FontSize="12" Opacity="0.6" TextWrapping="Wrap"/>
+                </StackPanel>
+                <controls:LottieToggle Grid.Column="1" x:Name="InterfaceSoundsToggle" VerticalAlignment="Center"
+                    AutomationProperties.Name="{loc:T Settings.InterfaceSounds}" IsChecked="{Binding InterfaceSoundsEnabled, Mode=TwoWay}"/>
+              </Grid>
+            </Border>
+
             <Border Classes="setting-card group-card">
             <StackPanel>
             <Border Classes="setting-row">

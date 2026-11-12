@@ -109,6 +109,21 @@ public class LocalApiServerTests
     // ── auth ──
 
     [AvaloniaFact]
+    public async Task Appearance_RequiresAuth_AndSharesOnlyDisplayValues()
+    {
+        using var h = new Harness();
+        var (status, json, raw) = await h.GetAsync("/api/v1/appearance");
+        Assert.Equal(HttpStatusCode.OK, status);
+        Assert.True(json.GetProperty("colors").GetProperty("accent").GetString()!.StartsWith('#'));
+        Assert.Equal(AppIconService.CurrentId, json.GetProperty("iconVariant").GetString());
+        Assert.DoesNotContain(h.Token, raw);
+        Assert.DoesNotContain(SecretDir, raw);
+        using var anonymous = new HttpClient { BaseAddress = h.Http.BaseAddress };
+        using var response = await anonymous.GetAsync("/api/v1/appearance");
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [AvaloniaFact]
     public async Task MissingOrWrongToken_Is401_WithErrorShape()
     {
         using var h = new Harness();

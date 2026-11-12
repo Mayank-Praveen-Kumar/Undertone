@@ -72,6 +72,7 @@ public partial class LottieToggle : UserControl
         if (e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
         {
             IsChecked = !IsChecked;
+            Services.InterfaceSounds.PlayClick();
             e.Handled = true;
         }
     }
@@ -85,6 +86,7 @@ public partial class LottieToggle : UserControl
         if (e.Key is Key.Space or Key.Enter)
         {
             IsChecked = !IsChecked;
+            Services.InterfaceSounds.PlayClick();
             e.Handled = true;
         }
     }
@@ -113,6 +115,7 @@ public partial class LottieToggle : UserControl
         {
             if (!IsEnabled()) throw new ElementNotEnabledException();
             Toggle_.IsChecked = !Toggle_.IsChecked;
+            Services.InterfaceSounds.PlayClick();
         }
 
         protected override AutomationControlType GetAutomationControlTypeCore() => AutomationControlType.CheckBox;

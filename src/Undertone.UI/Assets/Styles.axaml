@@ -1720,5 +1720,29 @@
     </Style>
 
 
+
+    <Style Selector="MenuItem, ComboBoxItem">
+        <Setter Property="(helpers:RoundedChrome.Radius)" Value="999"/>
+    </Style>
+    <Style Selector="MenuItem /template/ Border#PART_LayoutRoot, ComboBoxItem /template/ ContentPresenter#PART_ContentPresenter">
+        <Setter Property="(helpers:RoundedChrome.Radius)" Value="999"/>
+    </Style>
+    <!-- Shared shape policy applies to every page, popup and legacy control. -->
+    <Style Selector=":is(Button)">
+        <Setter Property="(helpers:RoundedChrome.Radius)" Value="999"/>
+    </Style>
+    <Style Selector=":is(Button) /template/ ContentPresenter#PART_ContentPresenter">
+        <Setter Property="(helpers:RoundedChrome.Radius)" Value="999"/>
+    </Style>
+    <Style Selector="TextBox, ComboBox, NumericUpDown">
+        <Setter Property="(helpers:RoundedChrome.Radius)" Value="999"/>
+    </Style>
+    <Style Selector="TextBox /template/ Border#PART_BorderElement">
+        <Setter Property="(helpers:RoundedChrome.Radius)" Value="999"/>
+    </Style>
+    <Style Selector="ContextMenu, MenuFlyoutPresenter, ToolTip">
+        <Setter Property="(helpers:RoundedChrome.Radius)" Value="24"/>
+    </Style>
+
 </Styles>
 
