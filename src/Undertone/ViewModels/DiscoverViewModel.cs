@@ -34,6 +34,8 @@ public partial class DiscoverViewModel : ViewModelBase, ISearchable
     private bool _active;
     private bool _loaded;
     public bool IsSearchPage { get; init; }
+    public event EventHandler? SearchFocusRequested;
+    public void RequestSearchFocus() => SearchFocusRequested?.Invoke(this, EventArgs.Empty);
     public string Heading => IsSearchPage ? "Search & discover" : "Discover";
     [ObservableProperty] private string _query = string.Empty;
     public bool IsSearchCleared => string.IsNullOrWhiteSpace(Query);

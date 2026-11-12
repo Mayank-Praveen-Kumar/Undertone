@@ -783,7 +783,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
         // Wire up search
         TopBar.SearchTextChanged += OnSearchTextChanged;
-        TopBar.HomeSearchRedirectRequested += OnHomeSearchRedirectRequested;
+        TopBar.GlobalSearchRequested += OnHomeSearchRedirectRequested;
 
         // Wire up album detail navigation from albums view
         _albumsVm.AlbumOpened += OnAlbumOpened;
@@ -2783,16 +2783,13 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private void OnHomeSearchRedirectRequested(object? sender, EventArgs e)
     {
-        // Home has nothing to filter, so the search gesture lands on Songs instead.
-        // Drive the jump through the sidebar selection — the same path as clicking
-        // the Songs item — so history and top-bar state behave like a real
-        // navigation. Navigate closes and clears the search pill as part of the
-        // section switch, so it may only be reopened once navigation is done.
-        var songs = Sidebar.NavItems.FirstOrDefault(n => n.Key == "discover");
-        if (songs == null) return;
-        Sidebar.SelectedNavItem = songs;
-        if (TopBar.IsSearchVisible)
-            TopBar.OpenSearchCommand.Execute(null);
+        if (!ReferenceEquals(CurrentView, _searchVm))
+        {
+            Navigate("discover");
+            Sidebar.SetSelectedNavItemSilently(null);
+        }
+        TopBar.IsSearchOpen = false;
+        _searchVm.RequestSearchFocus();
     }
 
     private void SetupSongsTopBarActions()

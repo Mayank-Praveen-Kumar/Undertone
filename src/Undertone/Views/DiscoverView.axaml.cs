@@ -17,11 +17,18 @@ public partial class DiscoverView : UserControl
         InitializeComponent();
         DataContextChanged += (_, _) =>
         {
-            if (_vm is not null) { _vm.PreviewRequested -= Preview; _vm.AlbumRequested -= FindAlbum; }
+            if (_vm is not null) { _vm.PreviewRequested -= Preview; _vm.AlbumRequested -= FindAlbum; _vm.SearchFocusRequested -= FocusSearch; }
             _vm = DataContext as DiscoverViewModel;
-            if (_vm is not null) { _vm.PreviewRequested += Preview; _vm.AlbumRequested += FindAlbum; }
+            if (_vm is not null) { _vm.PreviewRequested += Preview; _vm.AlbumRequested += FindAlbum; _vm.SearchFocusRequested += FocusSearch; }
         };
+        AttachedToVisualTree += (_, _) => FocusSearch(this, EventArgs.Empty);
         DetachedFromVisualTree += (_, _) => { _action?.Cancel(); _dialog?.Close(); _vm?.SavePreferences(); };
+    }
+
+    private void FocusSearch(object? sender, EventArgs e)
+    {
+        if (_vm?.IsSearchPage == true)
+            Avalonia.Threading.Dispatcher.UIThread.Post(() => DiscoverySearchBox.Focus());
     }
 
     private async void Preview(object? sender, DiscoverCard card)

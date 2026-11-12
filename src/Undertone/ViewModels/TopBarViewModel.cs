@@ -65,7 +65,7 @@ public partial class TopBarViewModel : ViewModelBase
     /// <summary>Enables the sidebar magnifier. Home itself is not searchable, but the
     /// button stays clickable there because invoking search on Home redirects to the
     /// Songs page (see <see cref="OpenSearch"/>).</summary>
-    public bool IsSearchActionAvailable => IsSearchVisible || CurrentTabName == "Home";
+    public bool IsSearchActionAvailable => true;
     // The search pill is a persistent (non-light-dismiss) popup: it stays open while
     // the user browses/filters and only closes explicitly (toggle, Esc, or navigating
     // to a page without search).
@@ -710,10 +710,16 @@ public partial class TopBarViewModel : ViewModelBase
     /// <summary>Raised when search is invoked on Home, which has nothing to filter.
     /// The shell answers by navigating to the Songs page and opening search there.</summary>
     public event EventHandler? HomeSearchRedirectRequested;
+    public event EventHandler? GlobalSearchRequested;
 
     [RelayCommand]
     private void OpenSearch()
     {
+        if (GlobalSearchRequested is not null)
+        {
+            GlobalSearchRequested.Invoke(this, EventArgs.Empty);
+            return;
+        }
         if (!IsSearchVisible)
         {
             // Home redirects to the searchable Songs page; Settings stays a silent
